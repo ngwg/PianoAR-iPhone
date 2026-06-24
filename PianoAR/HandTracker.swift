@@ -7,10 +7,10 @@ final class HandTracker: ObservableObject {
 
     struct HandResult {
         let isLeft: Bool
-        var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>]
+        var joints:   [VNHumanHandPoseObservation.JointName: SIMD3<Float>]
+        var joints2D: [VNHumanHandPoseObservation.JointName: CGPoint]
     }
 
-    // All 21 joints in a fixed order (indices used by boneConnections below)
     static let allJoints: [VNHumanHandPoseObservation.JointName] = [
         .wrist,
         .thumbCMC, .thumbMP, .thumbIP, .thumbTip,
@@ -20,22 +20,22 @@ final class HandTracker: ObservableObject {
         .littleMCP,.littlePIP,.littleDIP,.littleTip,
     ]
 
-    // (from, to) index pairs into allJoints
     static let boneConnections: [(Int, Int)] = [
-        (0,1),(1,2),(2,3),(3,4),          // thumb
-        (0,5),(5,6),(6,7),(7,8),          // index
-        (0,9),(9,10),(10,11),(11,12),     // middle
-        (0,13),(13,14),(14,15),(15,16),   // ring
-        (0,17),(17,18),(18,19),(19,20),   // little
-        (5,9),(9,13),(13,17),            // palm knuckle bar
+        (0,1),(1,2),(2,3),(3,4),
+        (0,5),(5,6),(6,7),(7,8),
+        (0,9),(9,10),(10,11),(11,12),
+        (0,13),(13,14),(14,15),(15,16),
+        (0,17),(17,18),(18,19),(19,20),
+        (5,9),(9,13),(13,17),
     ]
 
     private var _hands: [HandResult] = []
-    private let lock        = NSLock()
+    private let lock         = NSLock()
     private var isProcessing = false
     private var frameCount   = 0
     private let visionQueue  = DispatchQueue(label: "com.piano.vision", qos: .userInteractive)
-    private var smoothed: [String: SIMD3<Float>] = [:]
+    private var smoothed3D:  [String: SIMD3<Float>] = [:]
+    private var smoothed2D:  [String: CGPoint]      = [:]
 
     weak var sceneView: ARSCNView?
 
@@ -85,34 +85,50 @@ final class HandTracker: ObservableObject {
 
         for obs in observations {
             let side = obs.chirality == .left ? "L" : "R"
-            var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>] = [:]
+            var joints3D: [VNHumanHandPoseObservation.JointName: SIMD3<Float>] = [:]
+            var joints2D: [VNHumanHandPoseObservation.JointName: CGPoint]      = [:]
 
             for name in HandTracker.allJoints {
                 guard let pt = try? obs.recognizedPoint(name), pt.confidence > 0.2 else { continue }
 
+                // Vision normalized → viewport pixels
                 let vp = CGPoint(
                     x: CGFloat(pt.location.x) * viewportSize.width,
                     y: (1 - CGFloat(pt.location.y)) * viewportSize.height
                 )
-                guard let world = camera.unprojectPoint(
+
+                // Smooth 2D position (EMA α=0.4)
+                let key2 = "\(side)_2d_\(name.rawValue)"
+                let s2: CGPoint
+                if let prev = smoothed2D[key2] {
+                    s2 = CGPoint(x: prev.x + 0.4 * (vp.x - prev.x),
+                                 y: prev.y + 0.4 * (vp.y - prev.y))
+                } else {
+                    s2 = vp
+                }
+                smoothed2D[key2] = s2
+                joints2D[name] = s2
+
+                // 3D projection onto keyboard plane (for press detection later)
+                if let world = camera.unprojectPoint(
                     vp, ontoPlane: planeTransform,
                     orientation: .portrait, viewportSize: viewportSize
-                ) else { continue }
-
-                // Exponential smoothing per joint
-                let key = "\(side)_\(name.rawValue)"
-                let s: SIMD3<Float>
-                if let prev = smoothed[key] {
-                    s = prev + 0.35 * (world - prev)
-                } else {
-                    s = world
+                ) {
+                    let key3 = "\(side)_3d_\(name.rawValue)"
+                    let s3: SIMD3<Float>
+                    if let prev = smoothed3D[key3] {
+                        s3 = prev + 0.35 * (world - prev)
+                    } else {
+                        s3 = world
+                    }
+                    smoothed3D[key3] = s3
+                    joints3D[name] = s3
                 }
-                smoothed[key] = s
-                joints[name] = s
             }
 
-            if !joints.isEmpty {
-                results.append(HandResult(isLeft: obs.chirality == .left, joints: joints))
+            if !joints2D.isEmpty {
+                results.append(HandResult(isLeft: obs.chirality == .left,
+                                          joints: joints3D, joints2D: joints2D))
             }
         }
 
