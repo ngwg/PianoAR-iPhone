@@ -6,6 +6,7 @@ struct ContentView: View {
     @StateObject private var session     = ARSessionModel()
     @StateObject private var placement   = PlacementManager()
     @StateObject private var calibration = CalibrationManager()
+    @StateObject private var handTracker = HandTracker()
     @State       private var mode: AppMode = .virtualPiano
 
     var body: some View {
@@ -14,6 +15,7 @@ struct ContentView: View {
                 session:     session,
                 placement:   placement,
                 calibration: calibration,
+                handTracker: handTracker,
                 onTap:       handleTap
             )
             .ignoresSafeArea()
@@ -31,7 +33,8 @@ struct ContentView: View {
 
     private var topBar: some View {
         HStack(alignment: .top) {
-            HUDPanel(session: session, placement: placement, calibration: calibration, mode: mode)
+            HUDPanel(session: session, placement: placement,
+                     calibration: calibration, handTracker: handTracker, mode: mode)
                 .padding(12)
             Spacer()
             modeToggle
@@ -69,22 +72,17 @@ struct ContentView: View {
     @ViewBuilder
     private var bottomInstructions: some View {
         switch mode {
-        case .virtualPiano:
-            virtualPianoInstructions
-        case .realPiano:
-            realPianoInstructions
+        case .virtualPiano: virtualPianoInstructions
+        case .realPiano:    realPianoInstructions
         }
     }
 
     @ViewBuilder
     private var virtualPianoInstructions: some View {
         switch placement.state {
-        case .scanning:
-            EmptyView()
-        case .readyToPlace:
-            instructionLabel("Tap a flat surface to place the keyboard")
-        case .placed:
-            resetButton("Remove keyboard") { placement.reset(session: session) }
+        case .scanning:     EmptyView()
+        case .readyToPlace: instructionLabel("Tap a flat surface to place the keyboard")
+        case .placed:       resetButton("Remove keyboard") { placement.reset(session: session) }
         }
     }
 
@@ -147,11 +145,12 @@ private struct HUDPanel: View {
     @ObservedObject var session:     ARSessionModel
     @ObservedObject var placement:   PlacementManager
     @ObservedObject var calibration: CalibrationManager
+    @ObservedObject var handTracker: HandTracker
     let mode: AppMode
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("PianoAR — Phase 2")
+            Text("PianoAR — Phase 3")
                 .font(.caption.bold())
             Text("Tracking: \(session.trackingStateDescription)")
                 .font(.caption2)
@@ -159,6 +158,9 @@ private struct HUDPanel: View {
                 .font(.caption2)
             Text(statusLine)
                 .font(.caption2)
+            Text("Hands: \(handTracker.detectedHandCount)")
+                .font(.caption2)
+                .foregroundStyle(handTracker.detectedHandCount > 0 ? .green : .secondary)
         }
         .padding(8)
         .background(.black.opacity(0.55))
@@ -176,9 +178,9 @@ private struct HUDPanel: View {
             }
         case .realPiano:
             switch calibration.state {
-            case .idle:                   return "Calibration not started"
-            case .collecting(let count):  return "Corner \(count + 1)/4…"
-            case .done:                   return "Calibrated"
+            case .idle:                  return "Calibration not started"
+            case .collecting(let count): return "Corner \(count + 1)/4…"
+            case .done:                  return "Calibrated"
             }
         }
     }
