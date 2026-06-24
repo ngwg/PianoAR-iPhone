@@ -2,31 +2,45 @@ import ARKit
 import Vision
 import simd
 
-/// Runs VNDetectHumanHandPoseRequest on camera frames (~20 fps),
-/// projects each fingertip onto the keyboard surface plane using
-/// ARCamera.unprojectPoint + LiDAR-anchored plane, and applies
-/// per-finger exponential smoothing.
 final class HandTracker: ObservableObject {
     @Published var detectedHandCount: Int = 0
 
-    struct FingertipResult {
-        let label: String          // e.g. "L_index", "R_thumb"
-        let worldPosition: simd_float3
-        let confidence: Float
+    struct HandResult {
+        let isLeft: Bool
+        var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>]
     }
 
-    // Snapshot accessed from the render thread — protected by lock
-    private var _fingertips: [FingertipResult] = []
-    private let lock = NSLock()
+    // All 21 joints in a fixed order (indices used by boneConnections below)
+    static let allJoints: [VNHumanHandPoseObservation.JointName] = [
+        .wrist,
+        .thumbCMC, .thumbMP, .thumbIP, .thumbTip,
+        .indexMCP, .indexPIP, .indexDIP, .indexTip,
+        .middleMCP, .middlePIP, .middleDIP, .middleTip,
+        .ringMCP,  .ringPIP,  .ringDIP,  .ringTip,
+        .littleMCP,.littlePIP,.littleDIP,.littleTip,
+    ]
 
+    // (from, to) index pairs into allJoints
+    static let boneConnections: [(Int, Int)] = [
+        (0,1),(1,2),(2,3),(3,4),          // thumb
+        (0,5),(5,6),(6,7),(7,8),          // index
+        (0,9),(9,10),(10,11),(11,12),     // middle
+        (0,13),(13,14),(14,15),(15,16),   // ring
+        (0,17),(17,18),(18,19),(19,20),   // little
+        (5,9),(9,13),(13,17),            // palm knuckle bar
+    ]
+
+    private var _hands: [HandResult] = []
+    private let lock        = NSLock()
     private var isProcessing = false
     private var frameCount   = 0
     private let visionQueue  = DispatchQueue(label: "com.piano.vision", qos: .userInteractive)
-    private var smoothed: [String: simd_float3] = [:]
+    private var smoothed: [String: SIMD3<Float>] = [:]
+
+    weak var sceneView: ARSCNView?
 
     // MARK: - Public
 
-    /// Call from renderer(_:updateAtTime:) on the render thread.
     func maybeProcess(_ frame: ARFrame, viewportSize: CGSize) {
         frameCount += 1
         guard frameCount % 3 == 0, !isProcessing else { return }
@@ -44,10 +58,9 @@ final class HandTracker: ObservableObject {
         }
     }
 
-    /// Thread-safe snapshot for the render loop.
-    func snapshot() -> [FingertipResult] {
+    func snapshot() -> [HandResult] {
         lock.lock(); defer { lock.unlock() }
-        return _fingertips
+        return _hands
     }
 
     // MARK: - Vision
@@ -63,63 +76,51 @@ final class HandTracker: ObservableObject {
                                             orientation: .right, options: [:])
         guard (try? handler.perform([request])) != nil,
               let observations = request.results, !observations.isEmpty
-        else {
-            commit([], count: 0); return
-        }
+        else { commit([], count: 0); return }
 
         var planeTransform = matrix_identity_float4x4
         planeTransform.columns.3 = SIMD4<Float>(0, planeY, 0, 1)
 
-        let tips: [(VNHumanHandPoseObservation.JointName, String)] = [
-            (.thumbTip, "thumb"), (.indexTip, "index"), (.middleTip, "middle"),
-            (.ringTip,  "ring"),  (.littleTip, "little"),
-        ]
-
-        var results: [FingertipResult] = []
+        var results: [HandResult] = []
 
         for obs in observations {
             let side = obs.chirality == .left ? "L" : "R"
-            for (joint, name) in tips {
-                guard let pt = try? obs.recognizedPoint(joint),
-                      pt.confidence > 0.3
-                else { continue }
+            var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>] = [:]
 
-                // Vision with .right orientation: (0,0) = bottom-left of portrait view
+            for name in HandTracker.allJoints {
+                guard let pt = try? obs.recognizedPoint(name), pt.confidence > 0.2 else { continue }
+
                 let vp = CGPoint(
                     x: CGFloat(pt.location.x) * viewportSize.width,
                     y: (1 - CGFloat(pt.location.y)) * viewportSize.height
                 )
-
                 guard let world = camera.unprojectPoint(
                     vp, ontoPlane: planeTransform,
                     orientation: .portrait, viewportSize: viewportSize
                 ) else { continue }
 
-                // Exponential smoothing (α = 0.35)
-                let key = "\(side)_\(name)"
-                let alpha: Float = 0.35
-                let s: simd_float3
+                // Exponential smoothing per joint
+                let key = "\(side)_\(name.rawValue)"
+                let s: SIMD3<Float>
                 if let prev = smoothed[key] {
-                    s = prev + alpha * (world - prev)
+                    s = prev + 0.35 * (world - prev)
                 } else {
                     s = world
                 }
                 smoothed[key] = s
+                joints[name] = s
+            }
 
-                results.append(FingertipResult(
-                    label: key, worldPosition: s,
-                    confidence: Float(pt.confidence)
-                ))
+            if !joints.isEmpty {
+                results.append(HandResult(isLeft: obs.chirality == .left, joints: joints))
             }
         }
 
         commit(results, count: observations.count)
     }
 
-    private func commit(_ tips: [FingertipResult], count: Int) {
-        lock.lock()
-        _fingertips = tips
-        lock.unlock()
+    private func commit(_ hands: [HandResult], count: Int) {
+        lock.lock(); _hands = hands; lock.unlock()
         DispatchQueue.main.async { self.detectedHandCount = count }
     }
 }
