@@ -77,7 +77,7 @@ enum KeyboardNode {
     /// NoteHighway adds the key labels and active-note highlights on top of this.
     static func makeOverlay() -> SCNNode {
         let root     = SCNNode()
-        let leftEdge = -totalWidth / 2
+        let leftEdge = -KeyboardLayout.totalWidth / 2
 
         // Shared barely-visible material — additive so it never blocks the camera feed.
         let mat = SCNMaterial()
@@ -88,18 +88,18 @@ enum KeyboardNode {
         mat.isDoubleSided      = true
         mat.writesToDepthBuffer = false
 
-        for key in keys where !key.isBlack {
+        for key in KeyboardLayout.keys where !key.isBlack {
             let box = SCNBox(
-                width:        CGFloat(whiteKeyWidth  - 0.001),
+                width:        CGFloat(KeyboardLayout.whiteKeyWidth  - 0.001),
                 height:       0.0012,
-                length:       CGFloat(whiteKeyDepth  - 0.002),
+                length:       CGFloat(KeyboardLayout.whiteKeyDepth  - 0.002),
                 chamferRadius: 0.001
             )
             box.materials = [mat]
             let node = SCNNode(geometry: box)
-            node.name          = "ov_\(key.noteName)"
-            node.simdPosition  = SIMD3<Float>(leftEdge + key.xCenter,
-                                              whiteKeyHeight + 0.001, 0)
+            node.name         = "ov_\(key.noteName)"
+            node.simdPosition = SIMD3<Float>(leftEdge + key.xCenter,
+                                             KeyboardLayout.whiteKeyHeight + 0.001, 0)
             root.addChildNode(node)
         }
 
