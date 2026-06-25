@@ -120,6 +120,8 @@ final class NoteHighway {
     // MARK: - Node pools / registries
 
     private var barPool:        [SCNNode]  = []
+    private var labelPool:      [SCNNode]  = []
+    private var barNoteKeys:    [String]   = []   // tracks last text set on each label
     private var highlights:     [SCNNode?] = Array(repeating: nil, count: 88)
     private let midiToKey: [Int: KeyboardLayout.Key]
 
@@ -133,6 +135,7 @@ final class NoteHighway {
         buildGridLines()
         buildPlayheadLine()
         buildBarPool()
+        buildLabelPool()
         buildKeyHighlights()
         buildKeyLabels()
     }
@@ -189,15 +192,29 @@ final class NoteHighway {
 
     private func buildBarPool() {
         for _ in 0..<Self.poolSize {
-            // Unit cube; we set .scale each frame instead of recreating geometry.
-            // chamferRadius 0.28 gives nicely rounded pill ends on the short axis.
-            let geo  = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0.28)
+            // Unit cube scaled each frame. chamferRadius 0.06 = clean rectangle
+            // with just a hint of rounding on the corners.
+            let geo  = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0.06)
             geo.materials = [Self.matBarRight]
             let node = SCNNode(geometry: geo)
             node.renderingOrder = 50
             node.isHidden       = true
             rootNode.addChildNode(node)
             barPool.append(node)
+        }
+    }
+
+    private func buildLabelPool() {
+        for _ in 0..<Self.poolSize {
+            let node = SCNNode()
+            // Facing up (same orientation as key labels on the keyboard surface).
+            node.eulerAngles    = SCNVector3(-Float.pi / 2, 0, 0)
+            node.scale          = SCNVector3(0.009, 0.009, 0.009)
+            node.renderingOrder = 60
+            node.isHidden       = true
+            rootNode.addChildNode(node)
+            labelPool.append(node)
+            barNoteKeys.append("")
         }
     }
 
@@ -259,6 +276,7 @@ final class NoteHighway {
     func update(player: SongPlayer) {
         guard player.isPlaying else {
             barPool.forEach    { $0.isHidden = true }
+            labelPool.forEach  { $0.isHidden = true }
             highlights.forEach { $0?.isHidden = true }
             return
         }
@@ -269,21 +287,21 @@ final class NoteHighway {
         // ── Note bars ──────────────────────────────────────────────────────
         var barIdx = 0
         for note in player.notes {
-            let bUntilEnd   = Float(note.startBeat + note.durationBeats) - beat
             let bUntilStart = Float(note.startBeat) - beat
-            guard bUntilEnd >= -0.25,
+            // Only show bars that are still approaching the playhead.
+            // Once bUntilStart <= 0 the bar has "landed" — hide it so it
+            // doesn't slide over the keyboard keys.
+            guard bUntilStart > 0,
                   bUntilStart <= Self.lookAheadBeats + 0.1
             else { continue }
             guard barIdx < Self.poolSize else { break }
-
             guard let key = midiToKey[note.midiNote ?? -1] else { continue }
 
-            let bar    = barPool[barIdx]; barIdx += 1
+            let bar    = barPool[barIdx]
             let barLen = max(0.007, Float(note.durationBeats) * Self.beatsToMeters)
             let keyW   = key.isBlack ? KeyboardLayout.blackKeyWidth - 0.001
                                      : KeyboardLayout.whiteKeyWidth - 0.001
-            // Center of bar in Z: near end is at nearEdgeZ - bUntilStart*beatsToMeters
-            let nearZ  = Self.nearEdgeZ - bUntilStart * Self.beatsToMeters
+            let nearZ   = Self.nearEdgeZ - bUntilStart * Self.beatsToMeters
             let centerZ = nearZ - barLen / 2
 
             bar.simdPosition = SIMD3<Float>(
@@ -292,13 +310,35 @@ final class NoteHighway {
                 centerZ
             )
             bar.scale = SCNVector3(keyW, Self.barThickness, barLen)
-
-            let isActive = bUntilStart <= 0.05 && bUntilEnd > 0
-            bar.geometry?.materials = isActive ? [Self.matBarActive]
-                                     : note.isLeft ? [Self.matBarLeft] : [Self.matBarRight]
+            bar.geometry?.materials = [note.isLeft ? Self.matBarLeft : Self.matBarRight]
             bar.isHidden = false
+
+            // ── Label on bar ──
+            let lbl = labelPool[barIdx]
+            // Rebuild SCNText only when the note changes (avoids per-frame alloc).
+            if barNoteKeys[barIdx] != note.key {
+                let txt        = SCNText(string: note.key, extrusionDepth: 0.0001)
+                txt.font       = UIFont.boldSystemFont(ofSize: 1.0)
+                txt.flatness   = 0.05
+                txt.materials  = [Self.matLabel]
+                lbl.geometry   = txt
+                barNoteKeys[barIdx] = note.key
+            }
+            // Center text on the bar: after -π/2 X rotation, text "height" extends
+            // in -Z, so placing at nearZ centers the text near the leading edge.
+            lbl.simdPosition = SIMD3<Float>(
+                leftEdge + key.xCenter - 0.005,
+                Self.highwayY + Self.barThickness + 0.002,
+                nearZ - 0.002
+            )
+            lbl.isHidden = false
+
+            barIdx += 1
         }
-        for i in barIdx..<Self.poolSize { barPool[i].isHidden = true }
+        for i in barIdx..<Self.poolSize {
+            barPool[i].isHidden  = true
+            labelPool[i].isHidden = true
+        }
 
         // ── Key highlights ─────────────────────────────────────────────────
         highlights.forEach { $0?.isHidden = true }
