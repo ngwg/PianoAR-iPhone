@@ -27,82 +27,82 @@ final class NoteHighway {
 
     private static let matBackground: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel      = .constant
-        m.diffuse.contents   = UIColor(red: 0.02, green: 0.02, blue: 0.15, alpha: 0.82)
-        m.blendMode          = .alpha
-        m.isDoubleSided      = true
+        m.lightingModel       = .constant
+        m.diffuse.contents    = UIColor(red: 0.04, green: 0.05, blue: 0.16, alpha: 0.78)
+        m.blendMode           = .alpha
+        m.isDoubleSided       = true
         m.writesToDepthBuffer = false
         return m
     }()
 
     private static let matGridLine: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel      = .constant
-        m.diffuse.contents   = UIColor(white: 0.9, alpha: 0.35)
-        m.blendMode          = .alpha
-        m.isDoubleSided      = true
+        m.lightingModel       = .constant
+        m.diffuse.contents    = UIColor(white: 1.0, alpha: 0.18)
+        m.blendMode           = .alpha
+        m.isDoubleSided       = true
         m.writesToDepthBuffer = false
         return m
     }()
 
     private static let matPlayhead: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel      = .constant
-        m.diffuse.contents   = UIColor.white
-        m.emission.contents  = UIColor.white
-        m.blendMode          = .add
+        m.lightingModel       = .constant
+        m.diffuse.contents    = UIColor(white: 1.0, alpha: 0.90)
+        m.blendMode           = .alpha
         m.writesToDepthBuffer = false
         return m
     }()
 
+    // Solid blue — right hand / unassigned notes
     private static let matBarRight: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel      = .constant
-        m.diffuse.contents   = UIColor(red: 0.00, green: 0.75, blue: 1.00, alpha: 1)
-        m.emission.contents  = UIColor(red: 0.00, green: 0.35, blue: 0.55, alpha: 1)
-        m.blendMode          = .add
+        m.lightingModel       = .constant
+        m.diffuse.contents    = UIColor(red: 0.22, green: 0.55, blue: 1.00, alpha: 0.90)
+        m.blendMode           = .alpha
         m.writesToDepthBuffer = false
         return m
     }()
 
+    // Solid rose — left hand notes
     private static let matBarLeft: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel      = .constant
-        m.diffuse.contents   = UIColor(red: 1.00, green: 0.25, blue: 0.70, alpha: 1)
-        m.emission.contents  = UIColor(red: 0.55, green: 0.10, blue: 0.40, alpha: 1)
-        m.blendMode          = .add
+        m.lightingModel       = .constant
+        m.diffuse.contents    = UIColor(red: 0.95, green: 0.30, blue: 0.55, alpha: 0.90)
+        m.blendMode           = .alpha
         m.writesToDepthBuffer = false
         return m
     }()
 
+    // White flash when the bar reaches the playhead — stays in the same visual family
     private static let matBarActive: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel      = .constant
-        m.diffuse.contents   = UIColor(red: 0.20, green: 1.00, blue: 0.40, alpha: 1)
-        m.emission.contents  = UIColor(red: 0.10, green: 0.55, blue: 0.20, alpha: 1)
-        m.blendMode          = .add
+        m.lightingModel       = .constant
+        m.diffuse.contents    = UIColor(white: 1.0, alpha: 0.96)
+        m.blendMode           = .alpha
         m.writesToDepthBuffer = false
         return m
     }()
 
+    // Key glow uses additive blend so it lights up the real key surface
     private static let matHighlightRight: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel      = .constant
-        m.diffuse.contents   = UIColor(red: 0.00, green: 0.80, blue: 1.00, alpha: 0.7)
-        m.emission.contents  = UIColor(red: 0.00, green: 0.45, blue: 0.70, alpha: 0.7)
-        m.blendMode          = .add
-        m.isDoubleSided      = true
+        m.lightingModel       = .constant
+        m.diffuse.contents    = UIColor(red: 0.22, green: 0.55, blue: 1.00, alpha: 1)
+        m.emission.contents   = UIColor(red: 0.10, green: 0.30, blue: 0.70, alpha: 1)
+        m.blendMode           = .add
+        m.isDoubleSided       = true
         m.writesToDepthBuffer = false
         return m
     }()
 
     private static let matHighlightLeft: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel      = .constant
-        m.diffuse.contents   = UIColor(red: 1.00, green: 0.20, blue: 0.70, alpha: 0.7)
-        m.emission.contents  = UIColor(red: 0.65, green: 0.10, blue: 0.45, alpha: 0.7)
-        m.blendMode          = .add
-        m.isDoubleSided      = true
+        m.lightingModel       = .constant
+        m.diffuse.contents    = UIColor(red: 0.95, green: 0.30, blue: 0.55, alpha: 1)
+        m.emission.contents   = UIColor(red: 0.60, green: 0.10, blue: 0.28, alpha: 1)
+        m.blendMode           = .add
+        m.isDoubleSided       = true
         m.writesToDepthBuffer = false
         return m
     }()
@@ -190,7 +190,8 @@ final class NoteHighway {
     private func buildBarPool() {
         for _ in 0..<Self.poolSize {
             // Unit cube; we set .scale each frame instead of recreating geometry.
-            let geo  = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0.05)
+            // chamferRadius 0.28 gives nicely rounded pill ends on the short axis.
+            let geo  = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0.28)
             geo.materials = [Self.matBarRight]
             let node = SCNNode(geometry: geo)
             node.renderingOrder = 50
