@@ -7,27 +7,34 @@ struct ContentView: View {
     @StateObject private var placement   = PlacementManager()
     @StateObject private var calibration = CalibrationManager()
     @StateObject private var handTracker = HandTracker()
-    @StateObject private var songPlayer  = SongPlayer()
+    @StateObject private var songPlayer    = SongPlayer()
+    @StateObject private var pressDetector = PressDetector()
     @State       private var mode: AppMode = .virtualPiano
+    @State       private var showDebug = false
 
     var body: some View {
         ZStack {
             ARPassthroughView(
-                session:     session,
-                placement:   placement,
-                calibration: calibration,
-                handTracker: handTracker,
-                songPlayer:  songPlayer,
-                onTap:       handleTap
+                session:       session,
+                placement:     placement,
+                calibration:   calibration,
+                handTracker:   handTracker,
+                songPlayer:    songPlayer,
+                pressDetector: pressDetector,
+                onTap:         handleTap
             )
             .ignoresSafeArea()
 
             VStack {
                 topBar
                 Spacer()
+                if !pressDetector.lastDetected.isEmpty {
+                    detectedNoteLabel
+                }
                 playButton
                 bottomInstructions
             }
+            if showDebug { debugOverlay }
         }
         .background(Color.black)
         .onAppear {
@@ -35,6 +42,19 @@ struct ContentView: View {
                 songPlayer.load(song)
             }
         }
+    }
+
+    // MARK: Detected note label
+
+    private var detectedNoteLabel: some View {
+        Text("♪ \(pressDetector.lastDetected)")
+            .font(.title2.bold())
+            .foregroundStyle(.green)
+            .padding(.horizontal, 14)
+            .padding(.vertical, 6)
+            .background(.black.opacity(0.6))
+            .cornerRadius(8)
+            .padding(.bottom, 4)
     }
 
     // MARK: Play button
@@ -67,9 +87,41 @@ struct ContentView: View {
                      calibration: calibration, handTracker: handTracker, mode: mode)
                 .padding(12)
             Spacer()
-            modeToggle
-                .padding(12)
+            VStack(spacing: 8) {
+                modeToggle
+                debugToggle
+            }
+            .padding(12)
         }
+    }
+
+    private var debugToggle: some View {
+        Button { showDebug.toggle() } label: {
+            Text(showDebug ? "Debug ON" : "Debug")
+                .font(.caption2.bold())
+                .padding(.horizontal, 10)
+                .padding(.vertical, 5)
+                .background(showDebug ? Color.green.opacity(0.6) : Color.white.opacity(0.15))
+                .foregroundStyle(.white)
+                .cornerRadius(6)
+        }
+    }
+
+    private var debugOverlay: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("Press Detection Debug")
+                .font(.caption.bold())
+            ForEach(pressDetector.fingerDebugLines, id: \.self) { line in
+                Text(line).font(.system(size: 9, design: .monospaced))
+            }
+        }
+        .padding(8)
+        .background(.black.opacity(0.7))
+        .foregroundStyle(.green)
+        .cornerRadius(8)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .padding(.leading, 12)
+        .padding(.bottom, 100)
     }
 
     private var modeToggle: some View {
@@ -180,7 +232,7 @@ private struct HUDPanel: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("PianoAR — Phase 4")
+            Text("PianoAR — Phase 5")
                 .font(.caption.bold())
             Text("Tracking: \(session.trackingStateDescription)")
                 .font(.caption2)

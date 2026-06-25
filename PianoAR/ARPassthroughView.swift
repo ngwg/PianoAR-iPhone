@@ -3,16 +3,18 @@ import ARKit
 import SceneKit
 
 struct ARPassthroughView: UIViewRepresentable {
-    let session:     ARSessionModel
-    let placement:   PlacementManager
-    let calibration: CalibrationManager
-    let handTracker: HandTracker
-    let songPlayer:  SongPlayer
-    let onTap:       (CGPoint) -> Void
+    let session:       ARSessionModel
+    let placement:     PlacementManager
+    let calibration:   CalibrationManager
+    let handTracker:   HandTracker
+    let songPlayer:    SongPlayer
+    let pressDetector: PressDetector
+    let onTap:         (CGPoint) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(placement: placement, calibration: calibration,
-                    handTracker: handTracker, songPlayer: songPlayer, onTap: onTap)
+                    handTracker: handTracker, songPlayer: songPlayer,
+                    pressDetector: pressDetector, onTap: onTap)
     }
 
     func makeUIView(context: Context) -> ARSCNView {
@@ -37,30 +39,35 @@ struct ARPassthroughView: UIViewRepresentable {
     func updateUIView(_ uiView: ARSCNView, context: Context) {
         placement.sceneView   = uiView
         calibration.sceneView = uiView
-        context.coordinator.onTap       = onTap
-        context.coordinator.songPlayer  = songPlayer
+        context.coordinator.onTap          = onTap
+        context.coordinator.songPlayer     = songPlayer
+        context.coordinator.pressDetector  = pressDetector
     }
 
     // MARK: - Coordinator
 
     final class Coordinator: NSObject, ARSCNViewDelegate {
-        let placement:   PlacementManager
-        let calibration: CalibrationManager
-        let handTracker: HandTracker
-        var songPlayer:  SongPlayer
+        let placement:     PlacementManager
+        let calibration:   CalibrationManager
+        let handTracker:   HandTracker
+        var songPlayer:    SongPlayer
+        var pressDetector: PressDetector
         var onTap: (CGPoint) -> Void
 
         private var hand3D:  Hand3DOverlay?
         private var highway: NoteHighway?
+        private weak var keyboardNode: SCNNode?
 
         init(placement: PlacementManager, calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
+             pressDetector: PressDetector,
              onTap: @escaping (CGPoint) -> Void) {
-            self.placement   = placement
-            self.calibration = calibration
-            self.handTracker = handTracker
-            self.songPlayer  = songPlayer
-            self.onTap       = onTap
+            self.placement     = placement
+            self.calibration   = calibration
+            self.handTracker   = handTracker
+            self.songPlayer    = songPlayer
+            self.pressDetector = pressDetector
+            self.onTap         = onTap
         }
 
         @objc func handleTap(_ g: UITapGestureRecognizer) {
@@ -81,7 +88,17 @@ struct ARPassthroughView: UIViewRepresentable {
             }
 
             handTracker.maybeProcess(frame)
-            hand3D?.update(hands: handTracker.snapshot())
+            let hands = handTracker.snapshot()
+            hand3D?.update(hands: hands)
+
+            // Press detection: fingertip depth vs. keyboard surface
+            let presses = pressDetector.update(
+                hands: hands, keyboardNode: keyboardNode, time: time
+            )
+            for p in presses {
+                highway?.registerPress(keyIndex: p.keyIndex)
+            }
+
             highway?.update(player: songPlayer)
         }
 
@@ -93,10 +110,11 @@ struct ARPassthroughView: UIViewRepresentable {
                 let hw = NoteHighway()
                 n.addChildNode(hw.rootNode)
                 highway = hw
+                keyboardNode = n
+                pressDetector.reset()
                 return n
             }
             if anchor.name == "keyboard_calibrated" {
-                // Use the transparent overlay so the real piano keys remain visible.
                 let n = KeyboardNode.makeOverlay()
                 if let d = calibration.calibrationData {
                     n.scale = SCNVector3(d.widthScale, 1, d.depthScale)
@@ -104,6 +122,8 @@ struct ARPassthroughView: UIViewRepresentable {
                 let hw = NoteHighway()
                 n.addChildNode(hw.rootNode)
                 highway = hw
+                keyboardNode = n
+                pressDetector.reset()
                 return n
             }
             if let name = anchor.name, name.hasPrefix("corner_") { return cornerMarker() }

@@ -107,6 +107,18 @@ final class NoteHighway {
         return m
     }()
 
+    // Bright green flash when press detection fires on a key
+    private static let matPressFlash: SCNMaterial = {
+        let m = SCNMaterial()
+        m.lightingModel       = .constant
+        m.diffuse.contents    = UIColor(red: 0.15, green: 1.0, blue: 0.45, alpha: 1)
+        m.emission.contents   = UIColor(red: 0.05, green: 0.6, blue: 0.2, alpha: 1)
+        m.blendMode           = .add
+        m.isDoubleSided       = true
+        m.writesToDepthBuffer = false
+        return m
+    }()
+
     private static let matLabel: SCNMaterial = {
         let m = SCNMaterial()
         m.lightingModel      = .constant
@@ -123,6 +135,7 @@ final class NoteHighway {
     private var labelPool:      [SCNNode]  = []
     private var barNoteKeys:    [String]   = []   // tracks last text set on each label
     private var highlights:     [SCNNode?] = Array(repeating: nil, count: 88)
+    private var pressFlashes:  [Int: TimeInterval] = [:]
     private let midiToKey: [Int: KeyboardLayout.Key]
 
     // MARK: - Init
@@ -272,6 +285,12 @@ final class NoteHighway {
         }
     }
 
+    // MARK: - Press detection feedback
+
+    func registerPress(keyIndex: Int) {
+        pressFlashes[keyIndex] = CACurrentMediaTime()
+    }
+
     // MARK: - Per-frame update (called from renderer(_:updateAtTime:) on render thread)
 
     func update(player: SongPlayer) {
@@ -355,5 +374,20 @@ final class NoteHighway {
             hl.geometry?.materials = [note.isLeft ? Self.matHighlightLeft : Self.matHighlightRight]
             hl.isHidden = false
         }
+
+        // ── Press-detection flashes (override note highlights) ─────────
+        let now = CACurrentMediaTime()
+        var expired: [Int] = []
+        for (keyIndex, startTime) in pressFlashes {
+            let elapsed = now - startTime
+            if elapsed > 0.35 {
+                expired.append(keyIndex)
+                continue
+            }
+            guard keyIndex < 88, let hl = highlights[keyIndex] else { continue }
+            hl.geometry?.materials = [Self.matPressFlash]
+            hl.isHidden = false
+        }
+        for k in expired { pressFlashes.removeValue(forKey: k) }
     }
 }
