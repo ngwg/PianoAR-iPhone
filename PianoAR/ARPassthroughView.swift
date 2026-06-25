@@ -214,21 +214,36 @@ final class HandOverlayView: UIView {
     }
 
     private func drawHand(_ hand: HandOverlayHand, in ctx: CGContext) {
-        let fill = UIColor(red: 0.05, green: 0.90, blue: 0.95, alpha: 0.55)
-        let glow = UIColor(red: 0.00, green: 0.80, blue: 1.00, alpha: 0.70)
-
         ctx.saveGState()
+
+        // Outer glow pass — wide soft halo behind the hand.
+        ctx.setAlpha(0.25)
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        ctx.setShadow(offset: .zero, blur: 28,
+                      color: UIColor.white.withAlphaComponent(0.9).cgColor)
+        ctx.setStrokeColor(UIColor.white.cgColor)
         ctx.setLineCap(.round)
         ctx.setLineJoin(.round)
-        ctx.setShadow(offset: .zero, blur: 22, color: glow.cgColor)
-        ctx.setStrokeColor(fill.cgColor)
-
         for (i, (a, b)) in hand.segments.enumerated() {
-            ctx.setLineWidth(hand.isPalmSegment[i] ? 44 : 30)
-            ctx.move(to: a)
-            ctx.addLine(to: b)
-            ctx.strokePath()
+            ctx.setLineWidth(hand.isPalmSegment[i] ? 58 : 40)
+            ctx.move(to: a); ctx.addLine(to: b); ctx.strokePath()
         }
+        ctx.endTransparencyLayer()
+
+        // Solid fill pass — all segments drawn inside ONE transparency layer
+        // so overlapping bones merge into a single unified shape before compositing.
+        // No internal skeleton edges, just a smooth filled hand silhouette.
+        ctx.setAlpha(0.52)
+        ctx.beginTransparencyLayer(auxiliaryInfo: nil)
+        ctx.setStrokeColor(UIColor(white: 0.97, alpha: 1.0).cgColor)
+        ctx.setLineCap(.round)
+        ctx.setLineJoin(.round)
+        for (i, (a, b)) in hand.segments.enumerated() {
+            ctx.setLineWidth(hand.isPalmSegment[i] ? 52 : 36)
+            ctx.move(to: a); ctx.addLine(to: b); ctx.strokePath()
+        }
+        ctx.endTransparencyLayer()
+
         ctx.restoreGState()
     }
 }

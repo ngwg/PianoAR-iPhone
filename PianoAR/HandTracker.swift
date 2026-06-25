@@ -42,7 +42,7 @@ final class HandTracker: ObservableObject {
 
     func maybeProcess(_ frame: ARFrame) {
         frameCount += 1
-        guard frameCount % 3 == 0, !isProcessing else { return }
+        guard frameCount % 2 == 0, !isProcessing else { return }
         isProcessing = true
 
         let pixelBuffer = frame.capturedImage
