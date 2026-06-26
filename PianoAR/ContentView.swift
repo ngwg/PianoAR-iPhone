@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 enum AppMode { case virtualPiano, realPiano }
 
@@ -9,8 +10,13 @@ struct ContentView: View {
     @StateObject private var handTracker = HandTracker()
     @StateObject private var songPlayer    = SongPlayer()
     @StateObject private var pressDetector = PressDetector()
+    @StateObject private var audioDetector = AudioPitchDetector()
+    @StateObject private var keyTuning     = KeyTuning()
     @State       private var mode: AppMode = .virtualPiano
     @State       private var showDebug = false
+    @State       private var showMIDIImporter = false
+    @State       private var showSongPicker = false
+    @State       private var importedSongs: [Song] = []
 
     var body: some View {
         ZStack {
@@ -21,6 +27,8 @@ struct ContentView: View {
                 handTracker:   handTracker,
                 songPlayer:    songPlayer,
                 pressDetector: pressDetector,
+                audioDetector: audioDetector,
+                keyTuning:     keyTuning,
                 onTap:         handleTap
             )
             .ignoresSafeArea()
@@ -28,28 +36,64 @@ struct ContentView: View {
             VStack {
                 topBar
                 Spacer()
-                if !pressDetector.lastDetected.isEmpty {
+                if !detectionText.isEmpty {
                     detectedNoteLabel
                 }
-                playButton
+                if keyTuning.panelVisible {
+                    tuningPanel
+                }
+                songControls
                 bottomInstructions
             }
             if showDebug { debugOverlay }
         }
         .background(Color.black)
         .onAppear {
-            if let song = Song.load(named: "sample_song") {
-                songPlayer.load(song)
-            }
+            if songPlayer.song == nil { loadBuiltInLesson() }
+            audioDetector.start()
         }
+        .onDisappear {
+            audioDetector.stop()
+        }
+        .fileImporter(
+            isPresented: $showMIDIImporter,
+            allowedContentTypes: Self.midiTypes,
+            allowsMultipleSelection: false,
+            onCompletion: importMIDI
+        )
+        .sheet(isPresented: $showSongPicker) {
+            SongPickerView(
+                importedSongs: importedSongs,
+                loadBuiltIn: {
+                    loadBuiltInLesson()
+                    showSongPicker = false
+                },
+                loadImported: { song in
+                    songPlayer.load(song)
+                    showSongPicker = false
+                },
+                importMIDI: {
+                    showSongPicker = false
+                    showMIDIImporter = true
+                }
+            )
+        }
+    }
+
+    private static var midiTypes: [UTType] {
+        [
+            UTType(filenameExtension: "mid") ?? .data,
+            UTType(filenameExtension: "midi") ?? .data,
+        ]
     }
 
     // MARK: Detected note label
 
     private var detectedNoteLabel: some View {
-        Text("♪ \(pressDetector.lastDetected)")
+        Text(detectionText)
             .font(.title2.bold())
             .foregroundStyle(.green)
+            .multilineTextAlignment(.center)
             .padding(.horizontal, 14)
             .padding(.vertical, 6)
             .background(.black.opacity(0.6))
@@ -57,26 +101,154 @@ struct ContentView: View {
             .padding(.bottom, 4)
     }
 
-    // MARK: Play button
+    private var detectionText: String {
+        let base: String
+        if !songPlayer.feedbackLine.isEmpty {
+            base = songPlayer.feedbackLine
+        } else if !pressDetector.lastDetected.isEmpty {
+            base = "Vision \(pressDetector.lastDetected)"
+        } else if !audioDetector.lastDetected.isEmpty {
+            base = "Mic \(audioDetector.lastDetected)"
+        } else {
+            base = ""
+        }
 
-    private var playButton: some View {
-        Button {
-            if songPlayer.isPlaying { songPlayer.stop() } else { songPlayer.play() }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: songPlayer.isPlaying ? "stop.fill" : "play.fill")
-                Text(songPlayer.isPlaying ? "Stop" : "Play Song")
-                    .font(.caption.bold())
+        guard !songPlayer.chordLine.isEmpty else { return base }
+        if base.isEmpty {
+            return songPlayer.chordLine
+        }
+        return "\(base)\n\(songPlayer.chordLine)"
+    }
+
+    // MARK: Song controls
+
+    private var songControls: some View {
+        HStack(spacing: 8) {
+            Button {
+                if songPlayer.isPlaying { songPlayer.stop() } else { songPlayer.play() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: songPlayer.isPlaying ? "stop.fill" : "play.fill")
+                    Text(songPlayer.isPlaying ? "Stop" : "Practice")
+                        .font(.caption.bold())
+                }
+                .padding(.horizontal, 16)
+                .padding(.vertical, 9)
+                .background(songPlayer.isPlaying
+                    ? Color.red.opacity(0.75)
+                    : Color(red: 0.1, green: 0.5, blue: 0.9).opacity(0.85))
+                .foregroundStyle(.white)
+                .cornerRadius(10)
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 9)
-            .background(songPlayer.isPlaying
-                ? Color.red.opacity(0.75)
-                : Color(red: 0.1, green: 0.5, blue: 0.9).opacity(0.85))
-            .foregroundStyle(.white)
-            .cornerRadius(10)
+
+            Button {
+                showMIDIImporter = true
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "square.and.arrow.down")
+                    Text("MIDI")
+                        .font(.caption.bold())
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(Color.white.opacity(0.16))
+                .foregroundStyle(.white)
+                .cornerRadius(10)
+            }
+
+            Button {
+                showSongPicker = true
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "music.note.list")
+                    Text("Songs")
+                        .font(.caption.bold())
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(Color.white.opacity(0.16))
+                .foregroundStyle(.white)
+                .cornerRadius(10)
+            }
+
+            Button {
+                keyTuning.panelVisible.toggle()
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: "slider.horizontal.3")
+                    Text("Tune")
+                        .font(.caption.bold())
+                }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 9)
+                .background(keyTuning.panelVisible ? Color.green.opacity(0.45) : Color.white.opacity(0.16))
+                .foregroundStyle(.white)
+                .cornerRadius(10)
+            }
         }
         .padding(.bottom, 8)
+    }
+
+    private var tuningPanel: some View {
+        let keyIndex = songPlayer.expectedKeyIndexNow()
+        return VStack(spacing: 6) {
+            Text(keyTuning.status(for: keyIndex))
+                .font(.caption.bold())
+            HStack(spacing: 6) {
+                tuneButton("Left") { keyTuning.adjustX(for: keyIndex, by: -0.002) }
+                tuneButton("Right") { keyTuning.adjustX(for: keyIndex, by: 0.002) }
+                tuneButton("Narrow") { keyTuning.adjustWidth(for: keyIndex, by: -0.0015) }
+                tuneButton("Wider") { keyTuning.adjustWidth(for: keyIndex, by: 0.0015) }
+                tuneButton("Reset") { keyTuning.reset(keyIndex: keyIndex) }
+            }
+        }
+        .padding(8)
+        .background(.black.opacity(0.65))
+        .foregroundStyle(.white)
+        .cornerRadius(8)
+        .padding(.bottom, 6)
+    }
+
+    private func tuneButton(_ label: String, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(label)
+                .font(.caption2.bold())
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+                .background(Color.white.opacity(0.16))
+                .foregroundStyle(.white)
+                .cornerRadius(6)
+        }
+    }
+
+    private func importMIDI(_ result: Result<[URL], Error>) {
+        do {
+            guard let url = try result.get().first else { return }
+            let access = url.startAccessingSecurityScopedResource()
+            defer {
+                if access { url.stopAccessingSecurityScopedResource() }
+            }
+
+            let data = try Data(contentsOf: url)
+            let title = url.deletingPathExtension().lastPathComponent
+            let song = try MIDIFileImporter.song(from: data, title: title)
+            importedSongs.append(song)
+            songPlayer.load(song)
+        } catch {
+            songPlayer.feedbackLine = error.localizedDescription
+        }
+    }
+
+    private func loadBuiltInLesson() {
+        let bundledSong = MIDIFileImporter.loadBundled(
+            named: "right_hand_practice",
+            title: "Right Hand Primer"
+        )
+        let fallbackSong = Song.load(named: "right_hand_practice")
+            ?? Song.load(named: "sample_song")
+        if let song = bundledSong ?? fallbackSong {
+            songPlayer.load(song)
+        }
     }
 
     // MARK: Top bar
@@ -84,7 +256,9 @@ struct ContentView: View {
     private var topBar: some View {
         HStack(alignment: .top) {
             HUDPanel(session: session, placement: placement,
-                     calibration: calibration, handTracker: handTracker, mode: mode)
+                     calibration: calibration, handTracker: handTracker,
+                     songPlayer: songPlayer, audioDetector: audioDetector,
+                     keyTuning: keyTuning, mode: mode)
                 .padding(12)
             Spacer()
             VStack(spacing: 8) {
@@ -112,6 +286,12 @@ struct ContentView: View {
             Text("Press Detection Debug")
                 .font(.caption.bold())
             ForEach(pressDetector.fingerDebugLines, id: \.self) { line in
+                Text(line).font(.system(size: 9, design: .monospaced))
+            }
+            Text("Mic Detection Debug")
+                .font(.caption.bold())
+                .padding(.top, 6)
+            ForEach(audioDetector.fingerDebugLines, id: \.self) { line in
                 Text(line).font(.system(size: 9, design: .monospaced))
             }
         }
@@ -221,6 +401,46 @@ struct ContentView: View {
     }
 }
 
+// MARK: - Song picker
+
+private struct SongPickerView: View {
+    let importedSongs: [Song]
+    let loadBuiltIn: () -> Void
+    let loadImported: (Song) -> Void
+    let importMIDI: () -> Void
+
+    var body: some View {
+        NavigationStack {
+            List {
+                Section("Built in") {
+                    Button("Right Hand Primer") {
+                        loadBuiltIn()
+                    }
+                }
+
+                Section("Imported MIDI") {
+                    if importedSongs.isEmpty {
+                        Text("No imported MIDI yet")
+                            .foregroundStyle(.secondary)
+                    } else {
+                        ForEach(Array(importedSongs.enumerated()), id: \.offset) { item in
+                            Button(item.element.title ?? "Imported MIDI") {
+                                loadImported(item.element)
+                            }
+                        }
+                    }
+                    Button {
+                        importMIDI()
+                    } label: {
+                        Label("Import MIDI", systemImage: "square.and.arrow.down")
+                    }
+                }
+            }
+            .navigationTitle("Songs")
+        }
+    }
+}
+
 // MARK: - HUD
 
 private struct HUDPanel: View {
@@ -228,6 +448,9 @@ private struct HUDPanel: View {
     @ObservedObject var placement:   PlacementManager
     @ObservedObject var calibration: CalibrationManager
     @ObservedObject var handTracker: HandTracker
+    @ObservedObject var songPlayer: SongPlayer
+    @ObservedObject var audioDetector: AudioPitchDetector
+    @ObservedObject var keyTuning: KeyTuning
     let mode: AppMode
 
     var body: some View {
@@ -243,6 +466,19 @@ private struct HUDPanel: View {
             Text("Hands: \(handTracker.detectedHandCount)")
                 .font(.caption2)
                 .foregroundStyle(handTracker.detectedHandCount > 0 ? .green : .secondary)
+            Text("Mic: \(audioDetector.microphoneState)")
+                .font(.caption2)
+                .foregroundStyle(audioDetector.microphoneState == "mic listening" ? .green : .secondary)
+            Text("Lesson: \(songPlayer.acceptedCount)/\(songPlayer.notes.count)  Misses: \(songPlayer.mistakeCount)")
+                .font(.caption2)
+            if !songPlayer.scoreLine.isEmpty {
+                Text(songPlayer.scoreLine)
+                    .font(.caption2)
+            }
+            if keyTuning.panelVisible {
+                Text(keyTuning.status(for: songPlayer.expectedKeyIndexNow()))
+                    .font(.caption2)
+            }
         }
         .padding(8)
         .background(.black.opacity(0.55))

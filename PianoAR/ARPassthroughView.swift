@@ -9,12 +9,16 @@ struct ARPassthroughView: UIViewRepresentable {
     let handTracker:   HandTracker
     let songPlayer:    SongPlayer
     let pressDetector: PressDetector
+    let audioDetector: AudioPitchDetector
+    let keyTuning:     KeyTuning
     let onTap:         (CGPoint) -> Void
 
     func makeCoordinator() -> Coordinator {
         Coordinator(placement: placement, calibration: calibration,
                     handTracker: handTracker, songPlayer: songPlayer,
-                    pressDetector: pressDetector, onTap: onTap)
+                    pressDetector: pressDetector, audioDetector: audioDetector,
+                    keyTuning: keyTuning,
+                    onTap: onTap)
     }
 
     func makeUIView(context: Context) -> ARSCNView {
@@ -42,6 +46,8 @@ struct ARPassthroughView: UIViewRepresentable {
         context.coordinator.onTap          = onTap
         context.coordinator.songPlayer     = songPlayer
         context.coordinator.pressDetector  = pressDetector
+        context.coordinator.audioDetector  = audioDetector
+        context.coordinator.keyTuning      = keyTuning
     }
 
     // MARK: - Coordinator
@@ -52,6 +58,8 @@ struct ARPassthroughView: UIViewRepresentable {
         let handTracker:   HandTracker
         var songPlayer:    SongPlayer
         var pressDetector: PressDetector
+        var audioDetector: AudioPitchDetector
+        var keyTuning:     KeyTuning
         var onTap: (CGPoint) -> Void
 
         private var hand3D:  Hand3DOverlay?
@@ -60,13 +68,16 @@ struct ARPassthroughView: UIViewRepresentable {
 
         init(placement: PlacementManager, calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
-             pressDetector: PressDetector,
+             pressDetector: PressDetector, audioDetector: AudioPitchDetector,
+             keyTuning: KeyTuning,
              onTap: @escaping (CGPoint) -> Void) {
             self.placement     = placement
             self.calibration   = calibration
             self.handTracker   = handTracker
             self.songPlayer    = songPlayer
             self.pressDetector = pressDetector
+            self.audioDetector = audioDetector
+            self.keyTuning     = keyTuning
             self.onTap         = onTap
         }
 
@@ -74,10 +85,6 @@ struct ARPassthroughView: UIViewRepresentable {
             guard let v = g.view as? ARSCNView else { return }
             onTap(g.location(in: v))
         }
-
-        // MARK: Per-frame update — runs on the SceneKit render thread at 60 fps.
-        // Updating SCNNode positions here means zero async-dispatch lag:
-        // the nodes are repositioned and rendered in the same frame.
 
         func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
             guard let sceneView = renderer as? ARSCNView,
@@ -89,14 +96,25 @@ struct ARPassthroughView: UIViewRepresentable {
 
             handTracker.maybeProcess(frame)
             let hands = handTracker.snapshot()
+            let audio = audioDetector.snapshot()
+            let expectedKeyIndices = songPlayer.expectedKeyIndicesNow()
             hand3D?.update(hands: hands)
 
-            // Press detection: fingertip depth vs. keyboard surface
             let presses = pressDetector.update(
-                hands: hands, keyboardNode: keyboardNode, time: time
+                hands: hands, keyboardNode: keyboardNode, time: time,
+                audioSnapshot: audio,
+                expectedKeyIndices: expectedKeyIndices,
+                keyTuning: keyTuning
             )
             for p in presses {
-                highway?.registerPress(keyIndex: p.keyIndex)
+                switch songPlayer.registerPress(keyIndex: p.keyIndex, noteName: p.noteName) {
+                case .correct(let expectedKeyIndex, _):
+                    highway?.registerPress(keyIndex: expectedKeyIndex)
+                case .wrong(let playedKeyIndex, _, _, _):
+                    highway?.registerMiss(keyIndex: playedKeyIndex)
+                case .ignored:
+                    highway?.registerPress(keyIndex: p.keyIndex)
+                }
             }
 
             highway?.update(player: songPlayer)
@@ -167,26 +185,20 @@ struct ARPassthroughView: UIViewRepresentable {
 
 // MARK: - 3-D hand overlay
 
-/// 21 joint spheres + 23 bone cylinders per hand, in world-space metres.
-/// Sized like real anatomy so they scale correctly with hand distance.
-/// Additive blending: overlapping volumes (palm, knuckles) add their glow
-/// together and reach near-white, while thinner areas (finger tips) stay
-/// semi-translucent — Quest-style fill without a real mesh.
 private final class Hand3DOverlay {
 
-    // Radii in metres, indexed parallel to HandTracker.allJoints.
     private static let sphereR: [Float] = [
-        0.020,                                    // wrist
-        0.011, 0.010, 0.009, 0.008,               // thumb
-        0.012, 0.010, 0.009, 0.007,               // index
-        0.012, 0.010, 0.009, 0.007,               // middle
-        0.012, 0.010, 0.009, 0.007,               // ring
-        0.010, 0.009, 0.008, 0.006,               // little
+        0.020,
+        0.011, 0.010, 0.009, 0.008,
+        0.012, 0.010, 0.009, 0.007,
+        0.012, 0.010, 0.009, 0.007,
+        0.012, 0.010, 0.009, 0.007,
+        0.010, 0.009, 0.008, 0.006,
     ]
-    private static let cylR: Float = 0.008        // finger-width cylinder
+    private static let cylR: Float = 0.008
 
-    private var sph: [[SCNNode]] = []   // [hand 0/1][joint 0-20]
-    private var cyl: [[SCNNode]] = []   // [hand 0/1][bone  0-22]
+    private var sph: [[SCNNode]] = []
+    private var cyl: [[SCNNode]] = []
 
     init(scene: SCNScene) {
         for _ in 0..<2 {
@@ -195,7 +207,7 @@ private final class Hand3DOverlay {
 
             for i in 0..<HandTracker.allJoints.count {
                 let geo = SCNSphere(radius: CGFloat(Self.sphereR[i]))
-                geo.segmentCount = 8          // low-poly — fine at finger scale
+                geo.segmentCount = 8
                 geo.materials    = [Self.mat()]
                 let n = SCNNode(geometry: geo)
                 n.isHidden = true; n.renderingOrder = 100
@@ -205,7 +217,7 @@ private final class Hand3DOverlay {
 
             for _ in 0..<HandTracker.boneConnections.count {
                 let geo = SCNCylinder(radius: CGFloat(Self.cylR), height: 1.0)
-                geo.radialSegmentCount = 6    // hexagonal — smooth enough at 8-mm scale
+                geo.radialSegmentCount = 6
                 geo.materials    = [Self.mat()]
                 let n = SCNNode(geometry: geo)
                 n.isHidden = true; n.renderingOrder = 100
@@ -239,16 +251,14 @@ private final class Hand3DOverlay {
         }
     }
 
-    // MARK: Helpers
-
     private static func mat() -> SCNMaterial {
         let m = SCNMaterial()
-        m.lightingModel         = .constant     // unlit — not affected by scene lights
+        m.lightingModel         = .constant
         m.diffuse.contents      = UIColor.black
         m.emission.contents     = UIColor(white: 0.32, alpha: 1.0)
-        m.blendMode             = .add          // additive: overlaps accumulate toward white
-        m.writesToDepthBuffer   = false         // hand nodes don't occlude each other
-        m.readsFromDepthBuffer  = true          // still occluded by opaque scene objects
+        m.blendMode             = .add
+        m.writesToDepthBuffer   = false
+        m.readsFromDepthBuffer  = true
         m.isDoubleSided         = true
         return m
     }

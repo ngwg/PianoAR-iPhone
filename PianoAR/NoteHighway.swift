@@ -2,28 +2,20 @@ import SceneKit
 import UIKit
 import simd
 
-/// All Phase-4 visual elements: the highway grid, falling note bars,
-/// per-key highlight overlays, and note-letter labels.
-///
-/// rootNode should be added as a child of the keyboard anchor's scene node
-/// so it inherits the anchor's world-space transform (and the calibration
-/// scale for real-piano mode). All child positions are in keyboard-local
-/// space using KeyboardLayout constants.
 final class NoteHighway {
     let rootNode = SCNNode()
 
     // MARK: - Layout constants
 
-    private static let highwayLength:   Float = 1.5    // metres visible ahead
+    private static let highwayLength:   Float = 1.5
     private static let lookAheadBeats:  Float = 4.0
-    private static let highwayY:        Float = 0.030  // metres above keyboard surface
-    private static let barThickness:    Float = 0.003  // note bar Y height
-    // Near edge of keys (in keyboard-local Z) — highway "now" line.
-    private static let nearEdgeZ:       Float = KeyboardLayout.whiteKeyDepth / 2   // 0.074 m
+    private static let highwayY:        Float = 0.030
+    private static let barThickness:    Float = 0.003
+    private static let nearEdgeZ:       Float = KeyboardLayout.whiteKeyDepth / 2
     private static var beatsToMeters:   Float { highwayLength / lookAheadBeats }
     private static let poolSize:        Int   = 48
 
-    // MARK: - Cached materials (created once, reused every frame)
+    // MARK: - Cached materials
 
     private static let matBackground: SCNMaterial = {
         let m = SCNMaterial()
@@ -54,7 +46,6 @@ final class NoteHighway {
         return m
     }()
 
-    // Solid blue — right hand / unassigned notes
     private static let matBarRight: SCNMaterial = {
         let m = SCNMaterial()
         m.lightingModel       = .constant
@@ -64,7 +55,6 @@ final class NoteHighway {
         return m
     }()
 
-    // Solid rose — left hand notes
     private static let matBarLeft: SCNMaterial = {
         let m = SCNMaterial()
         m.lightingModel       = .constant
@@ -74,7 +64,6 @@ final class NoteHighway {
         return m
     }()
 
-    // White flash when the bar reaches the playhead — stays in the same visual family
     private static let matBarActive: SCNMaterial = {
         let m = SCNMaterial()
         m.lightingModel       = .constant
@@ -84,7 +73,6 @@ final class NoteHighway {
         return m
     }()
 
-    // Key glow uses additive blend so it lights up the real key surface
     private static let matHighlightRight: SCNMaterial = {
         let m = SCNMaterial()
         m.lightingModel       = .constant
@@ -107,12 +95,22 @@ final class NoteHighway {
         return m
     }()
 
-    // Bright green flash when press detection fires on a key
     private static let matPressFlash: SCNMaterial = {
         let m = SCNMaterial()
         m.lightingModel       = .constant
         m.diffuse.contents    = UIColor(red: 0.15, green: 1.0, blue: 0.45, alpha: 1)
         m.emission.contents   = UIColor(red: 0.05, green: 0.6, blue: 0.2, alpha: 1)
+        m.blendMode           = .add
+        m.isDoubleSided       = true
+        m.writesToDepthBuffer = false
+        return m
+    }()
+
+    private static let matMissFlash: SCNMaterial = {
+        let m = SCNMaterial()
+        m.lightingModel       = .constant
+        m.diffuse.contents    = UIColor(red: 1.0, green: 0.12, blue: 0.12, alpha: 1)
+        m.emission.contents   = UIColor(red: 0.75, green: 0.02, blue: 0.02, alpha: 1)
         m.blendMode           = .add
         m.isDoubleSided       = true
         m.writesToDepthBuffer = false
@@ -133,9 +131,10 @@ final class NoteHighway {
 
     private var barPool:        [SCNNode]  = []
     private var labelPool:      [SCNNode]  = []
-    private var barNoteKeys:    [String]   = []   // tracks last text set on each label
+    private var barNoteKeys:    [String]   = []
     private var highlights:     [SCNNode?] = Array(repeating: nil, count: 88)
     private var pressFlashes:  [Int: TimeInterval] = [:]
+    private var missFlashes:   [Int: TimeInterval] = [:]
     private let midiToKey: [Int: KeyboardLayout.Key]
 
     // MARK: - Init
@@ -153,7 +152,7 @@ final class NoteHighway {
         buildKeyLabels()
     }
 
-    // MARK: - Scene construction (called once from init)
+    // MARK: - Scene construction
 
     private func buildBackground() {
         let geo = SCNPlane(
@@ -162,7 +161,6 @@ final class NoteHighway {
         )
         geo.materials = [Self.matBackground]
         let node = SCNNode(geometry: geo)
-        // SCNPlane faces +Z; rotate -90° around X so it lies flat facing +Y
         node.eulerAngles.x = -.pi / 2
         node.simdPosition  = SIMD3<Float>(
             0,
@@ -176,7 +174,6 @@ final class NoteHighway {
         let leftEdge = -KeyboardLayout.totalWidth / 2
         let centerZ  = Self.nearEdgeZ - Self.highwayLength / 2
 
-        // Vertical lines at every C note (octave boundaries)
         for key in KeyboardLayout.keys where key.noteName.hasPrefix("C") {
             let x    = leftEdge + key.xCenter
             let line = SCNBox(width: 0.0018,
@@ -205,8 +202,6 @@ final class NoteHighway {
 
     private func buildBarPool() {
         for _ in 0..<Self.poolSize {
-            // Unit cube scaled each frame. chamferRadius 0.06 = clean rectangle
-            // with just a hint of rounding on the corners.
             let geo  = SCNBox(width: 1, height: 1, length: 1, chamferRadius: 0.06)
             geo.materials = [Self.matBarRight]
             let node = SCNNode(geometry: geo)
@@ -220,8 +215,6 @@ final class NoteHighway {
     private func buildLabelPool() {
         for _ in 0..<Self.poolSize {
             let node = SCNNode()
-            // After eulerAngles.x = -π/2: text face → +Y (faces camera which looks down),
-            // character height extends in world -Z (into the highway, away from playhead).
             node.eulerAngles    = SCNVector3(-Float.pi / 2, 0, 0)
             node.scale          = SCNVector3(0.012, 0.012, 0.012)
             node.renderingOrder = 60
@@ -273,9 +266,6 @@ final class NoteHighway {
             node.eulerAngles = SCNVector3(-Float.pi / 2, 0, 0)
             node.scale       = SCNVector3(0.010, 0.010, 0.010)
             node.renderingOrder = 20
-            // After -π/2 rotation around X: text face → +Y (faces up),
-            // letter height extends in -Z direction (from near edge backward).
-            // X offset of -0.003 roughly centers a single uppercase character.
             node.simdPosition = SIMD3<Float>(
                 leftEdge + key.xCenter - 0.003,
                 KeyboardLayout.whiteKeyHeight + 0.003,
@@ -291,26 +281,28 @@ final class NoteHighway {
         pressFlashes[keyIndex] = CACurrentMediaTime()
     }
 
-    // MARK: - Per-frame update (called from renderer(_:updateAtTime:) on render thread)
+    func registerMiss(keyIndex: Int) {
+        missFlashes[keyIndex] = CACurrentMediaTime()
+    }
+
+    // MARK: - Per-frame update
 
     func update(player: SongPlayer) {
         guard player.isPlaying else {
             barPool.forEach    { $0.isHidden = true }
             labelPool.forEach  { $0.isHidden = true }
             highlights.forEach { $0?.isHidden = true }
+            updatePressFlashes()
             return
         }
 
         let beat     = Float(player.beatNow())
         let leftEdge = -KeyboardLayout.totalWidth / 2
 
-        // ── Note bars ──────────────────────────────────────────────────────
+        // ── Note bars ──
         var barIdx = 0
         for note in player.notes {
             let bUntilStart = Float(note.startBeat) - beat
-            // Only show bars that are still approaching the playhead.
-            // Once bUntilStart <= 0 the bar has "landed" — hide it so it
-            // doesn't slide over the keyboard keys.
             guard bUntilStart > 0,
                   bUntilStart <= Self.lookAheadBeats + 0.1
             else { continue }
@@ -335,7 +327,6 @@ final class NoteHighway {
 
             // ── Label on bar ──
             let lbl = labelPool[barIdx]
-            // Rebuild SCNText only when the note changes (avoids per-frame alloc).
             if barNoteKeys[barIdx] != note.key {
                 let txt        = SCNText(string: note.key, extrusionDepth: 0.0001)
                 txt.font       = UIFont.boldSystemFont(ofSize: 1.0)
@@ -344,8 +335,6 @@ final class NoteHighway {
                 lbl.geometry   = txt
                 barNoteKeys[barIdx] = note.key
             }
-            // Place text at bar center; X offset approximates centering by char count.
-            // At scale 0.012 + fontSize 1.0, each char is ~0.0066 m wide.
             let charOffset = Float(note.key.count) * 0.0033
             lbl.simdPosition = SIMD3<Float>(
                 leftEdge + key.xCenter - charOffset,
@@ -361,7 +350,7 @@ final class NoteHighway {
             labelPool[i].isHidden = true
         }
 
-        // ── Key highlights ─────────────────────────────────────────────────
+        // ── Key highlights ──
         highlights.forEach { $0?.isHidden = true }
         for note in player.notes {
             let delta = Float(note.startBeat) - beat
@@ -375,7 +364,11 @@ final class NoteHighway {
             hl.isHidden = false
         }
 
-        // ── Press-detection flashes (override note highlights) ─────────
+        // ── Press-detection flashes ──
+        updatePressFlashes()
+    }
+
+    private func updatePressFlashes() {
         let now = CACurrentMediaTime()
         var expired: [Int] = []
         for (keyIndex, startTime) in pressFlashes {
@@ -389,5 +382,18 @@ final class NoteHighway {
             hl.isHidden = false
         }
         for k in expired { pressFlashes.removeValue(forKey: k) }
+
+        expired.removeAll()
+        for (keyIndex, startTime) in missFlashes {
+            let elapsed = now - startTime
+            if elapsed > 0.35 {
+                expired.append(keyIndex)
+                continue
+            }
+            guard keyIndex < 88, let hl = highlights[keyIndex] else { continue }
+            hl.geometry?.materials = [Self.matMissFlash]
+            hl.isHidden = false
+        }
+        for k in expired { missFlashes.removeValue(forKey: k) }
     }
 }
