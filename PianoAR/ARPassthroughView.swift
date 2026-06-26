@@ -282,13 +282,16 @@ private final class Hand3DOverlay {
 
     private static func mat() -> SCNMaterial {
         let m = SCNMaterial()
-        m.lightingModel         = .constant
-        m.diffuse.contents      = UIColor.black
-        m.emission.contents     = UIColor(white: 0.32, alpha: 1.0)
-        m.blendMode             = .add
-        m.writesToDepthBuffer   = false
-        m.readsFromDepthBuffer  = true
-        m.isDoubleSided         = true
+        m.lightingModel        = .constant
+        m.diffuse.contents     = UIColor.black
+        m.emission.contents    = UIColor(white: 0.32, alpha: 1.0)
+        m.blendMode            = .add
+        m.writesToDepthBuffer  = false
+        // Depth-reading against virtual key geometry causes hand spheres to flicker
+        // when fingertips are at key-surface depth. Drawing hand markers on top of
+        // everything is the correct behaviour — you always want to see them.
+        m.readsFromDepthBuffer = false
+        m.isDoubleSided        = true
         return m
     }
 

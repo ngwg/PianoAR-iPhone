@@ -75,45 +75,49 @@ final class NoteHighway {
 
     private static let matHighlightRight: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel       = .constant
-        m.diffuse.contents    = UIColor(red: 0.22, green: 0.55, blue: 1.00, alpha: 1)
-        m.emission.contents   = UIColor(red: 0.10, green: 0.30, blue: 0.70, alpha: 1)
-        m.blendMode           = .add
-        m.isDoubleSided       = true
-        m.writesToDepthBuffer = false
+        m.lightingModel        = .constant
+        m.diffuse.contents     = UIColor(red: 0.22, green: 0.55, blue: 1.00, alpha: 1)
+        m.emission.contents    = UIColor(red: 0.10, green: 0.30, blue: 0.70, alpha: 1)
+        m.blendMode            = .add
+        m.isDoubleSided        = true
+        m.writesToDepthBuffer  = false
+        m.readsFromDepthBuffer = false   // avoid z-fight with virtual key box tops
         return m
     }()
 
     private static let matHighlightLeft: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel       = .constant
-        m.diffuse.contents    = UIColor(red: 0.95, green: 0.30, blue: 0.55, alpha: 1)
-        m.emission.contents   = UIColor(red: 0.60, green: 0.10, blue: 0.28, alpha: 1)
-        m.blendMode           = .add
-        m.isDoubleSided       = true
-        m.writesToDepthBuffer = false
+        m.lightingModel        = .constant
+        m.diffuse.contents     = UIColor(red: 0.95, green: 0.30, blue: 0.55, alpha: 1)
+        m.emission.contents    = UIColor(red: 0.60, green: 0.10, blue: 0.28, alpha: 1)
+        m.blendMode            = .add
+        m.isDoubleSided        = true
+        m.writesToDepthBuffer  = false
+        m.readsFromDepthBuffer = false
         return m
     }()
 
     private static let matPressFlash: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel       = .constant
-        m.diffuse.contents    = UIColor(red: 0.15, green: 1.0, blue: 0.45, alpha: 1)
-        m.emission.contents   = UIColor(red: 0.05, green: 0.6, blue: 0.2, alpha: 1)
-        m.blendMode           = .add
-        m.isDoubleSided       = true
-        m.writesToDepthBuffer = false
+        m.lightingModel        = .constant
+        m.diffuse.contents     = UIColor(red: 0.15, green: 1.0, blue: 0.45, alpha: 1)
+        m.emission.contents    = UIColor(red: 0.05, green: 0.6, blue: 0.2, alpha: 1)
+        m.blendMode            = .add
+        m.isDoubleSided        = true
+        m.writesToDepthBuffer  = false
+        m.readsFromDepthBuffer = false
         return m
     }()
 
     private static let matMissFlash: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel       = .constant
-        m.diffuse.contents    = UIColor(red: 1.0, green: 0.12, blue: 0.12, alpha: 1)
-        m.emission.contents   = UIColor(red: 0.75, green: 0.02, blue: 0.02, alpha: 1)
-        m.blendMode           = .add
-        m.isDoubleSided       = true
-        m.writesToDepthBuffer = false
+        m.lightingModel        = .constant
+        m.diffuse.contents     = UIColor(red: 1.0, green: 0.12, blue: 0.12, alpha: 1)
+        m.emission.contents    = UIColor(red: 0.75, green: 0.02, blue: 0.02, alpha: 1)
+        m.blendMode            = .add
+        m.isDoubleSided        = true
+        m.writesToDepthBuffer  = false
+        m.readsFromDepthBuffer = false
         return m
     }()
 

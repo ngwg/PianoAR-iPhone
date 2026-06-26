@@ -29,9 +29,34 @@ final class PlacementManager: ObservableObject {
             alignment: .horizontal
         ) else { return }
 
-        guard let hit = sv.session.raycast(query).first else { return }
+        guard let hit  = sv.session.raycast(query).first,
+              let frame = sv.session.currentFrame
+        else { return }
 
-        let anchor = ARAnchor(name: "keyboard", transform: hit.worldTransform)
+        // Orient keyboard so its near edge (keyboard +Z) faces the camera.
+        // Raw hit.worldTransform has gravity-aligned axes, not camera-view-aligned,
+        // so the keyboard would appear sideways or backwards without this.
+        let hitPos = SIMD3<Float>(hit.worldTransform.columns.3.x,
+                                   hit.worldTransform.columns.3.y,
+                                   hit.worldTransform.columns.3.z)
+        let camPos = SIMD3<Float>(frame.camera.transform.columns.3.x,
+                                   frame.camera.transform.columns.3.y,
+                                   frame.camera.transform.columns.3.z)
+        let toUser  = camPos - hitPos
+        // Keyboard +Z = toward user (near edge); project onto horizontal plane.
+        let rawZ    = SIMD3<Float>(toUser.x, 0, toUser.z)
+        let kbZ     = simd_length(rawZ) > 0.01 ? simd_normalize(rawZ)
+                                                : SIMD3<Float>(0, 0, 1)
+        let kbY     = SIMD3<Float>(0, 1, 0)           // always world-up
+        let kbX     = simd_cross(kbZ, kbY)             // keyboard right (low→high notes)
+
+        var t = hit.worldTransform
+        t.columns.0 = SIMD4<Float>(kbX.x, kbX.y, kbX.z, 0)
+        t.columns.1 = SIMD4<Float>(kbY.x, kbY.y, kbY.z, 0)
+        t.columns.2 = SIMD4<Float>(kbZ.x, kbZ.y, kbZ.z, 0)
+        // columns.3 (translation) kept from hit.worldTransform
+
+        let anchor = ARAnchor(name: "keyboard", transform: t)
         sv.session.add(anchor: anchor)
         state = .placed
     }
