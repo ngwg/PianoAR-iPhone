@@ -44,10 +44,10 @@ final class AudioPitchDetector: ObservableObject {
     private let hop = 512
     private let log2n: vDSP_Length = 11
 
-    private let minRMS: Float = 0.00065
-    private let ambientRMSRatio: Float = 2.0
-    private let minFluxScore: Float = 0.14
-    private let ambientFluxRatio: Float = 2.35
+    private let minRMS: Float = 0.0015           // raised: ignore very quiet ambient taps
+    private let ambientRMSRatio: Float = 3.0      // raised: need 3× ambient to confirm onset
+    private let minFluxScore: Float = 0.24        // raised: stricter spectral change gate
+    private let ambientFluxRatio: Float = 3.0     // raised: matches ambientRMSRatio
     private let minAttackInterval: TimeInterval = 0.13
     private let maxPitchHints = 3
 

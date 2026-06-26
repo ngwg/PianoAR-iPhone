@@ -14,39 +14,47 @@ final class PressDetector: ObservableObject {
     @Published var lastDetected: String = ""
     @Published var fingerDebugLines: [String] = []
 
-    // Tunable thresholds — start conservative, tighten with real-device testing.
-    private let pressDepth: Float = 0.008         // 8 mm below key surface → press
-    private let minDescendVel: Float = -0.001     // m/frame downward to enter "descending"
-    private let debounceInterval: TimeInterval = 0.18
+    // ── Non-guided (depth + trajectory) ──────────────────────────────────
+    private let pressDepth:        Float    = 0.008
+    private let minDescendVel:     Float    = -0.001
+    private let debounceInterval:  TimeInterval = 0.18
     private let keyLockoutInterval: TimeInterval = 0.24
     private let historyCount = 12
-    private let flashRetain: TimeInterval = 2.0   // keep recent presses for UI
-    private let guidedAttackWindow: TimeInterval = 0.20
-    private let guidedMaxHover: Float = 0.120
-    private let guidedMaxBelow: Float = 0.045
-    private let guidedKeyXTolerance: Float = 0.010
-    private let guidedKeyZTolerance: Float = 0.030
+    private let flashRetain:       TimeInterval = 2.0
 
-    // Per-finger tracking
+    // ── Guided (audio-primary) ────────────────────────────────────────────
+    // Window after an audio onset timestamp during which we accept a press.
+    private let guidedAttackWindow:  TimeInterval = 0.22
+    // Minimum onset confidence to fire — raise to cut false positives.
+    private let guidedMinAttackConf: Float = 0.28
+    // Pitch hint tolerance: ±N semitones of expected key counts as a match.
+    private let pitchSemitoneWindow: Int   = 3
+    // Keyboard presence check — Y range around key surface.
+    private let kbAreaYMin:          Float = -0.06
+    private let kbAreaYMax:          Float =  0.10
+    // Extra Z tolerance beyond standard key depth.
+    private let kbAreaZExtra:        Float =  0.040
+
+    // ── State ─────────────────────────────────────────────────────────────
+
     enum Phase: String { case idle, descending, pressed }
-
     private struct FingerTrack {
-        var yHistory: [Float] = []
-        var phase: Phase = .idle
+        var yHistory:      [Float] = []
+        var phase:         Phase   = .idle
         var lastPressTime: TimeInterval = 0
     }
-
-    private struct FingerCandidate {
-        let key: KeyboardLayout.Key
+    private struct FingertipLocal {
         let fingerID: String
-        let score: Float
+        let localX:   Float
+        let localY:   Float
+        let localZ:   Float
     }
 
-    private var fingers: [String: FingerTrack] = [:]
-    private var recentPresses: [PressEvent] = []
-    private var lastKeyPressTime: [TimeInterval] = .init(repeating: -999, count: 88)
-    private var lastGuidedAttackTime: TimeInterval = -999
-    private var lastDebugUpdate: TimeInterval = 0
+    private var fingers:          [String: FingerTrack] = [:]
+    private var recentPresses:    [PressEvent]          = []
+    private var lastKeyPressTime: [TimeInterval]        = .init(repeating: -999, count: 88)
+    private var lastGuidedAttackTime: TimeInterval      = -999
+    private var lastDebugUpdate:  TimeInterval          = 0
 
     private static let tips: [(VNHumanHandPoseObservation.JointName, String)] = [
         (.thumbTip,  "thumb"),
@@ -56,157 +64,112 @@ final class PressDetector: ObservableObject {
         (.littleTip, "little"),
     ]
 
-    // MARK: - Render-thread entry point
+    // MARK: - Render-thread entry
 
-    /// Call from `renderer(_:updateAtTime:)`. Returns newly detected presses this frame.
     func update(hands: [HandTracker.HandResult],
                 keyboardNode: SCNNode?,
                 time: TimeInterval,
                 audioSnapshot: PitchSnapshot? = nil,
                 expectedKeyIndices: Set<Int> = [],
                 keyTuning: KeyTuning? = nil) -> [PressEvent] {
-        guard let kb = keyboardNode else { return [] }
 
         var newPresses: [PressEvent] = []
         var seen = Set<String>()
-        var debugLines: [String] = []
-        var guidedCandidates: [FingerCandidate] = []
-        let guidedPractice = !expectedKeyIndices.isEmpty
+        var debugLines = [String]()
 
-        for hand in hands {
-            let side = hand.isLeft ? "L" : "R"
+        let guided = !expectedKeyIndices.isEmpty
 
-            for (joint, fingerName) in Self.tips {
-                guard let worldPos = hand.joints[joint] else { continue }
-                let fid = "\(side)_\(fingerName)"
-                seen.insert(fid)
+        if guided, let kb = keyboardNode {
+            // ── Guided path: audio onset + loose presence check ──────────
+            let events = guidedPressEvents(
+                hands:              hands,
+                keyboardNode:       kb,
+                expectedKeyIndices: expectedKeyIndices,
+                snapshot:           audioSnapshot,
+                time:               time
+            )
+            newPresses.append(contentsOf: events)
 
-                // World → keyboard-local (handles anchor position, rotation, and scale)
-                let local = kb.simdConvertPosition(worldPos, from: nil)
-
-                var track = fingers[fid] ?? FingerTrack()
-
-                // Y history ring buffer
-                track.yHistory.append(local.y)
-                if track.yHistory.count > historyCount {
-                    track.yHistory.removeFirst()
+            // Debug lines
+            for hand in hands {
+                let side = hand.isLeft ? "L" : "R"
+                for (joint, name) in Self.tips {
+                    guard let wp = hand.joints[joint] else { continue }
+                    let lp = kb.simdConvertPosition(wp, from: nil)
+                    debugLines.append(String(format: "%@_%@ y%+.0fmm", side, name, lp.y * 1000))
                 }
+            }
+            if let atk = audioSnapshot?.attack {
+                debugLines.append(String(format: "onset conf %.2f score %.2f", atk.confidence, atk.onsetScore))
+            }
 
-                // Which key is this finger over?
-                let key = findKey(localX: local.x, localZ: local.z, keyTuning: keyTuning)
-                let guidedKey = expectedGuidedKey(
-                    localX: local.x,
-                    localZ: local.z,
-                    expectedKeyIndices: expectedKeyIndices,
-                    keyTuning: keyTuning
-                ) ?? findKey(
-                    localX: local.x,
-                    localZ: local.z,
-                    extraX: guidedKeyXTolerance,
-                    extraZ: guidedKeyZTolerance,
-                    keyTuning: keyTuning
-                )
-                let micBoost = key.map {
-                    audioBoost(
-                        for: $0.index,
-                        snapshot: audioSnapshot,
-                        time: time,
-                        expectedKeyIndices: expectedKeyIndices
-                    )
-                } ?? 0
-                let surfaceY: Float = (key?.isBlack == true)
-                    ? KeyboardLayout.whiteKeyHeight + KeyboardLayout.blackKeyExtraHeight
-                    : KeyboardLayout.whiteKeyHeight
-                let depth = local.y - surfaceY   // negative = below surface
+        } else if let kb = keyboardNode {
+            // ── Non-guided path: depth + trajectory ──────────────────────
+            for hand in hands {
+                let side = hand.isLeft ? "L" : "R"
+                for (joint, fingerName) in Self.tips {
+                    guard let wp = hand.joints[joint] else { continue }
+                    let fid  = "\(side)_\(fingerName)"
+                    seen.insert(fid)
+                    let lp   = kb.simdConvertPosition(wp, from: nil)
+                    var track = fingers[fid] ?? FingerTrack()
 
-                if let candidate = makeGuidedCandidate(
-                    key: guidedKey,
-                    fingerID: fid,
-                    localY: local.y,
-                    expectedKeyIndices: expectedKeyIndices
-                ) {
-                    guidedCandidates.append(candidate)
-                }
+                    track.yHistory.append(lp.y)
+                    if track.yHistory.count > historyCount { track.yHistory.removeFirst() }
 
-                // Smoothed velocity over 3 frames
-                let vel: Float
-                if track.yHistory.count >= 3 {
-                    let h = track.yHistory
-                    vel = (h[h.count - 1] - h[h.count - 3]) / 2.0
-                } else {
-                    vel = 0
-                }
+                    let key      = findKey(localX: lp.x, localZ: lp.z, keyTuning: keyTuning)
+                    let surfaceY = key?.isBlack == true
+                        ? KeyboardLayout.whiteKeyHeight + KeyboardLayout.blackKeyExtraHeight
+                        : KeyboardLayout.whiteKeyHeight
+                    let depth    = lp.y - surfaceY
+                    let vel: Float = track.yHistory.count >= 3
+                        ? (track.yHistory.last! - track.yHistory[track.yHistory.count - 3]) / 2.0
+                        : 0
 
-                // ── State machine ──────────────────────────────────────────
-                switch track.phase {
-                case .idle:
-                    if vel < minDescendVel && depth < 0.025 {
-                        track.phase = .descending
-                    }
+                    switch track.phase {
+                    case .idle:
+                        if vel < minDescendVel && depth < 0.025 { track.phase = .descending }
 
-                case .descending:
-                    if depth < -pressDepth {
-                        let h = track.yHistory
-                        let prevVel = h.count >= 4
-                            ? (h[h.count - 2] - h[h.count - 4]) / 2.0
-                            : vel
-                        let decelerated = vel > prevVel * 0.4
-
-                        if !guidedPractice,
+                    case .descending:
+                        if depth < -pressDepth,
                            let k = key,
-                           (decelerated || depth < -pressDepth * 2.5),
                            time - track.lastPressTime > debounceInterval,
                            time - lastKeyPressTime[k.index] > keyLockoutInterval {
-                            let baseConf = min(1.0, abs(depth) / 0.020)
-                            let conf = min(1.0, baseConf + micBoost)
-                            newPresses.append(PressEvent(
-                                keyIndex: k.index,
-                                noteName: k.noteName,
-                                confidence: conf,
-                                fingerID: fid,
-                                timestamp: time
-                            ))
-                            track.phase = .pressed
-                            track.lastPressTime = time
-                            lastKeyPressTime[k.index] = time
+                            let h = track.yHistory
+                            let pv = h.count >= 4 ? (h[h.count - 2] - h[h.count - 4]) / 2.0 : vel
+                            if vel > pv * 0.4 || depth < -pressDepth * 2.5 {
+                                let micBoost = audioBoost(audioSnapshot, time: time)
+                                newPresses.append(PressEvent(
+                                    keyIndex:   k.index,
+                                    noteName:   k.noteName,
+                                    confidence: min(1.0, abs(depth) / 0.020 + micBoost),
+                                    fingerID:   fid,
+                                    timestamp:  time
+                                ))
+                                track.phase = .pressed
+                                track.lastPressTime = time
+                                lastKeyPressTime[k.index] = time
+                            }
                         }
-                    }
-                    if vel > 0.001 && depth > 0.005 {
-                        track.phase = .idle
+                        if vel > 0.001 && depth > 0.005 { track.phase = .idle }
+
+                    case .pressed:
+                        if depth > pressDepth * 0.5 { track.phase = .idle }
                     }
 
-                case .pressed:
-                    if depth > pressDepth * 0.5 {
-                        track.phase = .idle
-                    }
+                    fingers[fid] = track
+                    debugLines.append(String(format: "%@ %+.0fmm %@ [%@]",
+                                            fid, depth * 1000, track.phase.rawValue,
+                                            key?.noteName ?? "-"))
                 }
-
-                fingers[fid] = track
-
-                let keyName = guidedKey?.noteName ?? key?.noteName ?? "-"
-                let depthMM = String(format: "%+.1f", depth * 1000)
-                let micTag = micBoost > 0 ? " mic+\(String(format: "%.2f", micBoost))" : ""
-                let guidedTag = guidedKey != nil ? " armed" : ""
-                debugLines.append("\(fid) \(depthMM)mm \(track.phase.rawValue) [\(keyName)]\(guidedTag)\(micTag)")
             }
-        }
-
-        let guided = guidedPressEvents(
-            from: guidedCandidates,
-            expectedKeyIndices: expectedKeyIndices,
-            snapshot: audioSnapshot,
-            time: time
-        )
-        newPresses.append(contentsOf: guided)
-
-        for fid in fingers.keys where !seen.contains(fid) {
-            fingers[fid] = FingerTrack()
+            for fid in fingers.keys where !seen.contains(fid) { fingers[fid] = FingerTrack() }
         }
 
         recentPresses.append(contentsOf: newPresses)
         recentPresses.removeAll { time - $0.timestamp > flashRetain }
 
-        if time - lastDebugUpdate > 0.1 {
+        if time - lastDebugUpdate > 0.10 {
             lastDebugUpdate = time
             let detected: String
             if !newPresses.isEmpty {
@@ -233,7 +196,139 @@ final class PressDetector: ObservableObject {
         lastGuidedAttackTime = -999
     }
 
-    // MARK: - Key lookup from keyboard-local coordinates
+    // MARK: - Guided press detection (audio-primary)
+    //
+    // In guided mode the song tells us exactly which key(s) to play — we don't
+    // need to identify a key from fingertip X position. Instead:
+    //
+    //   1. Audio onset = "something was played" (timing signal).
+    //   2. Loose keyboard-area presence check = "a hand is at the piano".
+    //   3. Pitch FFT hints optionally add confidence (not required — mic at
+    //      ~50 cm is noisy for bass notes and we don't want false rejections).
+    //
+    // We explicitly avoid identifying the key from vision X position because
+    // Vision + LiDAR gives ≥1 cm world-space error on 23.5 mm keys — the math
+    // cannot be reliable at that resolution.
+
+    private func guidedPressEvents(hands: [HandTracker.HandResult],
+                                   keyboardNode kb: SCNNode,
+                                   expectedKeyIndices: Set<Int>,
+                                   snapshot: PitchSnapshot?,
+                                   time: TimeInterval) -> [PressEvent] {
+        guard let snap   = snapshot,
+              let attack = snap.attack,
+              attack.confidence >= guidedMinAttackConf,
+              abs(time - attack.timestamp) <= guidedAttackWindow,
+              attack.timestamp > lastGuidedAttackTime
+        else { return [] }
+
+        // Loose keyboard presence check.
+        let fingerPresent = anyFingerInKeyboardArea(hands: hands, keyboardNode: kb)
+
+        // Pitch score: does the FFT hint agree with any expected key?
+        let pitchScore = bestPitchScore(expectedKeyIndices: expectedKeyIndices, snapshot: snap)
+
+        // Confidence:  onset (0…0.55) + pitch (0…0.30) + hand-present (0…0.15)
+        var confidence  = attack.confidence * 0.55
+        confidence     += pitchScore * 0.30
+        confidence     += fingerPresent ? 0.15 : 0.0
+
+        // Reject when pitch data is present and clearly contradicts expected note.
+        let pitchContradict = !snap.activeNotes.isEmpty && pitchScore < 0.07
+        guard confidence >= 0.30, !pitchContradict else { return [] }
+
+        lastGuidedAttackTime = attack.timestamp
+
+        // Assign best nearby fingertip to each expected key (fingerID only — not
+        // used for key identification, just for debug display and dedup).
+        let tips = collectFingertips(hands: hands, keyboardNode: kb)
+        var usedFingers = Set<String>()
+
+        return expectedKeyIndices.sorted().compactMap { keyIndex -> PressEvent? in
+            guard keyIndex >= 0, keyIndex < KeyboardLayout.keys.count else { return nil }
+            let key = KeyboardLayout.keys[keyIndex]
+            lastKeyPressTime[keyIndex] = time
+
+            let best = tips
+                .filter { !usedFingers.contains($0.fingerID) }
+                .min { abs($0.localX - key.xCenter) < abs($1.localX - key.xCenter) }
+            if let f = best { usedFingers.insert(f.fingerID) }
+
+            return PressEvent(
+                keyIndex:   keyIndex,
+                noteName:   key.noteName,
+                confidence: min(1.0, confidence),
+                fingerID:   best?.fingerID ?? "audio",
+                timestamp:  time
+            )
+        }
+    }
+
+    // MARK: - Helpers
+
+    private func collectFingertips(hands: [HandTracker.HandResult],
+                                   keyboardNode kb: SCNNode) -> [FingertipLocal] {
+        var out: [FingertipLocal] = []
+        let leftEdge = -KeyboardLayout.totalWidth / 2
+        for hand in hands {
+            let side = hand.isLeft ? "L" : "R"
+            for (joint, name) in Self.tips {
+                guard let wp = hand.joints[joint] else { continue }
+                let lp = kb.simdConvertPosition(wp, from: nil)
+                out.append(FingertipLocal(
+                    fingerID: "\(side)_\(name)",
+                    localX:   lp.x - leftEdge,  // relative to left edge, matching key.xCenter
+                    localY:   lp.y,
+                    localZ:   lp.z
+                ))
+            }
+        }
+        return out
+    }
+
+    private func anyFingerInKeyboardArea(hands: [HandTracker.HandResult],
+                                         keyboardNode kb: SCNNode) -> Bool {
+        let halfW = KeyboardLayout.totalWidth  * 0.55
+        let halfZ = KeyboardLayout.whiteKeyDepth * 0.5 + kbAreaZExtra
+        for hand in hands {
+            for (joint, _) in Self.tips {
+                guard let wp = hand.joints[joint] else { continue }
+                let lp = kb.simdConvertPosition(wp, from: nil)
+                if lp.y > kbAreaYMin && lp.y < kbAreaYMax
+                    && abs(lp.x) < halfW
+                    && abs(lp.z) < halfZ {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
+    private func bestPitchScore(expectedKeyIndices: Set<Int>,
+                                snapshot: PitchSnapshot) -> Float {
+        guard !snapshot.activeNotes.isEmpty else { return 0 }
+        var best: Float = 0
+        for keyIndex in expectedKeyIndices {
+            for hint in snapshot.activeNotes {
+                let d = abs(hint.keyIndex - keyIndex)
+                guard d <= pitchSemitoneWindow else { continue }
+                let penalty: Float = d == 0 ? 1.0 : d == 1 ? 0.75 : d == 2 ? 0.50 : 0.30
+                let s = hint.magnitude * penalty
+                if s > best { best = s }
+            }
+        }
+        return best
+    }
+
+    private func audioBoost(_ snapshot: PitchSnapshot?, time: TimeInterval) -> Float {
+        guard let snap   = snapshot,
+              let attack = snap.attack,
+              abs(time - attack.timestamp) <= 0.12
+        else { return 0 }
+        return 0.06 + attack.confidence * 0.10
+    }
+
+    // MARK: - Key lookup (non-guided mode only)
 
     private func findKey(localX: Float,
                          localZ: Float,
@@ -241,202 +336,35 @@ final class PressDetector: ObservableObject {
                          extraZ: Float = 0.018,
                          keyTuning: KeyTuning? = nil) -> KeyboardLayout.Key? {
         let leftEdge = -KeyboardLayout.totalWidth / 2
-        let relX = localX - leftEdge
+        let relX     = localX - leftEdge
         guard relX >= -extraX, relX <= KeyboardLayout.totalWidth + extraX else { return nil }
 
-        let whiteZMin = -KeyboardLayout.whiteKeyDepth / 2 - extraZ
-        let whiteZMax = KeyboardLayout.whiteKeyDepth / 2 + extraZ
-        guard localZ >= whiteZMin, localZ <= whiteZMax else { return nil }
+        let wZMin = -KeyboardLayout.whiteKeyDepth / 2 - extraZ
+        let wZMax =  KeyboardLayout.whiteKeyDepth / 2 + extraZ
+        guard localZ >= wZMin, localZ <= wZMax else { return nil }
 
-        let blackZCenter = -(KeyboardLayout.whiteKeyDepth - KeyboardLayout.blackKeyDepth) / 2
-        let blackZMin = blackZCenter - KeyboardLayout.blackKeyDepth / 2 - extraZ
-        let blackZMax = blackZCenter + KeyboardLayout.blackKeyDepth / 2 + extraZ
-        if localZ >= blackZMin, localZ <= blackZMax {
+        let bZC  = -(KeyboardLayout.whiteKeyDepth - KeyboardLayout.blackKeyDepth) / 2
+        let bZMn = bZC - KeyboardLayout.blackKeyDepth / 2 - extraZ
+        let bZMx = bZC + KeyboardLayout.blackKeyDepth / 2 + extraZ
+        if localZ >= bZMn, localZ <= bZMx {
             let halfW = KeyboardLayout.blackKeyWidth / 2 + extraX
-            let black = KeyboardLayout.keys
-                .filter {
-                    guard $0.isBlack else { return false }
-                    let center = tunedXCenter(for: $0, keyTuning: keyTuning)
-                    let tunedHalfW = halfW + tunedWidthExtra(for: $0, keyTuning: keyTuning)
-                    return abs(relX - center) < tunedHalfW
-                }
-                .min {
-                    abs(relX - tunedXCenter(for: $0, keyTuning: keyTuning))
-                        < abs(relX - tunedXCenter(for: $1, keyTuning: keyTuning))
-                }
-            if let black {
-                return black
+            if let b = KeyboardLayout.keys
+                .filter({ $0.isBlack && abs(relX - tunedX($0, keyTuning)) < halfW + tunedWE($0, keyTuning) })
+                .min(by: { abs(relX - tunedX($0, keyTuning)) < abs(relX - tunedX($1, keyTuning)) }) {
+                return b
             }
         }
 
         let halfW = KeyboardLayout.whiteKeyWidth / 2 + extraX
         return KeyboardLayout.keys
-            .filter {
-                guard !$0.isBlack else { return false }
-                let center = tunedXCenter(for: $0, keyTuning: keyTuning)
-                let tunedHalfW = halfW + tunedWidthExtra(for: $0, keyTuning: keyTuning)
-                return abs(relX - center) < tunedHalfW
-            }
-            .min {
-                abs(relX - tunedXCenter(for: $0, keyTuning: keyTuning))
-                    < abs(relX - tunedXCenter(for: $1, keyTuning: keyTuning))
-            }
+            .filter { !$0.isBlack && abs(relX - tunedX($0, keyTuning)) < halfW + tunedWE($0, keyTuning) }
+            .min { abs(relX - tunedX($0, keyTuning)) < abs(relX - tunedX($1, keyTuning)) }
     }
 
-    private func expectedGuidedKey(localX: Float,
-                                   localZ: Float,
-                                   expectedKeyIndices: Set<Int>,
-                                   keyTuning: KeyTuning? = nil) -> KeyboardLayout.Key? {
-        guard !expectedKeyIndices.isEmpty else { return nil }
-
-        let leftEdge = -KeyboardLayout.totalWidth / 2
-        let relX = localX - leftEdge
-        var best: (key: KeyboardLayout.Key, score: Float)?
-
-        for index in expectedKeyIndices.sorted() {
-            guard index >= 0, index < KeyboardLayout.keys.count else { continue }
-            let key = KeyboardLayout.keys[index]
-
-            if key.isBlack {
-                let blackZCenter = -(KeyboardLayout.whiteKeyDepth - KeyboardLayout.blackKeyDepth) / 2
-                let center = tunedXCenter(for: key, keyTuning: keyTuning)
-                let halfX = KeyboardLayout.blackKeyWidth / 2
-                    + guidedKeyXTolerance
-                    + tunedWidthExtra(for: key, keyTuning: keyTuning)
-                let halfZ = KeyboardLayout.blackKeyDepth / 2 + guidedKeyZTolerance
-                let dx = abs(relX - center)
-                let dz = abs(localZ - blackZCenter)
-                guard dx <= halfX, dz <= halfZ else { continue }
-                let score = 1.0 - min(1.0, dx / halfX) * 0.70 - min(1.0, dz / halfZ) * 0.30
-                if best == nil || score > best!.score {
-                    best = (key, score)
-                }
-            } else {
-                let center = tunedXCenter(for: key, keyTuning: keyTuning)
-                let halfX = KeyboardLayout.whiteKeyWidth / 2
-                    + 0.008
-                    + tunedWidthExtra(for: key, keyTuning: keyTuning)
-                let halfZ = KeyboardLayout.whiteKeyDepth / 2 + guidedKeyZTolerance
-                let dx = abs(relX - center)
-                let dz = abs(localZ)
-                guard dx <= halfX, dz <= halfZ else { continue }
-                let score = 1.0 - min(1.0, dx / halfX) * 0.78 - min(1.0, dz / halfZ) * 0.22
-                if best == nil || score > best!.score {
-                    best = (key, score)
-                }
-            }
-        }
-
-        return best?.key
+    private func tunedX(_ k: KeyboardLayout.Key, _ kt: KeyTuning?) -> Float {
+        k.xCenter + (kt?.xOffset(for: k.index) ?? 0)
     }
-
-    private func tunedXCenter(for key: KeyboardLayout.Key,
-                              keyTuning: KeyTuning?) -> Float {
-        key.xCenter + (keyTuning?.xOffset(for: key.index) ?? 0)
-    }
-
-    private func tunedWidthExtra(for key: KeyboardLayout.Key,
-                                 keyTuning: KeyTuning?) -> Float {
-        Swift.max(-0.008, keyTuning?.widthExtra(for: key.index) ?? 0)
-    }
-
-    private func makeGuidedCandidate(key: KeyboardLayout.Key?,
-                                     fingerID: String,
-                                     localY: Float,
-                                     expectedKeyIndices: Set<Int>) -> FingerCandidate? {
-        guard let key else { return nil }
-        let surfaceY: Float = key.isBlack
-            ? KeyboardLayout.whiteKeyHeight + KeyboardLayout.blackKeyExtraHeight
-            : KeyboardLayout.whiteKeyHeight
-        let depth = localY - surfaceY
-        guard depth > -guidedMaxBelow, depth < guidedMaxHover else { return nil }
-
-        let hover = max(0, depth)
-        let verticalScore = 1.0 - min(1.0, hover / guidedMaxHover)
-        let isExpected = expectedKeyIndices.contains(key.index)
-        let targetBonus: Float = isExpected ? 0.18 : 0
-        return FingerCandidate(
-            key: key,
-            fingerID: fingerID,
-            score: 0.46 + verticalScore * 0.34 + targetBonus
-        )
-    }
-
-    private func guidedPressEvents(from candidates: [FingerCandidate],
-                                   expectedKeyIndices: Set<Int>,
-                                   snapshot: PitchSnapshot?,
-                                   time: TimeInterval) -> [PressEvent] {
-        guard !expectedKeyIndices.isEmpty,
-              let snapshot,
-              let attack = snapshot.attack,
-              abs(time - attack.timestamp) <= guidedAttackWindow,
-              attack.timestamp - lastGuidedAttackTime > 0.001
-        else { return [] }
-
-        var selected: [FingerCandidate] = []
-        var usedFingers = Set<String>()
-        for keyIndex in expectedKeyIndices.sorted() {
-            let candidate = candidates
-                .filter { $0.key.index == keyIndex && !usedFingers.contains($0.fingerID) }
-                .max { $0.score < $1.score }
-            if let candidate {
-                selected.append(candidate)
-                usedFingers.insert(candidate.fingerID)
-            }
-        }
-
-        if selected.isEmpty,
-           let wrong = candidates
-                .filter({ !expectedKeyIndices.contains($0.key.index) })
-                .max(by: { $0.score < $1.score }) {
-            selected = [wrong]
-        }
-
-        guard !selected.isEmpty else { return [] }
-
-        lastGuidedAttackTime = attack.timestamp
-
-        return selected.map { candidate in
-            lastKeyPressTime[candidate.key.index] = time
-            let pitchBonus: Float = snapshot.activeNotes.contains {
-                abs($0.keyIndex - candidate.key.index) <= 1
-            } ? 0.08 : 0
-            let expectedBonus: Float = expectedKeyIndices.contains(candidate.key.index) ? 0.12 : 0
-            let confidence = min(
-                1.0,
-                candidate.score + attack.confidence * 0.20 + pitchBonus + expectedBonus
-            )
-
-            return PressEvent(
-                keyIndex: candidate.key.index,
-                noteName: candidate.key.noteName,
-                confidence: confidence,
-                fingerID: candidate.fingerID,
-                timestamp: time
-            )
-        }
-    }
-
-    private func audioBoost(for keyIndex: Int,
-                            snapshot: PitchSnapshot?,
-                            time: TimeInterval,
-                            expectedKeyIndices: Set<Int>) -> Float {
-        guard let snapshot,
-              let attack = snapshot.attack,
-              abs(time - attack.timestamp) <= 0.12
-        else { return 0 }
-
-        if !expectedKeyIndices.isEmpty,
-           !expectedKeyIndices.contains(keyIndex) {
-            return 0
-        }
-
-        let pitchMatchesExpected = snapshot.activeNotes.contains {
-            abs($0.keyIndex - keyIndex) <= 1
-        }
-        if pitchMatchesExpected {
-            return 0.16 + attack.confidence * 0.18
-        }
-        return 0.06 + attack.confidence * 0.10
+    private func tunedWE(_ k: KeyboardLayout.Key, _ kt: KeyTuning?) -> Float {
+        Swift.max(-0.008, kt?.widthExtra(for: k.index) ?? 0)
     }
 }
