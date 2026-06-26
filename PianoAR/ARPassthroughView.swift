@@ -12,13 +12,15 @@ struct ARPassthroughView: UIViewRepresentable {
     let audioDetector: AudioPitchDetector
     let keyTuning:     KeyTuning
     let onTap:         (CGPoint) -> Void
+    var onMenuAction:  ((MenuAction) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(placement: placement, calibration: calibration,
                     handTracker: handTracker, songPlayer: songPlayer,
                     pressDetector: pressDetector, audioDetector: audioDetector,
                     keyTuning: keyTuning,
-                    onTap: onTap)
+                    onTap: onTap,
+                    onMenuAction: onMenuAction)
     }
 
     func makeUIView(context: Context) -> ARSCNView {
@@ -43,11 +45,12 @@ struct ARPassthroughView: UIViewRepresentable {
     func updateUIView(_ uiView: ARSCNView, context: Context) {
         placement.sceneView   = uiView
         calibration.sceneView = uiView
-        context.coordinator.onTap          = onTap
-        context.coordinator.songPlayer     = songPlayer
-        context.coordinator.pressDetector  = pressDetector
-        context.coordinator.audioDetector  = audioDetector
-        context.coordinator.keyTuning      = keyTuning
+        context.coordinator.onTap         = onTap
+        context.coordinator.onMenuAction  = onMenuAction
+        context.coordinator.songPlayer    = songPlayer
+        context.coordinator.pressDetector = pressDetector
+        context.coordinator.audioDetector = audioDetector
+        context.coordinator.keyTuning     = keyTuning
     }
 
     // MARK: - Coordinator
@@ -60,17 +63,21 @@ struct ARPassthroughView: UIViewRepresentable {
         var pressDetector: PressDetector
         var audioDetector: AudioPitchDetector
         var keyTuning:     KeyTuning
-        var onTap: (CGPoint) -> Void
+        var onTap:        (CGPoint) -> Void
+        var onMenuAction: ((MenuAction) -> Void)?
 
-        private var hand3D:  Hand3DOverlay?
-        private var highway: NoteHighway?
+        private var hand3D:      Hand3DOverlay?
+        private var highway:     NoteHighway?
+        private var menuOverlay: ARMenuOverlay?
+        private let gestureDetector = GestureDetector()
         private weak var keyboardNode: SCNNode?
 
         init(placement: PlacementManager, calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
              pressDetector: PressDetector, audioDetector: AudioPitchDetector,
              keyTuning: KeyTuning,
-             onTap: @escaping (CGPoint) -> Void) {
+             onTap: @escaping (CGPoint) -> Void,
+             onMenuAction: ((MenuAction) -> Void)? = nil) {
             self.placement     = placement
             self.calibration   = calibration
             self.handTracker   = handTracker
@@ -79,6 +86,7 @@ struct ARPassthroughView: UIViewRepresentable {
             self.audioDetector = audioDetector
             self.keyTuning     = keyTuning
             self.onTap         = onTap
+            self.onMenuAction  = onMenuAction
         }
 
         @objc func handleTap(_ g: UITapGestureRecognizer) {
@@ -100,6 +108,21 @@ struct ARPassthroughView: UIViewRepresentable {
             let expectedKeyIndices = songPlayer.expectedKeyIndicesNow()
             hand3D?.update(hands: hands)
 
+            // ── Gesture detection ──────────────────────────────────────────
+            let pinches = gestureDetector.update(hands: hands, time: time)
+            if let kb = keyboardNode, let menu = menuOverlay {
+                if let action = menu.update(
+                    pinchEvents: pinches,
+                    hands: hands,
+                    keyboardNode: kb,
+                    isPlaying: songPlayer.isPlaying
+                ) {
+                    let cb = onMenuAction
+                    DispatchQueue.main.async { cb?(action) }
+                }
+            }
+
+            // ── Press detection ────────────────────────────────────────────
             let presses = pressDetector.update(
                 hands: hands, keyboardNode: keyboardNode, time: time,
                 audioSnapshot: audio,
@@ -128,6 +151,9 @@ struct ARPassthroughView: UIViewRepresentable {
                 let hw = NoteHighway()
                 n.addChildNode(hw.rootNode)
                 highway = hw
+                let menu = ARMenuOverlay()
+                n.addChildNode(menu.rootNode)
+                menuOverlay = menu
                 keyboardNode = n
                 pressDetector.reset()
                 return n
@@ -140,6 +166,9 @@ struct ARPassthroughView: UIViewRepresentable {
                 let hw = NoteHighway()
                 n.addChildNode(hw.rootNode)
                 highway = hw
+                let menu = ARMenuOverlay()
+                n.addChildNode(menu.rootNode)
+                menuOverlay = menu
                 keyboardNode = n
                 pressDetector.reset()
                 return n

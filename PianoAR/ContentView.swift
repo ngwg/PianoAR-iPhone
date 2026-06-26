@@ -29,7 +29,8 @@ struct ContentView: View {
                 pressDetector: pressDetector,
                 audioDetector: audioDetector,
                 keyTuning:     keyTuning,
-                onTap:         handleTap
+                onTap:         handleTap,
+                onMenuAction:  handleMenuAction
             )
             .ignoresSafeArea()
 
@@ -397,6 +398,34 @@ struct ContentView: View {
         switch mode {
         case .virtualPiano: placement.handleTap(at: point)
         case .realPiano:    calibration.handleTap(at: point)
+        }
+    }
+
+    // MARK: AR menu gesture routing
+
+    private func handleMenuAction(_ action: MenuAction) {
+        switch action {
+        case .playStop:
+            if songPlayer.isPlaying { songPlayer.stop() } else { songPlayer.play() }
+        case .restart:
+            songPlayer.restart()
+        case .nextSong:
+            advanceToNextSong()
+        }
+    }
+
+    private func advanceToNextSong() {
+        // Cycle through: built-in, then imported songs in order, then loop back.
+        let allSongs: [Song?] = [nil] + importedSongs.map { Optional($0) }
+        let currentTitle = songPlayer.song?.title
+        let currentIdx = allSongs.firstIndex {
+            $0?.title == currentTitle
+        } ?? 0
+        let nextIdx = (currentIdx + 1) % allSongs.count
+        if let next = allSongs[nextIdx] {
+            songPlayer.load(next)
+        } else {
+            loadBuiltInLesson()
         }
     }
 }
