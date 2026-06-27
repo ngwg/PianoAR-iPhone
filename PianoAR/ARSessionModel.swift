@@ -83,6 +83,21 @@ final class ARSessionModel: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     func sessionInterruptionEnded(_ session: ARSession) {
-        start()
+        // Resume tracking without removing existing anchors — the keyboard placement
+        // must survive interruptions (notifications, screen lock, etc.).
+        let config = ARWorldTrackingConfiguration()
+        config.planeDetection = [.horizontal]
+        config.environmentTexturing = .none
+        config.isAutoFocusEnabled = true
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
+            config.frameSemantics.insert(.sceneDepth)
+        }
+        if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
+            config.frameSemantics.insert(.smoothedSceneDepth)
+        }
+        if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+            config.sceneReconstruction = .mesh
+        }
+        session.run(config, options: [])   // no resetTracking, no removeExistingAnchors
     }
 }

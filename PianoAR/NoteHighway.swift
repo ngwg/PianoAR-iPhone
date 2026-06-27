@@ -20,7 +20,7 @@ final class NoteHighway {
     private static let matBackground: SCNMaterial = {
         let m = SCNMaterial()
         m.lightingModel       = .constant
-        m.diffuse.contents    = UIColor(red: 0.04, green: 0.05, blue: 0.16, alpha: 0.78)
+        m.diffuse.contents    = UIColor(red: 0.05, green: 0.07, blue: 0.22, alpha: 0.82)
         m.blendMode           = .alpha
         m.isDoubleSided       = true
         m.writesToDepthBuffer = false
@@ -123,11 +123,12 @@ final class NoteHighway {
 
     private static let matLabel: SCNMaterial = {
         let m = SCNMaterial()
-        m.lightingModel      = .constant
-        m.diffuse.contents   = UIColor.white
-        m.emission.contents  = UIColor(white: 0.65, alpha: 1)
-        m.isDoubleSided      = true
-        m.writesToDepthBuffer = false
+        m.lightingModel        = .constant
+        m.diffuse.contents     = UIColor.white
+        m.emission.contents    = UIColor(white: 0.65, alpha: 1)
+        m.isDoubleSided        = true
+        m.writesToDepthBuffer  = false
+        m.readsFromDepthBuffer = false   // always visible, not hidden by key boxes
         return m
     }()
 

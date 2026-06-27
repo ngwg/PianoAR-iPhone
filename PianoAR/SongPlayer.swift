@@ -261,10 +261,11 @@ final class SongPlayer: ObservableObject {
     }
 
     private func updateScoreLine() {
-        let average = timingSampleCount > 0 ? totalAbsTimingMs / Double(timingSampleCount) : 0
-        let last = Int(lastTimingMs.rounded())
-        let avg = Int(average.rounded())
-        let line = "Score: \(acceptedCount) ok  \(retryCount) retries  streak \(currentStreak)/\(bestStreak)  last \(last)ms avg \(avg)ms"
+        let average  = timingSampleCount > 0 ? totalAbsTimingMs / Double(timingSampleCount) : 0
+        let lastMs   = Int(abs(lastTimingMs).rounded())
+        let avgMs    = Int(average.rounded())
+        let timing   = lastMs == 0 ? "" : (lastTimingMs > 0 ? " \(lastMs)ms late" : " \(lastMs)ms early")
+        let line     = "\(acceptedCount) ok  \(retryCount) retry  streak \(currentStreak)/\(bestStreak)\(timing)  avg \(avgMs)ms"
         DispatchQueue.main.async { [weak self] in
             self?.scoreLine = line
         }

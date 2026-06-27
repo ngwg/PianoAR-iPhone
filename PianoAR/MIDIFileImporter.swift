@@ -22,13 +22,16 @@ enum MIDIImportError: LocalizedError {
 
 enum MIDIFileImporter {
     private struct RawNote {
-        let midiNote: Int
+        let midiNote:  Int
         let startTick: Int
-        let endTick: Int
+        var endTick:   Int
+        let channel:   Int   // 0-15 from status byte
+        var isLeft:    Bool  = false
     }
 
     private struct ActiveNote {
         let startTick: Int
+        let channel:   Int
     }
 
     static func loadBundled(named name: String, title: String? = nil) -> Song? {
@@ -45,7 +48,7 @@ enum MIDIFileImporter {
         let headerLength = try reader.readUInt32()
         guard headerLength >= 6 else { throw MIDIImportError.invalidHeader }
 
-        _ = try reader.readUInt16() // format 0, 1, or 2. We parse tracks the same way.
+        let format = Int(try reader.readUInt16())  // 0 = single track, 1 = multi-track
         let trackCount = Int(try reader.readUInt16())
         let division = try reader.readUInt16()
         guard division & 0x8000 == 0 else { throw MIDIImportError.unsupportedTimeDivision }
@@ -58,7 +61,7 @@ enum MIDIFileImporter {
         var notes: [RawNote] = []
         var bpm = 90.0
 
-        for _ in 0..<trackCount {
+        for trackIndex in 0..<trackCount {
             guard try reader.readASCII(4) == "MTrk" else { throw MIDIImportError.invalidHeader }
             let trackLength = Int(try reader.readUInt32())
             let trackEnd = reader.position + trackLength
@@ -69,7 +72,21 @@ enum MIDIFileImporter {
                 ticksPerQuarter: ticksPerQuarter,
                 bpm: &bpm
             )
-            notes.append(contentsOf: parsed)
+            // Hand assignment:
+            // Format 1: track 0 is the tempo track (no notes in practice). Track 1 = right,
+            //           track 2 = left hand. Track 3+ treated as right (uncommon in piano MIDI).
+            // Format 0: all notes on one track — use MIDI channel. Channel 1 (status 0x91) = left.
+            // RawNote carries the channel so we can decide here.
+            let isLeftTrack: Bool
+            switch format {
+            case 1:  isLeftTrack = (trackIndex == 2)
+            default: isLeftTrack = false   // resolved per-note via channel below
+            }
+            for var note in parsed {
+                if format != 1 { note.isLeft = (note.channel == 1) }
+                else           { note.isLeft = isLeftTrack }
+                notes.append(note)
+            }
             reader.position = trackEnd
         }
 
@@ -87,7 +104,7 @@ enum MIDIFileImporter {
                         0.25,
                         Double(note.endTick - note.startTick) / Double(ticksPerQuarter)
                     ),
-                    hand: "right"
+                    hand: note.isLeft ? "left" : "right"
                 )
             }
 
@@ -116,6 +133,8 @@ enum MIDIFileImporter {
                 runningStatus = status
             }
 
+            let channel = Int(status & 0x0F)
+
             switch status {
             case 0x80...0x8F:
                 let note = Int(try reader.readUInt8())
@@ -128,7 +147,7 @@ enum MIDIFileImporter {
                 if velocity == 0 {
                     close(note: note, tick: tick, active: &active, notes: &notes)
                 } else {
-                    active[note, default: []].append(ActiveNote(startTick: tick))
+                    active[note, default: []].append(ActiveNote(startTick: tick, channel: channel))
                 }
 
             case 0xA0...0xBF, 0xE0...0xEF:
@@ -166,9 +185,10 @@ enum MIDIFileImporter {
         for (note, stack) in active {
             for item in stack {
                 notes.append(RawNote(
-                    midiNote: note,
+                    midiNote:  note,
                     startTick: item.startTick,
-                    endTick: item.startTick + ticksPerQuarter
+                    endTick:   item.startTick + ticksPerQuarter,
+                    channel:   item.channel
                 ))
             }
         }
@@ -183,7 +203,8 @@ enum MIDIFileImporter {
         guard var stack = active[note], !stack.isEmpty else { return }
         let item = stack.removeFirst()
         active[note] = stack
-        notes.append(RawNote(midiNote: note, startTick: item.startTick, endTick: tick))
+        notes.append(RawNote(midiNote: note, startTick: item.startTick,
+                             endTick: tick, channel: item.channel))
     }
 
     private static func midiName(_ midi: Int) -> String {

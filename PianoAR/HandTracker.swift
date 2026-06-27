@@ -36,7 +36,9 @@ final class HandTracker: ObservableObject {
     private var isProcessing = false
     // No frame-count gate — process as fast as Vision allows; isProcessing prevents queuing.
     private let visionQueue  = DispatchQueue(label: "com.piano.vision", qos: .userInteractive)
-    private var smoothed:    [String: SIMD3<Float>] = [:]
+    private var smoothed:     [String: SIMD3<Float>]        = [:]
+    private var smoothedAge:  [String: TimeInterval]        = [:]
+    private static let smoothedStaleTimeout: TimeInterval   = 0.5
 
     // Reusable downscale buffer — allocated once, reused every frame to avoid heap churn.
     private var scaledBuf:  CVPixelBuffer?
@@ -97,7 +99,7 @@ final class HandTracker: ObservableObject {
 
             for name in HandTracker.allJoints {
                 guard let pt = try? obs.recognizedPoint(name),
-                      pt.confidence > 0.15 else { continue }
+                      pt.confidence > 0.30 else { continue }
 
                 // Vision (y-up, bottom-left) → camera image pixel (y-down, top-left)
                 let px = Float(pt.location.x) * imgW
@@ -113,17 +115,22 @@ final class HandTracker: ObservableObject {
                 // This eliminates lag on fast gestures while suppressing jitter at rest —
                 // critical for the gesture UI in Phase 6.
                 let key = "\(side)_\(name.rawValue)"
+                let now = CACurrentMediaTime()
                 let s: SIMD3<Float>
-                if let prev = smoothed[key] {
+                if let prev = smoothed[key],
+                   let age  = smoothedAge[key],
+                   now - age < Self.smoothedStaleTimeout {
                     let dist  = simd_length(world - prev)
                     // α ≈ 0.2 for < 3 mm/frame movement, ramps to 0.95 at > 4 cm/frame
                     let alpha = simd_clamp(dist / 0.04, 0.2, 0.95)
                     s = prev + alpha * (world - prev)
                 } else {
+                    // Stale or first appearance — jump directly to avoid "snap" from old position.
                     s = world
                 }
-                smoothed[key] = s
-                joints[name]  = s
+                smoothed[key]    = s
+                smoothedAge[key] = now
+                joints[name]     = s
             }
 
             if !joints.isEmpty {
@@ -169,20 +176,37 @@ final class HandTracker: ObservableObject {
 
     // MARK: - Helpers
 
+    /// Sample LiDAR depth at a 3×3 neighbourhood and return the median valid reading.
+    /// Single-pixel sampling is fragile — LiDAR depth maps have holes and noise at
+    /// object edges, so a joint that lands on a depth-map hole would fall back to the
+    /// 0.4 m default. The 3×3 median is cheap (9 reads) and robust.
     private func sampleDepth(from map: CVPixelBuffer,
                                px: Float, py: Float,
                                imgW: Float, imgH: Float) -> Float? {
-        let dW = CVPixelBufferGetWidth(map)
-        let dH = CVPixelBufferGetHeight(map)
-        let dx = max(0, min(dW - 1, Int((px / imgW * Float(dW)).rounded())))
-        let dy = max(0, min(dH - 1, Int((py / imgH * Float(dH)).rounded())))
+        let dW     = CVPixelBufferGetWidth(map)
+        let dH     = CVPixelBufferGetHeight(map)
+        let cxD    = Int((px / imgW * Float(dW)).rounded())
+        let cyD    = Int((py / imgH * Float(dH)).rounded())
+        let stride = CVPixelBufferGetBytesPerRow(map) / 4
 
         CVPixelBufferLockBaseAddress(map, .readOnly)
         defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
-
         guard let base = CVPixelBufferGetBaseAddress(map) else { return nil }
-        let val = base.assumingMemoryBound(to: Float32.self)[dy * (CVPixelBufferGetBytesPerRow(map) / 4) + dx]
-        return (val > 0.05 && val < 5.0 && val.isFinite) ? val : nil
+        let data = base.assumingMemoryBound(to: Float32.self)
+
+        var samples: [Float] = []
+        samples.reserveCapacity(9)
+        for dy in -1...1 {
+            for dx in -1...1 {
+                let col = max(0, min(dW - 1, cxD + dx))
+                let row = max(0, min(dH - 1, cyD + dy))
+                let v   = data[row * stride + col]
+                if v > 0.05 && v < 5.0 && v.isFinite { samples.append(v) }
+            }
+        }
+        guard !samples.isEmpty else { return nil }
+        let sorted = samples.sorted()
+        return sorted[sorted.count / 2]   // median
     }
 
     // ARKit camera: right-hand coords, looks along -Z, Y up. Image: x-right, y-down.

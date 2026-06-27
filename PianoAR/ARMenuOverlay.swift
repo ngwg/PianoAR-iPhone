@@ -46,11 +46,12 @@ final class ARMenuOverlay {
             let box   = SCNBox(width: 0.120, height: 0.048, length: 0.008,
                                chamferRadius: 0.006)
             let mat   = SCNMaterial()
-            mat.lightingModel     = .constant
-            mat.diffuse.contents  = Self.colNormal
-            mat.blendMode         = .alpha
-            mat.isDoubleSided     = true
-            mat.writesToDepthBuffer = false
+            mat.lightingModel        = .constant
+            mat.diffuse.contents     = Self.colNormal
+            mat.blendMode            = .alpha
+            mat.isDoubleSided        = true
+            mat.writesToDepthBuffer  = false
+            mat.readsFromDepthBuffer = false   // always render on top of key geometry
             box.materials = [mat]
 
             let node = SCNNode(geometry: box)
@@ -62,11 +63,12 @@ final class ARMenuOverlay {
             let txt           = SCNText(string: label, extrusionDepth: 0.001)
             txt.font          = UIFont.boldSystemFont(ofSize: 1.0)
             txt.flatness      = 0.05
-            let tmat          = SCNMaterial()
-            tmat.lightingModel    = .constant
-            tmat.diffuse.contents = UIColor.white
-            tmat.writesToDepthBuffer = false
-            txt.materials     = [tmat]
+            let tmat = SCNMaterial()
+            tmat.lightingModel        = .constant
+            tmat.diffuse.contents     = UIColor.white
+            tmat.writesToDepthBuffer  = false
+            tmat.readsFromDepthBuffer = false
+            txt.materials = [tmat]
             let tnode         = SCNNode(geometry: txt)
             tnode.scale       = SCNVector3(0.009, 0.009, 0.009)
             // Rough centering — SCNText anchors at lower-left.

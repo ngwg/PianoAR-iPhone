@@ -17,17 +17,25 @@ enum KeyboardNode {
             chamferRadius: 0.003
         )
         let baseMat = SCNMaterial()
+        baseMat.lightingModel    = .constant
         baseMat.diffuse.contents = UIColor(red: 0.18, green: 0.09, blue: 0.02, alpha: 1)
         base.materials = [baseMat]
         let baseNode = SCNNode(geometry: base)
         baseNode.position = SCNVector3(0, -0.003, 0)
         root.addChildNode(baseNode)
 
+        // Constant lighting model: the keys look exactly like their diffuse color
+        // regardless of scene light estimation. This matters in the headset where the
+        // phone is in a dark enclosure — default Blinn/Phong gets very dark.
         let ivoryMat = SCNMaterial()
-        ivoryMat.diffuse.contents = UIColor(white: 0.94, alpha: 1)
+        ivoryMat.lightingModel    = .constant
+        ivoryMat.diffuse.contents = UIColor(white: 0.93, alpha: 1)
+        ivoryMat.emission.contents = UIColor(white: 0.06, alpha: 1)  // slight glow for dark rooms
 
         let eboxyMat = SCNMaterial()
-        eboxyMat.diffuse.contents = UIColor(white: 0.08, alpha: 1)
+        eboxyMat.lightingModel    = .constant
+        eboxyMat.diffuse.contents = UIColor(white: 0.10, alpha: 1)
+        eboxyMat.emission.contents = UIColor(white: 0.02, alpha: 1)
 
         // White keys first so black keys render on top
         for key in KeyboardLayout.keys where !key.isBlack {

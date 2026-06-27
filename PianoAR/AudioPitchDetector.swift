@@ -74,9 +74,10 @@ final class AudioPitchDetector: ObservableObject {
     // Debug pitch hints.
     private var keyEnergy: [Float] = .init(repeating: 0, count: 88)
 
-    // Adaptive attack gates.
-    private var ambientRMS: Float = 0.002
-    private var ambientFlux: Float = 0.08
+    // Adaptive attack gates. Start low so the first few real attacks are not missed
+    // while the ambient estimate converges upward from actual environment noise.
+    private var ambientRMS: Float = 0.0008
+    private var ambientFlux: Float = 0.04
     private var lastAttackTime: TimeInterval = 0
     private var hasPreviousSpectrum = false
 
@@ -84,6 +85,7 @@ final class AudioPitchDetector: ObservableObject {
     private let stateQueue = DispatchQueue(label: "com.pianoar.audio-detector.state")
     private var tapInstalled = false
     private var running = false
+    private var interruptionObserver: NSObjectProtocol?
 
     private let lock = NSLock()
     private var _snap = PitchSnapshot(activeNotes: [], attack: nil, timestamp: 0)
@@ -105,6 +107,9 @@ final class AudioPitchDetector: ObservableObject {
     }
 
     deinit {
+        if let obs = interruptionObserver {
+            NotificationCenter.default.removeObserver(obs)
+        }
         if tapInstalled {
             engine.inputNode.removeTap(onBus: 0)
         }
@@ -115,6 +120,23 @@ final class AudioPitchDetector: ObservableObject {
     // MARK: - Start / Stop
 
     func start() {
+        // Register for audio session interruption (phone call, Siri, etc.) so the
+        // mic restarts automatically when the interruption ends.
+        if interruptionObserver == nil {
+            interruptionObserver = NotificationCenter.default.addObserver(
+                forName: AVAudioSession.interruptionNotification,
+                object: nil, queue: nil
+            ) { [weak self] notification in
+                guard let self,
+                      let typeValue = notification.userInfo?[AVAudioSessionInterruptionTypeKey] as? UInt,
+                      let type = AVAudioSession.InterruptionType(rawValue: typeValue)
+                else { return }
+                if type == .ended {
+                    self.stateQueue.async { self.configureAndStart() }
+                }
+            }
+        }
+
         let session = AVAudioSession.sharedInstance()
         switch session.recordPermission {
         case .granted:
@@ -514,8 +536,8 @@ final class AudioPitchDetector: ObservableObject {
         keyEnergy = .init(repeating: 0, count: 88)
         ringW = 0
         hopAcc = 0
-        ambientRMS = 0.002
-        ambientFlux = 0.08
+        ambientRMS  = 0.0008
+        ambientFlux = 0.04
         lastAttackTime = 0
         hasPreviousSpectrum = false
     }
