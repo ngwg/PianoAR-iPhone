@@ -45,12 +45,15 @@ final class ARMenuOverlay {
     private static let initRotY: Float = -Float.pi * 0.13
 
     // ── Cursor / click thresholds ───────────────────────────────────────────
-    private static let hoverMaxZ:  Float        = 0.11   // show cursor within 11 cm of face
-    private static let pokeArmZ:   Float        = 0.045  // finger must start beyond this …
-    private static let pokeFireZ:  Float        = 0.015  // … then cross inside this to poke
-    private static let dwellTime:  TimeInterval = 0.50
+    // Generous reach: the cursor appears (and dwell works) from up to ~28 cm in
+    // front of the panel, so you can tap from a comfortable distance without
+    // having to push your finger all the way to the virtual surface.
+    private static let hoverMaxZ:  Float        = 0.28   // show cursor within 28 cm of face
+    private static let pokeArmZ:   Float        = 0.090  // finger must start beyond this …
+    private static let pokeFireZ:  Float        = 0.040  // … then cross inside this to poke
+    private static let dwellTime:  TimeInterval = 0.45
     private static let debounce:   TimeInterval = 0.32
-    private static let xyMargin:   Float        = 0.018
+    private static let xyMargin:   Float        = 0.030
 
     // ── Grab thresholds ─────────────────────────────────────────────────────
     private static let grabPinchOn:  Float = 0.030

@@ -109,6 +109,12 @@ final class PressDetector: ObservableObject {
                 let side = hand.isLeft ? "L" : "R"
                 for (joint, fingerName) in Self.tips {
                     guard let wp = hand.joints[joint] else { continue }
+                    // Skip occlusion-reconstructed tips: a guessed fingertip must
+                    // never register a press in the depth/trajectory path.
+                    if hand.estimated.contains(joint) {
+                        fingers["\(side)_\(fingerName)"] = FingerTrack()
+                        continue
+                    }
                     let fid  = "\(side)_\(fingerName)"
                     seen.insert(fid)
                     let lp   = kb.simdConvertPosition(wp, from: nil)

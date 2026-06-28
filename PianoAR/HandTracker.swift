@@ -17,6 +17,10 @@ final class HandTracker: ObservableObject {
     struct HandResult {
         let isLeft: Bool
         var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>]
+        // Joints that were occluded and reconstructed (guessed) rather than
+        // directly detected. Used for the hand model + UI cursor, but press
+        // detection ignores these so a guessed fingertip can't fire a note.
+        var estimated: Set<VNHumanHandPoseObservation.JointName> = []
     }
 
     static let allJoints: [VNHumanHandPoseObservation.JointName] = [
@@ -47,6 +51,9 @@ final class HandTracker: ObservableObject {
     private var smoothed:     [String: SIMD3<Float>]        = [:]
     private var smoothedAge:  [String: TimeInterval]        = [:]
     private var lastDepthByKey: [String: Float]             = [:]
+    // Per-hand canonical skeleton: each joint's position in the palm-local frame,
+    // learned whenever that joint is visible. Drives occlusion reconstruction.
+    private var localPose:    [String: [Int: SIMD3<Float>]] = [:]
     private static let smoothedStaleTimeout: TimeInterval   = 0.5
 
     // Reusable downscale buffer — allocated once, reused every frame to avoid heap churn.
@@ -162,11 +169,93 @@ final class HandTracker: ObservableObject {
             }
 
             if !joints.isEmpty {
-                results.append(HandResult(isLeft: obs.chirality == .left, joints: joints))
+                let estimated = completeHand(side: side, joints: &joints)
+                results.append(HandResult(isLeft: obs.chirality == .left,
+                                          joints: joints, estimated: estimated))
             }
         }
 
         commit(results, count: observations.count)
+    }
+
+    // MARK: - Occlusion reconstruction
+
+    /// Fills in joints Vision couldn't see this frame, using a palm-local model of
+    /// the hand learned from frames where they *were* visible. The palm (wrist +
+    /// knuckles) is close to rigid, so a joint's position relative to a palm frame
+    /// is stable; transforming that learned local position into the current palm
+    /// orientation gives a natural guess for an occluded finger that still rotates
+    /// correctly as the hand turns. Returns the set of joints that were guessed.
+    @discardableResult
+    private func completeHand(side: String,
+                              joints: inout [VNHumanHandPoseObservation.JointName: SIMD3<Float>])
+        -> Set<VNHumanHandPoseObservation.JointName> {
+
+        var pos: [Int: SIMD3<Float>] = [:]
+        for (i, name) in HandTracker.allJoints.enumerated() {
+            if let p = joints[name] { pos[i] = p }
+        }
+        let detected = Set(pos.keys)
+
+        guard let frame = palmFrame(pos) else { return [] }
+        let rInv = frame.r.transpose   // orthonormal → inverse is transpose
+
+        // Learn / refresh local coords for every visible joint.
+        var store = localPose[side] ?? [:]
+        for (i, p) in pos { store[i] = rInv * (p - frame.origin) }
+        localPose[side] = store
+
+        var estimated = Set<VNHumanHandPoseObservation.JointName>()
+
+        // Reconstruct any joint we have a learned pose for but didn't see this frame.
+        for i in 0..<HandTracker.allJoints.count where !detected.contains(i) {
+            guard let local = store[i] else { continue }
+            let world = frame.origin + frame.r * local
+            pos[i] = world
+            joints[HandTracker.allJoints[i]] = world
+            estimated.insert(HandTracker.allJoints[i])
+        }
+
+        // Fingertip refinement: when a tip is occluded but its two parent joints are
+        // *actually* detected, extrapolate along the live finger so the tip follows
+        // the current curl instead of the stale palm-relative guess.
+        for tip in [4, 8, 12, 16, 20] where !detected.contains(tip) {
+            guard detected.contains(tip - 1), detected.contains(tip - 2),
+                  let a = pos[tip - 1], let b = pos[tip - 2] else { continue }
+            let world = a + (a - b) * 0.7
+            pos[tip] = world
+            joints[HandTracker.allJoints[tip]] = world
+            estimated.insert(HandTracker.allJoints[tip])
+        }
+
+        return estimated
+    }
+
+    /// Builds an orthonormal palm frame (origin at the wrist) from whatever palm
+    /// joints are visible. Needs the wrist + at least two knuckles.
+    private func palmFrame(_ pos: [Int: SIMD3<Float>])
+        -> (origin: SIMD3<Float>, r: simd_float3x3)? {
+
+        guard let wrist = pos[0] else { return nil }
+        let mcps = [pos[5], pos[9], pos[13], pos[17]].compactMap { $0 }
+        guard mcps.count >= 2 else { return nil }
+
+        let centroid = mcps.reduce(SIMD3<Float>(repeating: 0), +) / Float(mcps.count)
+        var forward  = centroid - wrist
+        guard simd_length(forward) > 1e-4 else { return nil }
+        forward = simd_normalize(forward)
+
+        // "Across" the palm: index knuckle → little knuckle if both present.
+        let across0 = (pos[5] != nil && pos[17] != nil)
+            ? pos[17]! - pos[5]!
+            : mcps.last! - mcps.first!
+        var across = across0 - forward * simd_dot(across0, forward)   // orthogonalize
+        guard simd_length(across) > 1e-4 else { return nil }
+        across = simd_normalize(across)
+
+        let up      = simd_normalize(simd_cross(forward, across))     // palm normal
+        let across2 = simd_cross(up, forward)                          // re-orthonormalize
+        return (wrist, simd_float3x3(columns: (across2, up, forward)))
     }
 
     // MARK: - Downscaling
