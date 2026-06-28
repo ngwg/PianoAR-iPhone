@@ -13,7 +13,7 @@ final class GestureDetector {
     private let onThreshold:  Float = 0.030
     private let offThreshold: Float = 0.050
     // Minimum time between consecutive pinches on the same hand
-    private let debounce: TimeInterval = 0.55
+    private let debounce: TimeInterval = 0.22
 
     private var pinching:      [String: Bool]          = [:]
     private var lastPinchTime: [String: TimeInterval]  = [:]

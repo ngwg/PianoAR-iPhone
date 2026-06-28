@@ -109,15 +109,15 @@ struct ARPassthroughView: UIViewRepresentable {
             let hands = handTracker.snapshot()
             let audio = audioDetector.snapshot()
             let expectedKeyIndices = songPlayer.expectedKeyIndicesNow()
-            hand3D?.update(hands: hands)
+            // Hand model renders above UI (renderingOrder 300 > buttons 200)
+            hand3D?.update(hands: hands, menu: menuOverlay, keyboardNode: keyboardNode)
 
-            // ── Gesture detection ──────────────────────────────────────────
-            let pinches = gestureDetector.update(hands: hands, time: time)
+            // AR menu: direct fingertip touch — no pinch required
             if let kb = keyboardNode, let menu = menuOverlay {
                 if let action = menu.update(
-                    pinchEvents: pinches,
                     hands: hands,
                     keyboardNode: kb,
+                    time: time,
                     isPlaying: songPlayer.isPlaying,
                     debugOn: showDebug
                 ) {
@@ -217,58 +217,106 @@ struct ARPassthroughView: UIViewRepresentable {
 }
 
 // MARK: - 3-D hand overlay
+//
+// Renders a realistic skin-toned hand skeleton in world space.
+// renderingOrder = 300 ensures the hand always appears in front of the AR
+// menu buttons (200) and note-highway geometry (50–100), so the player's
+// virtual hand visually "goes over" all UI elements.
+//
+// The index-fingertip node doubles as a touch cursor: it glows blue when
+// near an AR menu button and green when within trigger distance.
 
 private final class Hand3DOverlay {
 
+    // Joint sphere radii (mm → m), indexed by HandTracker.allJoints order
+    // [0]=wrist, [1-4]=thumb, [5-8]=index, [9-12]=middle, [13-16]=ring, [17-20]=little
     private static let sphereR: [Float] = [
-        0.020,
-        0.011, 0.010, 0.009, 0.008,
-        0.012, 0.010, 0.009, 0.007,
-        0.012, 0.010, 0.009, 0.007,
-        0.012, 0.010, 0.009, 0.007,
-        0.010, 0.009, 0.008, 0.006,
+        0.018,                              // wrist
+        0.010, 0.009, 0.008, 0.007,        // thumb CMC MP IP TIP
+        0.011, 0.009, 0.008, 0.007,        // index MCP PIP DIP TIP
+        0.011, 0.009, 0.008, 0.007,        // middle
+        0.010, 0.009, 0.008, 0.007,        // ring
+        0.009, 0.008, 0.007, 0.006,        // little
     ]
-    private static let cylR: Float = 0.008
+    private static let cylR: Float = 0.0055
 
-    private var sph: [[SCNNode]] = []
-    private var cyl: [[SCNNode]] = []
+    // Index joint in allJoints that is the index fingertip (used as touch cursor)
+    private static let indexTipJoint = 8
+    private static let thumbTipJoint = 4
+
+    // Skin-tone palette (CGColor — thread-safe for render-thread emission changes)
+    private static let cgSkin  = CGColor(red: 0.88, green: 0.71, blue: 0.55, alpha: 1)
+    private static let cgCursorHover   = CGColor(red: 0.15, green: 0.55, blue: 1.00, alpha: 1)
+    private static let cgCursorTouch   = CGColor(red: 0.08, green: 0.96, blue: 0.40, alpha: 1)
+    private static let cgCursorInactive = CGColor(red: 0.70, green: 0.55, blue: 0.42, alpha: 1)
+
+    // Nodes: [hand 0=left, 1=right][joint/bone index]
+    private var sph:    [[SCNNode]] = []
+    private var cyl:    [[SCNNode]] = []
+    // Separate tracked index-tip sphere materials for cursor glow changes
+    private var idxTipMat: [SCNMaterial] = []
 
     init(scene: SCNScene) {
+        let skinMat  = Self.makeMat(skin: true,  isTip: false)
+        let tipMat   = Self.makeMat(skin: true,  isTip: true)
+        let boneMat  = Self.makeMat(skin: false, isTip: false)
+
         for _ in 0..<2 {
             var sNodes: [SCNNode] = []
             var cNodes: [SCNNode] = []
+            var idxMat: SCNMaterial?
 
             for i in 0..<HandTracker.allJoints.count {
-                let geo = SCNSphere(radius: CGFloat(Self.sphereR[i]))
-                geo.segmentCount = 8
-                geo.materials    = [Self.mat()]
+                let r   = CGFloat(Self.sphereR[i])
+                let geo = SCNSphere(radius: r)
+                geo.segmentCount = 10
+                let isTip = (i == Self.indexTipJoint || i == Self.thumbTipJoint ||
+                              i == 12 || i == 16 || i == 20)
+                let mat: SCNMaterial
+                if i == Self.indexTipJoint {
+                    // Dedicated mutable material for cursor glow
+                    mat = Self.makeMat(skin: true, isTip: true)
+                    idxMat = mat
+                } else {
+                    mat = isTip ? tipMat : skinMat
+                }
+                geo.materials = [mat]
                 let n = SCNNode(geometry: geo)
-                n.isHidden = true; n.renderingOrder = 100
+                n.isHidden       = true
+                n.renderingOrder = 300
                 scene.rootNode.addChildNode(n)
                 sNodes.append(n)
             }
 
             for _ in 0..<HandTracker.boneConnections.count {
                 let geo = SCNCylinder(radius: CGFloat(Self.cylR), height: 1.0)
-                geo.radialSegmentCount = 6
-                geo.materials    = [Self.mat()]
+                geo.radialSegmentCount = 8
+                geo.materials    = [boneMat]
                 let n = SCNNode(geometry: geo)
-                n.isHidden = true; n.renderingOrder = 100
+                n.isHidden       = true
+                n.renderingOrder = 300
                 scene.rootNode.addChildNode(n)
                 cNodes.append(n)
             }
 
-            sph.append(sNodes); cyl.append(cNodes)
+            sph.append(sNodes)
+            cyl.append(cNodes)
+            idxTipMat.append(idxMat ?? Self.makeMat(skin: true, isTip: true))
         }
     }
 
-    func update(hands: [HandTracker.HandResult]) {
+    /// Call from render thread. `menu` and `keyboardNode` are optional:
+    /// if provided, the index-fingertip cursor node changes colour based on
+    /// its proximity to AR menu buttons.
+    func update(hands: [HandTracker.HandResult],
+                menu: ARMenuOverlay?,
+                keyboardNode: SCNNode?) {
         sph.forEach { $0.forEach { $0.isHidden = true } }
         cyl.forEach { $0.forEach { $0.isHidden = true } }
 
         for hand in hands {
             let h = hand.isLeft ? 0 : 1
-            guard h < 2 else { continue }
+            guard h < sph.count else { continue }
 
             for (i, name) in HandTracker.allJoints.enumerated() {
                 guard let p = hand.joints[name] else { continue }
@@ -279,27 +327,58 @@ private final class Hand3DOverlay {
             for (i, (fi, ti)) in HandTracker.boneConnections.enumerated() {
                 guard let a = hand.joints[HandTracker.allJoints[fi]],
                       let b = hand.joints[HandTracker.allJoints[ti]] else { continue }
-                place(cyl[h][i], from: a, to: b)
+                placeCylinder(cyl[h][i], from: a, to: b)
+            }
+
+            // Touch cursor: colour the index-tip sphere based on menu proximity
+            if let idxWorld = hand.joints[HandTracker.allJoints[Self.indexTipJoint]],
+               let m = menu, let kb = keyboardNode {
+                let prox = m.maxProximity(worldPos: idxWorld, keyboardNode: kb)
+                // Proximity: 0=none, <0.4=approach, 0.4-0.9=hover, >0.9=near-touch
+                let cursorColor: CGColor
+                if prox > 0.88 {
+                    cursorColor = Self.cgCursorTouch   // green — about to trigger
+                } else if prox > 0.20 {
+                    // Lerp blue intensity with proximity
+                    let t = (prox - 0.20) / 0.68
+                    cursorColor = CGColor(red: 0.15 + CGFloat(t) * 0.0,
+                                         green: 0.55 - CGFloat(t) * 0.25,
+                                         blue: 1.00,
+                                         alpha: 1)
+                } else {
+                    cursorColor = Self.cgCursorInactive
+                }
+                idxTipMat[h].emission.contents = cursorColor
             }
         }
     }
 
-    private static func mat() -> SCNMaterial {
+    // ── Material factories ────────────────────────────────────────────────
+
+    private static func makeMat(skin: Bool, isTip: Bool) -> SCNMaterial {
         let m = SCNMaterial()
         m.lightingModel        = .constant
-        m.diffuse.contents     = UIColor.black
-        m.emission.contents    = UIColor(white: 0.32, alpha: 1.0)
-        m.blendMode            = .add
+        if skin {
+            // Warm skin tone — alpha blend so it looks solid, not additive
+            m.diffuse.contents   = UIColor(red: 0.86, green: 0.69, blue: 0.53, alpha: isTip ? 1.0 : 0.88)
+            m.emission.contents  = isTip
+                ? CGColor(red: 0.70, green: 0.55, blue: 0.42, alpha: 1)  // initial cursor colour
+                : CGColor(red: 0.20, green: 0.13, blue: 0.07, alpha: 1)  // subtle warm self-emission
+        } else {
+            // Bone cylinders: slightly darker skin
+            m.diffuse.contents   = UIColor(red: 0.78, green: 0.62, blue: 0.47, alpha: 0.82)
+            m.emission.contents  = CGColor(red: 0.15, green: 0.09, blue: 0.04, alpha: 1)
+        }
+        m.blendMode            = .alpha
         m.writesToDepthBuffer  = false
-        // Depth-reading against virtual key geometry causes hand spheres to flicker
-        // when fingertips are at key-surface depth. Drawing hand markers on top of
-        // everything is the correct behaviour — you always want to see them.
-        m.readsFromDepthBuffer = false
+        m.readsFromDepthBuffer = false   // always render, never hidden by virtual geometry
         m.isDoubleSided        = true
         return m
     }
 
-    private func place(_ node: SCNNode, from a: SIMD3<Float>, to b: SIMD3<Float>) {
+    // ── Cylinder placement (render thread) ───────────────────────────────
+
+    private func placeCylinder(_ node: SCNNode, from a: SIMD3<Float>, to b: SIMD3<Float>) {
         let diff = b - a
         let len  = simd_length(diff)
         guard len > 0.001 else { return }
