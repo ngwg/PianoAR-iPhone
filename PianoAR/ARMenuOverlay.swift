@@ -37,7 +37,30 @@ final class ARMenuOverlay {
     private static let handleH:  CGFloat = 56
     private static let tabBarH:  CGFloat = 70
     private static let headerH:  CGFloat = 54
-    private static let songRowH: CGFloat = 70
+
+    // Library is a 2-column grid of song cards (fits up to 12 = 6 rows)
+    private static let libCols:  Int     = 2
+    private static let libGap:   CGFloat = 10
+    private static let libCellH: CGFloat = 56
+
+    private static func libArea() -> CGRect {
+        CGRect(x: 22, y: handleH + headerH,
+               width: texW - 44,
+               height: (texH - tabBarH) - (handleH + headerH) - 8)
+    }
+    private static func libMaxVisible() -> Int {
+        let rows = Int((libArea().height + libGap) / (libCellH + libGap))
+        return max(0, rows) * libCols
+    }
+    private static func libCellRect(_ i: Int) -> CGRect {
+        let area  = libArea()
+        let col   = i % libCols
+        let row   = i / libCols
+        let cellW = (area.width - CGFloat(libCols - 1) * libGap) / CGFloat(libCols)
+        return CGRect(x: area.minX + CGFloat(col) * (cellW + libGap),
+                      y: area.minY + CGFloat(row) * (libCellH + libGap),
+                      width: cellW, height: libCellH)
+    }
 
     // ── Default placement (right of keyboard centre, lifted, tilted) ────────
     private static let initPos = SIMD3<Float>(KeyboardLayout.totalWidth * 0.30, 0.30, 0.18)
@@ -125,6 +148,7 @@ final class ARMenuOverlay {
         addBorder()
         addCursor()
         dispatchBake()
+        animateIn()
     }
 
     private func addBorder() {
@@ -291,6 +315,7 @@ final class ARMenuOverlay {
                     firedRegion    = region
                     dwellRegion    = .none
                     dwellStart     = time
+                    pulse()
                 }
 
                 updateCursor(local: b.local, progress: dwellProg,
@@ -359,13 +384,9 @@ final class ARMenuOverlay {
         }
         switch activeTab {
         case .library:
-            let startY = Self.handleH + Self.headerH
-            let maxY   = Self.texH - Self.tabBarH
-            let count  = 1 + availableSongs.count
-            for i in 0..<count {
-                let rowY = startY + CGFloat(i) * Self.songRowH
-                guard rowY + Self.songRowH <= maxY else { break }
-                if py >= rowY, py < rowY + Self.songRowH { return .song(i) }
+            let count = min(availableSongs.count, Self.libMaxVisible())
+            for i in 0..<count where Self.libCellRect(i).contains(CGPoint(x: px, y: py)) {
+                return .song(i)
             }
             return .none
         case .controls:
@@ -392,7 +413,7 @@ final class ARMenuOverlay {
             return nil
         case .song(let i):
             activeTab = .controls; dirty = true
-            let song: Song? = i == 0 ? nil : (i - 1 < availableSongs.count ? availableSongs[i - 1] : nil)
+            let song: Song? = (i >= 0 && i < availableSongs.count) ? availableSongs[i] : nil
             return .loadAndPlay(song)
         case .play:    return .playStop
         case .restart: return .restart
@@ -495,43 +516,44 @@ final class ARMenuOverlay {
     }
 
     private static func drawLibrary(_ s: PanelSnap) {
-        let topY = handleH
-        centered("LIBRARY", in: CGRect(x: 0, y: topY, width: texW, height: headerH),
+        centered("LIBRARY", in: CGRect(x: 0, y: handleH, width: texW, height: headerH),
                  font: .systemFont(ofSize: 24, weight: .black),
                  color: UIColor(white: 1, alpha: 0.55))
 
-        let startY = topY + headerH
-        let maxY   = texH - tabBarH
+        // Per-card accent colours, cycled so the grid reads as distinct tiles.
+        let accents: [UIColor] = [
+            UIColor(red: 0.22, green: 0.55, blue: 1.00, alpha: 1),
+            UIColor(red: 0.70, green: 0.35, blue: 1.00, alpha: 1),
+            UIColor(red: 0.20, green: 0.78, blue: 0.62, alpha: 1),
+            UIColor(red: 0.98, green: 0.55, blue: 0.25, alpha: 1),
+            UIColor(red: 0.95, green: 0.35, blue: 0.55, alpha: 1),
+        ]
 
-        let entries: [(String, String)] = [("♪", "Right Hand Primer")] +
-            s.songs.map { ("♪", $0.title ?? "Untitled") }
+        let count = min(s.songs.count, libMaxVisible())
+        for i in 0..<count {
+            let rect   = libCellRect(i)
+            let accent = accents[i % accents.count]
 
-        let iconBg    = UIColor(red: 0.28, green: 0.12, blue: 0.58, alpha: 0.65)
-        let titleFont = UIFont.systemFont(ofSize: 22, weight: .semibold)
-        let chevFont  = UIFont.systemFont(ofSize: 28, weight: .light)
+            // Card background
+            UIColor(red: 0.10, green: 0.06, blue: 0.26, alpha: 0.95).setFill()
+            UIBezierPath(roundedRect: rect, cornerRadius: 14).fill()
+            accent.withAlphaComponent(0.45).setStroke()
+            let border = UIBezierPath(roundedRect: rect.insetBy(dx: 0.75, dy: 0.75), cornerRadius: 14)
+            border.lineWidth = 1.5
+            border.stroke()
 
-        for (i, (icon, title)) in entries.enumerated() {
-            let rowY = startY + CGFloat(i) * songRowH
-            guard rowY + songRowH <= maxY else { break }
+            // Note-icon chip on the left
+            let chip = CGRect(x: rect.minX + 10, y: rect.midY - 18, width: 36, height: 36)
+            accent.withAlphaComponent(0.85).setFill()
+            UIBezierPath(roundedRect: chip, cornerRadius: 9).fill()
+            centered("♪", in: chip, font: .systemFont(ofSize: 20, weight: .bold), color: .white)
 
-            if i % 2 == 0 {
-                UIColor(white: 1, alpha: 0.04).setFill()
-                UIBezierPath(rect: CGRect(x: 0, y: rowY, width: texW, height: songRowH)).fill()
-            }
-            UIColor(white: 1, alpha: 0.07).setFill()
-            UIBezierPath(rect: CGRect(x: 24, y: rowY + songRowH - 1, width: texW - 48, height: 1)).fill()
-
-            iconBg.setFill()
-            let iconRect = CGRect(x: 20, y: rowY + (songRowH - 42) / 2, width: 42, height: 42)
-            UIBezierPath(ovalIn: iconRect).fill()
-            centered(icon, in: iconRect, font: .systemFont(ofSize: 20, weight: .bold), color: .white)
-
-            let tAttrs: [NSAttributedString.Key: Any] = [.font: titleFont, .foregroundColor: UIColor.white]
-            let tSize  = title.size(withAttributes: tAttrs)
-            title.draw(at: CGPoint(x: 74, y: rowY + (songRowH - tSize.height) / 2), withAttributes: tAttrs)
-
-            centered("›", in: CGRect(x: texW - 40, y: rowY, width: 28, height: songRowH),
-                     font: chevFont, color: UIColor(white: 1, alpha: 0.30))
+            // Title (single line, truncated to fit)
+            let title = s.songs[i].title ?? "Untitled"
+            let textRect = CGRect(x: chip.maxX + 10, y: rect.minY,
+                                  width: rect.maxX - chip.maxX - 18, height: rect.height)
+            leftTruncated(title, in: textRect,
+                          font: .systemFont(ofSize: 18, weight: .semibold), color: .white)
         }
     }
 
@@ -592,5 +614,38 @@ final class ARMenuOverlay {
         let x  = rect.minX + (rect.width  - sz.width)  / 2
         let y  = rect.minY + (rect.height - sz.height) / 2
         text.draw(at: CGPoint(x: x, y: y), withAttributes: attrs)
+    }
+
+    /// Single line, left-aligned, vertically centred, truncated with an ellipsis
+    /// if it overflows the rect width.
+    private static func leftTruncated(_ text: String, in rect: CGRect,
+                                      font: UIFont, color: UIColor) {
+        let para = NSMutableParagraphStyle()
+        para.lineBreakMode = .byTruncatingTail
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: font, .foregroundColor: color, .paragraphStyle: para,
+        ]
+        let h = font.lineHeight
+        let r = CGRect(x: rect.minX, y: rect.midY - h / 2, width: rect.width, height: h)
+        (text as NSString).draw(in: r, withAttributes: attrs)
+    }
+
+    // MARK: - Entrance / feedback animation  (render thread — SCNAction is safe)
+
+    private func animateIn() {
+        panelNode.opacity = 0
+        panelNode.scale   = SCNVector3(0.7, 0.7, 0.7)
+        let grow = SCNAction.scale(to: 1.0, duration: 0.42)
+        grow.timingMode = .easeOut
+        let fade = SCNAction.fadeIn(duration: 0.42)
+        panelNode.runAction(SCNAction.group([grow, fade]))
+    }
+
+    /// Quick scale pulse when a control fires, for tactile confirmation.
+    private func pulse() {
+        panelNode.removeAction(forKey: "pulse")
+        let up = SCNAction.scale(to: 1.04, duration: 0.08); up.timingMode = .easeOut
+        let dn = SCNAction.scale(to: 1.0,  duration: 0.11); dn.timingMode = .easeIn
+        panelNode.runAction(SCNAction.sequence([up, dn]), forKey: "pulse")
     }
 }
