@@ -4,10 +4,9 @@ import simd
 
 enum MenuAction { case playStop, restart, prevSong, nextSong, toggleDebug }
 
-/// Floating AR control panel anchored to the right side of the keyboard.
-/// Buttons are UIImage-textured SCNPlanes — text is rendered via CoreGraphics so
-/// it centres correctly and reads cleanly through the headset lens.
-/// Activated by pinch gestures from GestureDetector; hover glow on approach.
+/// AR floating control panel — 5 buttons in a vertical column right of the keyboard.
+/// All UIImage textures are pre-baked at init (main thread); the render thread only
+/// swaps `diffuse.contents`, which SCNMaterial documents as thread-safe.
 final class ARMenuOverlay {
     let rootNode = SCNNode()
 
@@ -19,14 +18,14 @@ final class ARMenuOverlay {
     private static let colDebugOn = UIColor(red: 0.10, green: 0.60, blue: 0.12, alpha: 0.90)
 
     // ── Button geometry ────────────────────────────────────────────────────
-    private static let btnW:  CGFloat = 0.130   // 13 cm wide
-    private static let btnH:  CGFloat = 0.058   // 5.8 cm tall
-    private static let btnD:  CGFloat = 0.007   // 7 mm depth
-    private static let gap:   Float   = 0.072   // 7.2 cm centre-to-centre (vertical)
+    private static let btnW: CGFloat = 0.130
+    private static let btnH: CGFloat = 0.058
+    private static let btnD: CGFloat = 0.007
+    private static let gap:  Float   = 0.072
 
-    // Texture resolution (points × 2 for retina)
-    private static let texW:  CGFloat = 320
-    private static let texH:  CGFloat = 140
+    // Texture atlas dimensions
+    private static let texW: CGFloat = 320
+    private static let texH: CGFloat = 140
 
     // ── Per-button state ───────────────────────────────────────────────────
     private struct Button {
@@ -37,22 +36,32 @@ final class ARMenuOverlay {
         let hitRadius:     Float = 0.058
         var hovered:       Bool  = false
         var label:         String
+        // Pre-baked textures — swapped on render thread (SCNMaterial.contents is thread-safe)
+        var texNormal:     UIImage
+        var texHover:      UIImage
+        var texSpecial:    UIImage? // stop colour / debugOn colour
+        var texFlash:      UIImage
     }
 
-    private var buttons:    [Button]   = []
-    private var isPlaying   = false
-    private var debugOn     = false
+    private var buttons:  [Button] = []
+    private var isPlaying = false
+    private var debugOn   = false
 
     init() { build() }
 
-    // MARK: - Build
+    // MARK: - Build (runs on main thread at anchor creation)
 
     private func build() {
-        // Panel background — subtle dark card behind all buttons
-        let panelH = Float(Self.gap) * 4 + Float(Self.btnH)
+        let colX: Float    = KeyboardLayout.totalWidth * 0.5 + 0.075
+        let colZ: Float    = KeyboardLayout.whiteKeyDepth * 0.5 + 0.050
+        let colYTop: Float = 0.26
+
+        // Panel background card.
+        // 5 buttons span (N-1)*gap + btnH; centre of column is colYTop - 2*gap.
+        let panelH = CGFloat(Self.gap) * 4 + Self.btnH
         let panelGeo = SCNBox(
-            width:         Self.btnW  + 0.016,
-            height:        CGFloat(panelH) + 0.016,
+            width:         Self.btnW + 0.016,
+            height:        panelH    + 0.020,
             length:        Self.btnD * 0.5,
             chamferRadius: 0.010
         )
@@ -62,55 +71,69 @@ final class ARMenuOverlay {
         panelMat.blendMode            = .alpha
         panelMat.writesToDepthBuffer  = false
         panelMat.readsFromDepthBuffer = false
-        panelGeo.materials = [panelMat]
-        let panelNode = SCNNode(geometry: panelGeo)
+        panelGeo.materials    = [panelMat]
+        let panelNode         = SCNNode(geometry: panelGeo)
+        panelNode.simdPosition = SIMD3<Float>(colX, colYTop - Self.gap * 2, colZ)
         panelNode.renderingOrder = 195
-
-        // Column position in keyboard-local space:
-        //   x  = just right of the rightmost key
-        //   z  = same z as near-edge menu (slightly in front of near edge)
-        //   y  = centre of the button column
-        let colX: Float = KeyboardLayout.totalWidth * 0.5 + 0.075
-        let colZ: Float = KeyboardLayout.whiteKeyDepth * 0.5 + 0.050
-        let colYTop: Float = 0.26
-
-        panelNode.simdPosition = SIMD3<Float>(colX, colYTop - Self.gap * 1.5, colZ)
         rootNode.addChildNode(panelNode)
 
-        // Header label
-        let headerNode = labelNode(
-            text: "MENU",
-            bgColor: UIColor(white: 0.0, alpha: 0.0),
-            textColor: UIColor(white: 1.0, alpha: 0.40),
-            fontSize: 16, bold: false
-        )
-        headerNode.simdPosition = SIMD3<Float>(colX, colYTop + Float(Self.gap) * 0.5 + 0.012, colZ)
+        // "MENU" header label
+        let headerNode = makeLabelNode(text: "MENU")
+        headerNode.simdPosition   = SIMD3<Float>(colX, colYTop + Self.gap * 0.45, colZ)
         headerNode.renderingOrder = 198
         rootNode.addChildNode(headerNode)
 
-        // Five buttons top-to-bottom
         let specs: [(String, MenuAction)] = [
-            ("▶  Play",      .playStop),
-            ("↺  Restart",   .restart),
-            ("◀  Prev",      .prevSong),
-            ("▶▶  Next",    .nextSong),
-            ("⚙  Debug",    .toggleDebug),
+            ("▶  Play",    .playStop),
+            ("↺  Restart", .restart),
+            ("◀  Prev",    .prevSong),
+            ("▶▶ Next",   .nextSong),
+            ("⚙  Debug",  .toggleDebug),
         ]
 
         for (i, (label, action)) in specs.enumerated() {
-            let yPos = colYTop - Float(i) * Self.gap
+            let yPos     = colYTop - Float(i) * Self.gap
             let localPos = SIMD3<Float>(colX, yPos, colZ)
-            let node = makeButtonNode(label: label, bgColor: Self.colNormal)
-            node.simdPosition = localPos
+
+            let specialColor: UIColor? = {
+                switch action {
+                case .playStop:    return Self.colStop
+                case .toggleDebug: return Self.colDebugOn
+                default:           return nil
+                }
+            }()
+
+            let texNormal  = makeTexture(label: label, bgColor: Self.colNormal)
+            let texHover   = makeTexture(label: label, bgColor: Self.colHover)
+            let texFlash   = makeTexture(label: label, bgColor: Self.colFlash)
+            let texSpecial = specialColor.map { makeTexture(label: specialLabel(for: action), bgColor: $0) }
+
+            let mat        = SCNMaterial()
+            mat.lightingModel        = .constant
+            mat.diffuse.contents     = texNormal
+            mat.blendMode            = .alpha
+            mat.writesToDepthBuffer  = false
+            mat.readsFromDepthBuffer = false
+
+            let box = SCNBox(width: Self.btnW, height: Self.btnH,
+                             length: Self.btnD, chamferRadius: 0.006)
+            box.materials = [mat]     // one material — all faces share it
+
+            let node              = SCNNode(geometry: box)
+            node.simdPosition     = localPos
+            node.renderingOrder   = 200
             rootNode.addChildNode(node)
+
             buttons.append(Button(
-                node: node, action: action,
-                localPosition: localPos, label: label
+                node: node, action: action, localPosition: localPos,
+                label: label,
+                texNormal: texNormal, texHover: texHover,
+                texSpecial: texSpecial, texFlash: texFlash
             ))
         }
     }
 
-    // MARK: - Per-frame update
+    // MARK: - Per-frame update (called on SceneKit render thread)
 
     func update(pinchEvents:  [PinchEvent],
                 hands:        [HandTracker.HandResult],
@@ -120,11 +143,11 @@ final class ARMenuOverlay {
 
         if self.isPlaying != isPlaying {
             self.isPlaying = isPlaying
-            refreshPlayLabel(isPlaying: isPlaying)
+            rebakePlayButton()
         }
         if self.debugOn != debugOn {
             self.debugOn = debugOn
-            refreshDebugLabel(debugOn: debugOn)
+            rebakeDebugButton()
         }
 
         updateHover(hands: hands, keyboardNode: keyboardNode)
@@ -141,7 +164,7 @@ final class ARMenuOverlay {
         return nil
     }
 
-    // MARK: - Hover
+    // MARK: - Hover (render thread — only sets pre-baked UIImage references)
 
     private func updateHover(hands: [HandTracker.HandResult], keyboardNode: SCNNode) {
         var tips: [SIMD3<Float>] = []
@@ -157,129 +180,108 @@ final class ARMenuOverlay {
             }
             guard nowHovered != buttons[i].hovered else { continue }
             buttons[i].hovered = nowHovered
-            let bg = nowHovered ? Self.colHover : normalColor(for: buttons[i].action)
-            rebakeButton(index: i, bgColor: bg)
+            applyCurrentTexture(index: i)
         }
     }
 
-    // MARK: - Flash
+    // MARK: - Flash (render thread)
 
     private func flashButton(index: Int) {
-        rebakeButton(index: index, bgColor: Self.colFlash)
-        let action = buttons[index].action
-        let hovered = buttons[index].hovered
+        setTexture(index: index, tex: buttons[index].texFlash)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
             guard let self else { return }
-            let bg = hovered ? Self.colHover : self.normalColor(for: action)
-            self.rebakeButton(index: index, bgColor: bg)
+            // Read current hovered state at execution time, not capture time.
+            self.applyCurrentTexture(index: index)
         }
     }
 
-    // MARK: - Label refresh
+    // MARK: - State refresh (render thread)
 
-    private func refreshPlayLabel(isPlaying: Bool) {
+    private func rebakePlayButton() {
         guard let i = buttons.firstIndex(where: { $0.action == .playStop }) else { return }
-        buttons[i].label = isPlaying ? "■  Stop" : "▶  Play"
-        let bg = isPlaying ? Self.colStop
-                           : (buttons[i].hovered ? Self.colHover : Self.colNormal)
-        rebakeButton(index: i, bgColor: bg)
+        applyCurrentTexture(index: i)
     }
 
-    private func refreshDebugLabel(debugOn: Bool) {
+    private func rebakeDebugButton() {
         guard let i = buttons.firstIndex(where: { $0.action == .toggleDebug }) else { return }
-        buttons[i].label = debugOn ? "⚙  Debug ON" : "⚙  Debug"
-        let bg = debugOn ? Self.colDebugOn
-                         : (buttons[i].hovered ? Self.colHover : Self.colNormal)
-        rebakeButton(index: i, bgColor: bg)
+        applyCurrentTexture(index: i)
     }
 
-    private func normalColor(for action: MenuAction) -> UIColor {
-        switch action {
-        case .playStop:    return isPlaying ? Self.colStop    : Self.colNormal
-        case .toggleDebug: return debugOn   ? Self.colDebugOn : Self.colNormal
-        default:           return Self.colNormal
+    // MARK: - Texture application (render thread — safe, SCNMaterial.contents is thread-safe)
+
+    private func applyCurrentTexture(index: Int) {
+        let btn = buttons[index]
+        let tex: UIImage
+        switch btn.action {
+        case .playStop:
+            tex = isPlaying ? (btn.texSpecial ?? btn.texNormal)
+                            : (btn.hovered   ? btn.texHover   : btn.texNormal)
+        case .toggleDebug:
+            tex = debugOn   ? (btn.texSpecial ?? btn.texNormal)
+                            : (btn.hovered   ? btn.texHover   : btn.texNormal)
+        default:
+            tex = btn.hovered ? btn.texHover : btn.texNormal
         }
+        setTexture(index: index, tex: tex)
     }
 
-    // MARK: - Node helpers
-
-    private func makeButtonNode(label: String, bgColor: UIColor) -> SCNNode {
-        let box = SCNBox(width: Self.btnW, height: Self.btnH,
-                         length: Self.btnD, chamferRadius: 0.006)
-        let mat = SCNMaterial()
-        mat.lightingModel        = .constant
-        mat.diffuse.contents     = makeTexture(label: label, bgColor: bgColor)
-        mat.blendMode            = .alpha
-        mat.writesToDepthBuffer  = false
-        mat.readsFromDepthBuffer = false
-        mat.isDoubleSided        = false
-        box.materials = Array(repeating: mat, count: 6)   // same on all faces
-
-        let node = SCNNode(geometry: box)
-        node.renderingOrder = 200
-        return node
+    private func setTexture(index: Int, tex: UIImage) {
+        buttons[index].node.geometry?.firstMaterial?.diffuse.contents = tex
     }
 
-    private func rebakeButton(index: Int, bgColor: UIColor) {
-        let label = buttons[index].label
-        let tex   = makeTexture(label: label, bgColor: bgColor)
-        buttons[index].node.geometry?.materials.forEach { $0.diffuse.contents = tex }
-    }
-
-    // ── Texture baking ─────────────────────────────────────────────────────
+    // MARK: - Texture baking (UIKit — must only be called on main thread / during init)
 
     private func makeTexture(label: String, bgColor: UIColor) -> UIImage {
         let w = Self.texW, h = Self.texH
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: w, height: h))
-        return renderer.image { ctx in
-            // Background with rounded corners
+        return renderer.image { _ in
             let rect = CGRect(x: 0, y: 0, width: w, height: h)
             let path = UIBezierPath(roundedRect: rect, cornerRadius: 20)
             bgColor.setFill()
             path.fill()
 
-            // Subtle border
-            UIColor.white.withAlphaComponent(0.20).setStroke()
+            UIColor.white.withAlphaComponent(0.22).setStroke()
             path.lineWidth = 3
             path.stroke()
 
-            // Centered label text
-            let font = UIFont.systemFont(ofSize: 38, weight: .bold)
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font:            font,
-                .foregroundColor: UIColor.white,
-            ]
-            let size   = label.size(withAttributes: attrs)
-            let origin = CGPoint(x: (w - size.width)  / 2,
-                                 y: (h - size.height) / 2)
-            label.draw(at: origin, withAttributes: attrs)
+            let font  = UIFont.systemFont(ofSize: 38, weight: .bold)
+            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: UIColor.white]
+            let size  = label.size(withAttributes: attrs)
+            label.draw(at: CGPoint(x: (w - size.width) / 2, y: (h - size.height) / 2),
+                       withAttributes: attrs)
         }
     }
 
-    private func labelNode(text: String, bgColor: UIColor, textColor: UIColor,
-                           fontSize: CGFloat, bold: Bool) -> SCNNode {
-        let w: CGFloat = 200, h: CGFloat = 40
+    private func makeLabelNode(text: String) -> SCNNode {
+        let w: CGFloat = 200, h: CGFloat = 36
         let renderer = UIGraphicsImageRenderer(size: CGSize(width: w, height: h))
         let img = renderer.image { _ in
-            let font: UIFont = bold
-                ? .boldSystemFont(ofSize: fontSize)
-                : .systemFont(ofSize: fontSize, weight: .semibold)
+            let font  = UIFont.systemFont(ofSize: 15, weight: .semibold)
             let attrs: [NSAttributedString.Key: Any] = [
-                .font: font, .foregroundColor: textColor
+                .font: font, .foregroundColor: UIColor.white.withAlphaComponent(0.42)
             ]
             let size = text.size(withAttributes: attrs)
             text.draw(at: CGPoint(x: (w - size.width) / 2, y: (h - size.height) / 2),
                       withAttributes: attrs)
         }
-        let plane = SCNPlane(width: Self.btnW, height: 0.022)
-        let mat   = SCNMaterial()
+        let plane     = SCNPlane(width: Self.btnW, height: 0.020)
+        let mat       = SCNMaterial()
         mat.lightingModel        = .constant
         mat.diffuse.contents     = img
         mat.blendMode            = .alpha
         mat.writesToDepthBuffer  = false
         mat.readsFromDepthBuffer = false
         plane.materials = [mat]
-        let node = SCNNode(geometry: plane)
-        return node
+        return SCNNode(geometry: plane)
+    }
+
+    // MARK: - Helpers
+
+    private func specialLabel(for action: MenuAction) -> String {
+        switch action {
+        case .playStop:    return "■  Stop"
+        case .toggleDebug: return "⚙  Debug ON"
+        default:           return ""
+        }
     }
 }
