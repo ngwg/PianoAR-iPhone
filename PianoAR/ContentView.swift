@@ -28,7 +28,8 @@ struct ContentView: View {
                 calibration: calibration, handTracker: handTracker,
                 songPlayer: songPlayer, pressDetector: pressDetector,
                 audioDetector: audioDetector, keyTuning: keyTuning,
-                onTap: handleTap, onMenuAction: handleMenuAction
+                onTap: handleTap, onMenuAction: handleMenuAction,
+                showDebug: showDebug
             )
             .ignoresSafeArea()
 
@@ -646,17 +647,19 @@ struct ContentView: View {
 
     private func handleMenuAction(_ action: MenuAction) {
         switch action {
-        case .playStop: songPlayer.isPlaying ? songPlayer.stop() : songPlayer.play()
-        case .restart:  songPlayer.restart()
-        case .nextSong: advanceToNextSong()
+        case .playStop:    songPlayer.isPlaying ? songPlayer.stop() : songPlayer.play()
+        case .restart:     songPlayer.restart()
+        case .nextSong:    advanceToNextSong(by: +1)
+        case .prevSong:    advanceToNextSong(by: -1)
+        case .toggleDebug: withAnimation { showDebug.toggle() }
         }
     }
 
-    private func advanceToNextSong() {
+    private func advanceToNextSong(by delta: Int = 1) {
         let allSongs: [Song?] = [nil] + importedSongs.map { Optional($0) }
         let currentTitle = songPlayer.song?.title
         let currentIdx   = allSongs.firstIndex { $0?.title == currentTitle } ?? 0
-        let nextIdx      = (currentIdx + 1) % allSongs.count
+        let nextIdx      = ((currentIdx + delta) % allSongs.count + allSongs.count) % allSongs.count
         if let next = allSongs[nextIdx] { songPlayer.load(next) } else { loadBuiltInLesson() }
     }
 }

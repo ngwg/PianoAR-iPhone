@@ -13,6 +13,7 @@ struct ARPassthroughView: UIViewRepresentable {
     let keyTuning:     KeyTuning
     let onTap:         (CGPoint) -> Void
     var onMenuAction:  ((MenuAction) -> Void)?
+    var showDebug:     Bool = false
 
     func makeCoordinator() -> Coordinator {
         Coordinator(placement: placement, calibration: calibration,
@@ -47,6 +48,7 @@ struct ARPassthroughView: UIViewRepresentable {
         calibration.sceneView = uiView
         context.coordinator.onTap         = onTap
         context.coordinator.onMenuAction  = onMenuAction
+        context.coordinator.showDebug     = showDebug
         context.coordinator.songPlayer    = songPlayer
         context.coordinator.pressDetector = pressDetector
         context.coordinator.audioDetector = audioDetector
@@ -65,6 +67,7 @@ struct ARPassthroughView: UIViewRepresentable {
         var keyTuning:     KeyTuning
         var onTap:        (CGPoint) -> Void
         var onMenuAction: ((MenuAction) -> Void)?
+        var showDebug:    Bool = false
 
         private var hand3D:      Hand3DOverlay?
         private var highway:     NoteHighway?
@@ -115,7 +118,8 @@ struct ARPassthroughView: UIViewRepresentable {
                     pinchEvents: pinches,
                     hands: hands,
                     keyboardNode: kb,
-                    isPlaying: songPlayer.isPlaying
+                    isPlaying: songPlayer.isPlaying,
+                    debugOn: showDebug
                 ) {
                     let cb = onMenuAction
                     DispatchQueue.main.async { cb?(action) }
