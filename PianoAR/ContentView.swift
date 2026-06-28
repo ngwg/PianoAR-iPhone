@@ -29,7 +29,8 @@ struct ContentView: View {
                 songPlayer: songPlayer, pressDetector: pressDetector,
                 audioDetector: audioDetector, keyTuning: keyTuning,
                 onTap: handleTap, onMenuAction: handleMenuAction,
-                showDebug: showDebug
+                showDebug: showDebug,
+                availableSongs: importedSongs
             )
             .ignoresSafeArea()
 
@@ -647,11 +648,15 @@ struct ContentView: View {
 
     private func handleMenuAction(_ action: MenuAction) {
         switch action {
-        case .playStop:    songPlayer.isPlaying ? songPlayer.stop() : songPlayer.play()
-        case .restart:     songPlayer.restart()
-        case .nextSong:    advanceToNextSong(by: +1)
-        case .prevSong:    advanceToNextSong(by: -1)
-        case .toggleDebug: withAnimation { showDebug.toggle() }
+        case .playStop:
+            songPlayer.isPlaying ? songPlayer.stop() : songPlayer.play()
+        case .restart:
+            songPlayer.restart()
+        case .loadAndPlay(let song):
+            if let song { songPlayer.load(song) } else { loadBuiltInLesson() }
+            songPlayer.play()
+        case .toggleDebug:
+            withAnimation { showDebug.toggle() }
         }
     }
 

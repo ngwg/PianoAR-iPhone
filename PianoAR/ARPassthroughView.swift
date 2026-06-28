@@ -12,8 +12,9 @@ struct ARPassthroughView: UIViewRepresentable {
     let audioDetector: AudioPitchDetector
     let keyTuning:     KeyTuning
     let onTap:         (CGPoint) -> Void
-    var onMenuAction:  ((MenuAction) -> Void)?
-    var showDebug:     Bool = false
+    var onMenuAction:   ((MenuAction) -> Void)?
+    var showDebug:      Bool   = false
+    var availableSongs: [Song] = []
 
     func makeCoordinator() -> Coordinator {
         Coordinator(placement: placement, calibration: calibration,
@@ -48,7 +49,8 @@ struct ARPassthroughView: UIViewRepresentable {
         calibration.sceneView = uiView
         context.coordinator.onTap         = onTap
         context.coordinator.onMenuAction  = onMenuAction
-        context.coordinator.showDebug     = showDebug
+        context.coordinator.showDebug      = showDebug
+        context.coordinator.availableSongs = availableSongs
         context.coordinator.songPlayer    = songPlayer
         context.coordinator.pressDetector = pressDetector
         context.coordinator.audioDetector = audioDetector
@@ -65,9 +67,10 @@ struct ARPassthroughView: UIViewRepresentable {
         var pressDetector: PressDetector
         var audioDetector: AudioPitchDetector
         var keyTuning:     KeyTuning
-        var onTap:        (CGPoint) -> Void
-        var onMenuAction: ((MenuAction) -> Void)?
-        var showDebug:    Bool = false
+        var onTap:          (CGPoint) -> Void
+        var onMenuAction:   ((MenuAction) -> Void)?
+        var showDebug:      Bool   = false
+        var availableSongs: [Song] = []
 
         private var hand3D:      Hand3DOverlay?
         private var highway:     NoteHighway?
@@ -119,7 +122,8 @@ struct ARPassthroughView: UIViewRepresentable {
                     keyboardNode: kb,
                     time: time,
                     isPlaying: songPlayer.isPlaying,
-                    debugOn: showDebug
+                    debugOn: showDebug,
+                    availableSongs: availableSongs
                 ) {
                     let cb = onMenuAction
                     DispatchQueue.main.async { cb?(action) }

@@ -2,393 +2,410 @@ import SceneKit
 import UIKit
 import simd
 
-enum MenuAction { case playStop, restart, prevSong, nextSong, toggleDebug }
+enum MenuAction { case playStop, restart, loadAndPlay(Song?), toggleDebug }
 
-/// Direct-touch AR control panel.
+/// Large floating "tablet" AR panel — PianoVision-style.
 ///
-/// Interaction model: a 3-D SDF (signed-distance function) is evaluated from
-/// each tracked fingertip to each button's bounding volume every frame.
-/// No pinch required — the user just reaches out and presses the button.
-///
-/// Proximity → continuous CGColor emission glow (thread-safe on render thread).
-/// UIKit drawing (UIGraphicsImageRenderer) is strictly confined to init().
+/// Architecture:
+///  • One SCNPlane in keyboard-local space, tilted to face the camera looking down.
+///  • A UIImage is baked on the main thread whenever visible state changes, then
+///    set as diffuse.contents (thread-safe from any thread).
+///  • Touch: convert fingertip world pos → panel-local XYZ, check Z proximity,
+///    then UV hit-test static CGRect regions. No velocity gate — just debounce.
+///  • All UIKit drawing is strictly in static `bake*` methods called only via
+///    DispatchQueue.main.async — never on the SceneKit render thread.
 final class ARMenuOverlay {
     let rootNode = SCNNode()
 
-    // ── Layout ──────────────────────────────────────────────────────────────
-    private static let btnW:  Float   = 0.135   // 135 mm wide
-    private static let btnH:  Float   = 0.062   // 62 mm tall
-    private static let btnD:  Float   = 0.010   // 10 mm depth
-    private static let gap:   Float   = 0.082   // 82 mm centre-to-centre (vertical)
+    // ── Panel geometry ──────────────────────────────────────────────────────
+    private static let panW: Float  = 0.52    // metres
+    private static let panH: Float  = 0.32
 
-    // Touch zone: extend btnD in front to create a generous approach zone.
-    // The SDF checks this extended box so the trigger fires as the finger
-    // gets close rather than requiring a literal physical intersection.
-    private static let touchHalfZ: Float = 0.032  // 32 mm in front of button
+    // Texture resolution — 2000 px/m keeps text sharp without wasting memory
+    private static let texW: CGFloat = 1040
+    private static let texH: CGFloat = 640
 
-    // Thresholds
-    private static let triggerDist: Float       = 0.016  // 16 mm → confirmed press
-    private static let hoverDist:   Float       = 0.085  // 85 mm → glow starts
-    private static let debounce:    TimeInterval = 0.22  // 220 ms between taps
+    // UI zone heights (in texture pixels)
+    private static let tabBarH:  CGFloat = 72
+    private static let headerH:  CGFloat = 60
+    private static let songRowH: CGFloat = 72
 
-    // Texture resolution
-    private static let texW: CGFloat = 540
-    private static let texH: CGFloat = 204
+    // Touch threshold: fingertip within this many metres of panel surface → hit
+    private static let triggerZ: Float    = 0.022   // 22 mm
+    private static let debounce: TimeInterval = 0.30
 
-    // ── CGColor constants (thread-safe; used only from render thread) ──────
-    private static let cgBlack  = CGColor(red: 0, green: 0, blue: 0, alpha: 1)
-    private static let cgHoverR: CGFloat = 0.12
-    private static let cgHoverG: CGFloat = 0.38
-    private static let cgHoverB: CGFloat = 1.00
-    private static let cgFlashR: CGFloat = 0.04
-    private static let cgFlashG: CGFloat = 0.95
-    private static let cgFlashB: CGFloat = 0.38
+    // ── State (mutated only on render thread) ───────────────────────────────
+    private enum Tab { case library, controls }
+    private var activeTab:      Tab      = .library
+    private var availableSongs: [Song]   = []
+    private var isPlaying               = false
+    private var debugOn                 = false
+    private var needsRebake             = true
+    private var lastTap: TimeInterval   = -999
 
-    // ── Per-button state ─────────────────────────────────────────────────────
-    private struct Button {
-        let node:        SCNNode
-        let action:      MenuAction
-        let localPos:    SIMD3<Float>
-        let halfNormal:  SIMD3<Float>   // half-extents for SDF (no Z extend)
-        let halfTouch:   SIMD3<Float>   // half-extents for SDF (extended Z)
-        var glowLevel:   Float = 0      // 0..1 updated every frame
-        var isActive:    Bool  = false
-        // Pre-baked textures (UIKit, main thread only)
-        let texNormal:   UIImage
-        let texActive:   UIImage        // "■ STOP" / "⚙ DEBUG ON" variant
-    }
-
-    private var buttons:       [Button]           = []
-    private var isPlaying      = false
-    private var debugOn        = false
-    // Debounce per hand side
-    private var lastTap:       [Bool: TimeInterval] = [false: -999, true: -999]
-    // Velocity history: key = "L_idx" / "R_idx" etc.
-    private var velHist:       [String: [(SIMD3<Float>, TimeInterval)]] = [:]
+    // ── Scene nodes ─────────────────────────────────────────────────────────
+    private var panelNode: SCNNode!
+    private var panelMat:  SCNMaterial!
 
     init() { build() }
 
-    // MARK: - Build  (runs on main thread at anchor creation time)
+    // MARK: - Build  (runs on main thread at init time)
 
     private func build() {
-        let colX: Float    = KeyboardLayout.totalWidth * 0.5 + 0.082
-        let colZ: Float    = KeyboardLayout.whiteKeyDepth * 0.5 + 0.058
-        let colYTop: Float = 0.218   // top button Y in keyboard-local space
-        // Centre of 5-button column:  colYTop - 2 * gap
-        let colYCtr: Float = colYTop - Self.gap * 2
+        let geo = SCNPlane(width: CGFloat(Self.panW), height: CGFloat(Self.panH))
+        panelMat = SCNMaterial()
+        panelMat.lightingModel        = .constant
+        panelMat.diffuse.contents     = UIColor(red: 0.06, green: 0.03, blue: 0.18, alpha: 0.97)
+        panelMat.blendMode            = .alpha
+        panelMat.isDoubleSided        = true
+        panelMat.writesToDepthBuffer  = false
+        panelMat.readsFromDepthBuffer = false
+        geo.materials = [panelMat]
 
-        let hN = SIMD3<Float>(Self.btnW/2, Self.btnH/2, Self.btnD/2)
-        let hT = SIMD3<Float>(Self.btnW/2, Self.btnH/2, Self.btnD/2 + Self.touchHalfZ)
+        panelNode = SCNNode(geometry: geo)
+        // Position: centred over keyboard, above surface and toward player.
+        // Tilt ~54° so the face is roughly toward a camera looking 45-60° down.
+        panelNode.simdPosition = SIMD3<Float>(0, 0.30, 0.18)
+        panelNode.eulerAngles  = SCNVector3(-Float.pi * 0.30, 0, 0)
+        panelNode.renderingOrder = 200
+        rootNode.addChildNode(panelNode)
 
-        // ── Background panel ──────────────────────────────────────────────
-        let panH = CGFloat(Self.gap * 4 + Self.btnH + 0.050)
-        let panGeo = SCNBox(width:  CGFloat(Self.btnW + 0.024),
-                            height: panH,
-                            length: CGFloat(Self.btnD * 0.55),
-                            chamferRadius: 0.014)
-        panGeo.materials = [panMaterial(UIColor(red: 0.02, green: 0.02, blue: 0.09, alpha: 0.94))]
-        let panNode = SCNNode(geometry: panGeo)
-        panNode.simdPosition   = SIMD3<Float>(colX, colYCtr, colZ - Self.btnD * 0.22)
-        panNode.renderingOrder = 195
-        rootNode.addChildNode(panNode)
+        // Thin glowing border frame
+        addBorder()
 
-        // ── Top / bottom accent lines ─────────────────────────────────────
-        for sign: Float in [-1, 1] {
-            let lineGeo = SCNBox(width:  CGFloat(Self.btnW + 0.024),
-                                 height: 0.0018,
-                                 length: 0.003,
-                                 chamferRadius: 0)
-            lineGeo.materials = [accentLineMaterial()]
-            let lNode = SCNNode(geometry: lineGeo)
-            lNode.simdPosition   = SIMD3<Float>(colX, Float(panNode.simdPosition.y) + sign * Float(panH * 0.5), colZ)
-            lNode.renderingOrder = 197
-            rootNode.addChildNode(lNode)
-        }
+        // Kick off first bake
+        dispatchBake()
+    }
 
-        // ── Header label ──────────────────────────────────────────────────
-        let hdr = headerLabelNode(text: "CONTROLS")
-        hdr.simdPosition   = SIMD3<Float>(colX, colYTop + Self.gap * 0.46, colZ)
-        hdr.renderingOrder = 198
-        rootNode.addChildNode(hdr)
+    private func addBorder() {
+        // Four edge bars as thin SCNBox nodes
+        let edgeColor = UIColor(red: 0.45, green: 0.22, blue: 0.85, alpha: 0.70)
+        let t: Float = 0.003   // thickness
 
-        // ── Buttons ───────────────────────────────────────────────────────
-        let specs: [(label: String, active: String, action: MenuAction)] = [
-            ("▶  PLAY",    "■  STOP",      .playStop),
-            ("↺  RESTART", "↺  RESTART",   .restart),
-            ("◀  PREV",    "◀  PREV",      .prevSong),
-            ("▶▶ NEXT",   "▶▶ NEXT",     .nextSong),
-            ("⚙  DEBUG",  "⚙  DEBUG ON", .toggleDebug),
+        struct Edge { var w: Float; var h: Float; var x: Float; var y: Float }
+        let edges: [Edge] = [
+            Edge(w: Self.panW + t*2, h: t, x: 0, y:  Self.panH/2),   // top
+            Edge(w: Self.panW + t*2, h: t, x: 0, y: -Self.panH/2),   // bottom
+            Edge(w: t, h: Self.panH, x: -Self.panW/2, y: 0),          // left
+            Edge(w: t, h: Self.panH, x:  Self.panW/2, y: 0),          // right
         ]
+        let mat = SCNMaterial()
+        mat.lightingModel       = .constant
+        mat.diffuse.contents    = edgeColor
+        mat.emission.contents   = UIColor(red: 0.35, green: 0.15, blue: 0.70, alpha: 0.55)
+        mat.writesToDepthBuffer = false
 
-        for (i, spec) in specs.enumerated() {
-            let yPos     = colYTop - Float(i) * Self.gap
-            let localPos = SIMD3<Float>(colX, yPos, colZ)
-
-            let texNormal = makeButtonTexture(label: spec.label,   isActive: false)
-            let texActive = makeButtonTexture(label: spec.active,  isActive: true)
-
-            let mat = SCNMaterial()
-            mat.lightingModel        = .constant
-            mat.diffuse.contents     = texNormal
-            mat.emission.contents    = Self.cgBlack
-            mat.blendMode            = .alpha
-            mat.writesToDepthBuffer  = false
-            mat.readsFromDepthBuffer = false
-
-            let box = SCNBox(width:         CGFloat(Self.btnW),
-                             height:        CGFloat(Self.btnH),
-                             length:        CGFloat(Self.btnD),
-                             chamferRadius: 0.008)
-            box.materials = [mat]     // one shared material — all faces
-
-            let node = SCNNode(geometry: box)
-            node.simdPosition   = localPos
-            node.renderingOrder = 200
-            rootNode.addChildNode(node)
-
-            buttons.append(Button(
-                node: node, action: spec.action, localPos: localPos,
-                halfNormal: hN, halfTouch: hT,
-                texNormal: texNormal, texActive: texActive
-            ))
+        for e in edges {
+            let box = SCNBox(width: CGFloat(e.w), height: CGFloat(e.h), length: 0.001, chamferRadius: 0)
+            box.materials = [mat]
+            let n = SCNNode(geometry: box)
+            n.simdPosition   = SIMD3<Float>(e.x, e.y, 0.0005)
+            n.renderingOrder = 201
+            panelNode.addChildNode(n)
         }
     }
 
-    // MARK: - Per-frame update  (called on SceneKit render thread)
+    // MARK: - Per-frame update  (SceneKit render thread)
 
-    /// Returns a triggered action if a fingertip presses a button this frame.
-    func update(hands:        [HandTracker.HandResult],
-                keyboardNode: SCNNode,
-                time:         TimeInterval,
-                isPlaying:    Bool,
-                debugOn:      Bool = false) -> MenuAction? {
+    func update(hands:          [HandTracker.HandResult],
+                keyboardNode:   SCNNode,
+                time:           TimeInterval,
+                isPlaying:      Bool,
+                debugOn:        Bool = false,
+                availableSongs: [Song] = []) -> MenuAction? {
 
-        if self.isPlaying != isPlaying { self.isPlaying = isPlaying; syncPlayButton()  }
-        if self.debugOn   != debugOn   { self.debugOn   = debugOn;   syncDebugButton() }
+        // State change detection
+        var dirty = false
+        if self.isPlaying != isPlaying { self.isPlaying = isPlaying; dirty = true }
+        if self.debugOn   != debugOn   { self.debugOn   = debugOn;   dirty = true }
 
-        // Build local-space fingertip list (index tips preferred, also thumb)
-        struct Tip { let local: SIMD3<Float>; let isLeft: Bool; let key: String }
-        var tips: [Tip] = []
-        for hand in hands {
-            let side = hand.isLeft ? "L" : "R"
-            if let p = hand.joints[.indexTip] {
-                tips.append(Tip(local: keyboardNode.simdConvertPosition(p, from: nil),
-                                isLeft: hand.isLeft, key: "\(side)_i"))
-            }
-            if let p = hand.joints[.thumbTip] {
-                tips.append(Tip(local: keyboardNode.simdConvertPosition(p, from: nil),
-                                isLeft: hand.isLeft, key: "\(side)_t"))
-            }
-        }
+        let newTitles = availableSongs.map { $0.title ?? "" }
+        let oldTitles = self.availableSongs.map { $0.title ?? "" }
+        if newTitles != oldTitles { self.availableSongs = availableSongs; dirty = true }
 
-        // Velocity history (up to 5 frames, pruned after 300 ms)
-        for t in tips {
-            var h = velHist[t.key] ?? []
-            h.append((t.local, time))
-            if h.count > 5 { h.removeFirst() }
-            velHist[t.key] = h
-        }
-        velHist = velHist.filter { _, v in (time - (v.last?.1 ?? 0)) < 0.30 }
-
+        // Touch detection
         var result: MenuAction? = nil
+        for hand in hands {
+            guard let idxWorld = hand.joints[.indexTip] else { continue }
 
-        for i in 0..<buttons.count {
-            // Find the closest tip to this button
-            var minDist: Float = Self.hoverDist + 1
-            var closestTip: Tip? = nil
-            for t in tips {
-                let d = sdf(t.local, buttons[i].localPos, buttons[i].halfTouch)
-                if d < minDist { minDist = d; closestTip = t }
+            // Panel-local coordinates: XY on panel face, Z = depth from face (+Z = in front)
+            let local = panelNode.simdConvertPosition(idxWorld, from: nil)
+
+            // Accept only the front side within trigger distance
+            guard local.z > -0.005, local.z < Self.triggerZ else { continue }
+            guard abs(local.x) < Self.panW / 2,
+                  abs(local.y) < Self.panH / 2 else { continue }
+
+            // UV: u left→right, v top→bottom (UIKit convention)
+            let u = CGFloat((local.x + Self.panW / 2) / Self.panW)
+            let v = CGFloat(1.0 - (local.y + Self.panH / 2) / Self.panH)
+
+            let (action, tabChanged) = performHitTest(u: u, v: v)
+            if tabChanged { dirty = true }
+
+            if let action, time - lastTap > Self.debounce {
+                if case .loadAndPlay = action {
+                    activeTab = .controls  // auto-navigate to controls after song pick
+                    dirty = true
+                }
+                lastTap = time
+                result  = action
+                break
             }
+        }
 
-            // ── Continuous proximity glow ────────────────────────────────
-            let t01 = simd_clamp(1 - minDist / Self.hoverDist, 0, 1)
-            let glow = t01 * t01   // quadratic — fast near button, subtle far
-            if abs(glow - buttons[i].glowLevel) > 0.008 {
-                buttons[i].glowLevel = glow
-                setGlow(index: i, glow: glow)
-            }
-
-            // ── Touch trigger ────────────────────────────────────────────
-            guard result == nil, let tip = closestTip, minDist < Self.triggerDist else { continue }
-
-            // Velocity gate: fingertip must be moving *toward* the button
-            // (SDF decreasing = dist decreasing = approaching).
-            // This prevents resting-hand false triggers.
-            var approaching = true
-            if let hist = velHist[tip.key], hist.count >= 2 {
-                let prevDist = sdf(hist.first!.0, buttons[i].localPos, buttons[i].halfTouch)
-                approaching = prevDist > minDist   // was further away before
-            }
-            guard approaching else { continue }
-
-            // Debounce per hand side
-            let last = lastTap[tip.isLeft] ?? -999
-            guard time - last > Self.debounce else { continue }
-            lastTap[tip.isLeft] = time
-
-            result = buttons[i].action
-            flashButton(index: i)
+        // Rebake texture if state changed (dispatch to main thread)
+        if dirty || needsRebake {
+            needsRebake = false
+            dispatchBake()
         }
 
         return result
     }
 
-    // MARK: - Proximity query for external callers (render thread, pure math)
+    // MARK: - Hit testing  (render thread, pure math)
 
-    /// Returns a 0…1 proximity value for any world-space point.
-    /// 1 = touching a button; 0 = outside hover zone.
+    private func performHitTest(u: CGFloat, v: CGFloat) -> (MenuAction?, Bool) {
+        let px = u * Self.texW
+        let py = v * Self.texH
+
+        // Tab bar (bottom region)
+        if py >= Self.texH - Self.tabBarH {
+            let wanted: Tab = px < Self.texW / 2 ? .library : .controls
+            if activeTab != wanted { activeTab = wanted; return (nil, true) }
+            return (nil, false)
+        }
+
+        switch activeTab {
+        case .library:  return (libraryHit(px: px, py: py), false)
+        case .controls: return (controlsHit(px: px, py: py), false)
+        }
+    }
+
+    private func libraryHit(px: CGFloat, py: CGFloat) -> MenuAction? {
+        let startY = Self.headerH
+        let maxY   = Self.texH - Self.tabBarH
+        // Row 0 = built-in, rows 1..n = imported songs
+        let allCount = 1 + availableSongs.count
+
+        for i in 0..<allCount {
+            let rowY = startY + CGFloat(i) * Self.songRowH
+            guard rowY + Self.songRowH <= maxY else { break }
+            if py >= rowY, py < rowY + Self.songRowH {
+                let song: Song? = i == 0 ? nil : availableSongs[i - 1]
+                return .loadAndPlay(song)
+            }
+        }
+        return nil
+    }
+
+    private func controlsHit(px: CGFloat, py: CGFloat) -> MenuAction? {
+        let centerX = Self.texW / 2
+        let topY    = Self.headerH
+        let contH   = Self.texH - Self.tabBarH - topY
+        let midY    = topY + contH / 2
+
+        // Debug button (top-left)
+        let dbgRect = CGRect(x: 32, y: topY + 14, width: 220, height: 46)
+        if dbgRect.contains(CGPoint(x: px, y: py)) { return .toggleDebug }
+
+        // Play/Stop (large, centred)
+        let playRect = CGRect(x: centerX - 160, y: midY - 52, width: 320, height: 88)
+        if playRect.contains(CGPoint(x: px, y: py)) { return .playStop }
+
+        // Restart (below play)
+        let rstRect = CGRect(x: centerX - 120, y: midY + 52, width: 240, height: 56)
+        if rstRect.contains(CGPoint(x: px, y: py)) { return .restart }
+
+        return nil
+    }
+
+    // MARK: - Proximity query for Hand3DOverlay cursor  (render thread)
+
     func maxProximity(worldPos: SIMD3<Float>, keyboardNode: SCNNode) -> Float {
-        let local = keyboardNode.simdConvertPosition(worldPos, from: nil)
-        var best: Float = 0
-        for btn in buttons {
-            let d = sdf(local, btn.localPos, btn.halfTouch)
-            let t = simd_clamp(1 - d / Self.hoverDist, 0, 1)
-            if t > best { best = t }
-        }
-        return best * best
+        let local = panelNode.simdConvertPosition(worldPos, from: nil)
+        let halfW = Self.panW / 2
+        let halfH = Self.panH / 2
+        let zProx  = simd_clamp(1.0 - abs(local.z) / 0.12, 0, 1)
+        let xFade  = simd_clamp(1.0 - max(0, abs(local.x) - halfW) / 0.05, 0, 1)
+        let yFade  = simd_clamp(1.0 - max(0, abs(local.y) - halfH) / 0.05, 0, 1)
+        return zProx * xFade * yFade
     }
 
-    // MARK: - Glow  (render thread — CGColor assignment is thread-safe)
+    // MARK: - Texture dispatch  (may be called from render thread)
 
-    private func setGlow(index: Int, glow: Float) {
-        let mat = buttons[index].node.geometry?.firstMaterial
-        if buttons[index].isActive {
-            // Active: constant state-colour emission (red for stop, green for debug)
-            let (r, g, b) = activeEmission(buttons[index].action)
-            let i = CGFloat(0.22 + glow * 0.40)
-            mat?.emission.contents = CGColor(red: r*i, green: g*i, blue: b*i, alpha: 1)
-        } else {
-            // Normal: blue proximity glow
-            let i = CGFloat(glow * 0.60)
-            mat?.emission.contents = CGColor(red: Self.cgHoverR * i,
-                                             green: Self.cgHoverG * i,
-                                             blue:  Self.cgHoverB * i, alpha: 1)
+    private func dispatchBake() {
+        let snap = PanelSnap(tab: activeTab, songs: availableSongs,
+                             isPlaying: isPlaying, debugOn: debugOn)
+        let mat  = panelMat!
+        DispatchQueue.main.async {
+            mat.diffuse.contents = ARMenuOverlay.bake(snap)
         }
     }
 
-    private func flashButton(index: Int) {
-        let mat = buttons[index].node.geometry?.firstMaterial
-        mat?.emission.contents = CGColor(red: Self.cgFlashR, green: Self.cgFlashG,
-                                         blue: Self.cgFlashB, alpha: 1)
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.20) { [weak self] in
-            guard let self else { return }
-            self.setGlow(index: index, glow: self.buttons[index].glowLevel)
+    // MARK: - Texture baking  (main thread only — UIKit)
+
+    private struct PanelSnap {
+        let tab:      Tab
+        let songs:    [Song]
+        let isPlaying: Bool
+        let debugOn:   Bool
+    }
+
+    private static func bake(_ s: PanelSnap) -> UIImage {
+        let sz = CGSize(width: texW, height: texH)
+        return UIGraphicsImageRenderer(size: sz).image { _ in
+            // Background
+            UIColor(red: 0.06, green: 0.03, blue: 0.18, alpha: 0.97).setFill()
+            UIBezierPath(roundedRect: CGRect(origin: .zero, size: sz), cornerRadius: 24).fill()
+
+            drawTabBar(s)
+            switch s.tab {
+            case .library:  drawLibrary(s)
+            case .controls: drawControls(s)
+            }
         }
     }
 
-    private func activeEmission(_ action: MenuAction) -> (CGFloat, CGFloat, CGFloat) {
-        switch action {
-        case .playStop:    return (0.90, 0.08, 0.05)   // red
-        case .toggleDebug: return (0.08, 0.85, 0.10)   // green
-        default:           return (0.60, 0.60, 0.60)
+    // ── Tab bar ──────────────────────────────────────────────────────────────
+
+    private static func drawTabBar(_ s: PanelSnap) {
+        let y = texH - tabBarH
+
+        // Active tab highlight
+        let activeX: CGFloat = s.tab == .library ? 0 : texW / 2
+        UIColor(red: 0.30, green: 0.12, blue: 0.62, alpha: 0.80).setFill()
+        UIBezierPath(roundedRect: CGRect(x: activeX, y: y, width: texW/2, height: tabBarH),
+                     cornerRadius: 0).fill()
+
+        // Top border
+        UIColor(white: 1, alpha: 0.15).setFill()
+        UIBezierPath(rect: CGRect(x: 0, y: y, width: texW, height: 1)).fill()
+
+        // Centre divider
+        UIColor(white: 1, alpha: 0.10).setFill()
+        UIBezierPath(rect: CGRect(x: texW/2 - 0.5, y: y + 12, width: 1, height: tabBarH - 24)).fill()
+
+        let font = UIFont.systemFont(ofSize: 22, weight: .bold)
+        centered("LIBRARY",  in: CGRect(x: 0,       y: y, width: texW/2, height: tabBarH),
+                 font: font, color: s.tab == .library  ? .white : UIColor(white:1,alpha:0.38))
+        centered("CONTROLS", in: CGRect(x: texW/2,  y: y, width: texW/2, height: tabBarH),
+                 font: font, color: s.tab == .controls ? .white : UIColor(white:1,alpha:0.38))
+    }
+
+    // ── Library view ─────────────────────────────────────────────────────────
+
+    private static func drawLibrary(_ s: PanelSnap) {
+        // Header
+        centered("LIBRARY", in: CGRect(x: 0, y: 0, width: texW, height: headerH),
+                 font: .systemFont(ofSize: 26, weight: .black),
+                 color: UIColor(white: 1, alpha: 0.55))
+
+        let startY = headerH
+        let maxY   = texH - tabBarH
+
+        let entries: [(String, String)] = [("♪", "Right Hand Primer")] +
+            s.songs.map { ("♪", $0.title ?? "Untitled") }
+
+        let iconBg    = UIColor(red: 0.28, green: 0.12, blue: 0.58, alpha: 0.65)
+        let titleFont = UIFont.systemFont(ofSize: 22, weight: .semibold)
+        let chevFont  = UIFont.systemFont(ofSize: 28, weight: .light)
+
+        for (i, (icon, title)) in entries.enumerated() {
+            let rowY = startY + CGFloat(i) * songRowH
+            guard rowY + songRowH <= maxY else { break }
+
+            // Alternating row tint
+            if i % 2 == 0 {
+                UIColor(white: 1, alpha: 0.04).setFill()
+                UIBezierPath(rect: CGRect(x: 0, y: rowY, width: texW, height: songRowH)).fill()
+            }
+
+            // Row separator
+            UIColor(white: 1, alpha: 0.07).setFill()
+            UIBezierPath(rect: CGRect(x: 24, y: rowY + songRowH - 1, width: texW - 48, height: 1)).fill()
+
+            // Icon circle
+            iconBg.setFill()
+            let iconRect = CGRect(x: 20, y: rowY + (songRowH - 42) / 2, width: 42, height: 42)
+            UIBezierPath(ovalIn: iconRect).fill()
+            centered(icon, in: iconRect, font: .systemFont(ofSize: 20, weight: .bold), color: .white)
+
+            // Title
+            let tAttrs: [NSAttributedString.Key: Any] = [.font: titleFont, .foregroundColor: UIColor.white]
+            let tSize  = title.size(withAttributes: tAttrs)
+            title.draw(at: CGPoint(x: 74, y: rowY + (songRowH - tSize.height) / 2),
+                       withAttributes: tAttrs)
+
+            // Chevron
+            centered("›", in: CGRect(x: texW - 40, y: rowY, width: 28, height: songRowH),
+                     font: chevFont, color: UIColor(white: 1, alpha: 0.30))
         }
     }
 
-    // MARK: - State sync  (render thread, swaps pre-baked UIImage refs)
+    // ── Controls view ─────────────────────────────────────────────────────────
 
-    private func syncPlayButton() {
-        guard let i = buttons.firstIndex(where: { $0.action == .playStop }) else { return }
-        buttons[i].isActive = isPlaying
-        // UIImage is immutable; setting diffuse.contents on render thread is thread-safe.
-        buttons[i].node.geometry?.firstMaterial?.diffuse.contents =
-            isPlaying ? buttons[i].texActive : buttons[i].texNormal
-        setGlow(index: i, glow: buttons[i].glowLevel)
+    private static func drawControls(_ s: PanelSnap) {
+        let topY   = headerH
+        let contH  = texH - tabBarH - topY
+        let centX  = texW / 2
+        let midY   = topY + contH / 2
+
+        // ── Debug button (top-left) ──────────────────────────────────────────
+        let dbgBg = s.debugOn
+            ? UIColor(red: 0.10, green: 0.48, blue: 0.18, alpha: 0.85)
+            : UIColor(white: 1, alpha: 0.09)
+        dbgBg.setFill()
+        let dbgRect = CGRect(x: 32, y: topY + 14, width: 220, height: 46)
+        UIBezierPath(roundedRect: dbgRect, cornerRadius: 11).fill()
+        centered(s.debugOn ? "⚙  DEBUG ON" : "⚙  DEBUG",
+                 in: dbgRect,
+                 font: .systemFont(ofSize: 19, weight: .semibold),
+                 color: s.debugOn ? UIColor(red: 0.45, green: 1.00, blue: 0.55, alpha: 1) : UIColor(white:1,alpha:0.55))
+
+        // ── Status label ────────────────────────────────────────────────────
+        let statusColor: UIColor = s.isPlaying
+            ? UIColor(red: 0.45, green: 1.00, blue: 0.55, alpha: 1)
+            : UIColor(white: 1, alpha: 0.40)
+        centered(s.isPlaying ? "● PLAYING" : "— READY —",
+                 in: CGRect(x: 0, y: topY + 76, width: texW, height: 48),
+                 font: .systemFont(ofSize: 24, weight: .black),
+                 color: statusColor)
+
+        // ── Play / Stop button ───────────────────────────────────────────────
+        let playBg: UIColor = s.isPlaying
+            ? UIColor(red: 0.78, green: 0.08, blue: 0.08, alpha: 0.92)
+            : UIColor(red: 0.12, green: 0.44, blue: 0.96, alpha: 0.92)
+        playBg.setFill()
+        let playRect = CGRect(x: centX - 160, y: midY - 52, width: 320, height: 88)
+        UIBezierPath(roundedRect: playRect, cornerRadius: 22).fill()
+        // Subtle border
+        UIColor(white: 1, alpha: 0.20).setStroke()
+        let playBorder = UIBezierPath(roundedRect: playRect.insetBy(dx: 1, dy: 1), cornerRadius: 22)
+        playBorder.lineWidth = 1.5
+        playBorder.stroke()
+        centered(s.isPlaying ? "■   STOP" : "▶   PLAY",
+                 in: playRect,
+                 font: .systemFont(ofSize: 38, weight: .black),
+                 color: .white)
+
+        // ── Restart button ───────────────────────────────────────────────────
+        UIColor(white: 1, alpha: 0.11).setFill()
+        let rstRect = CGRect(x: centX - 120, y: midY + 52, width: 240, height: 56)
+        UIBezierPath(roundedRect: rstRect, cornerRadius: 14).fill()
+        centered("↺   RESTART", in: rstRect,
+                 font: .systemFont(ofSize: 24, weight: .bold),
+                 color: UIColor(white: 1, alpha: 0.75))
     }
 
-    private func syncDebugButton() {
-        guard let i = buttons.firstIndex(where: { $0.action == .toggleDebug }) else { return }
-        buttons[i].isActive = debugOn
-        buttons[i].node.geometry?.firstMaterial?.diffuse.contents =
-            debugOn ? buttons[i].texActive : buttons[i].texNormal
-        setGlow(index: i, glow: buttons[i].glowLevel)
-    }
+    // ── Shared text helper ────────────────────────────────────────────────────
 
-    // MARK: - SDF math  (pure, no UIKit)
-
-    /// Axis-aligned box signed-distance function.
-    /// Returns 0 at the surface, negative inside, positive outside.
-    private func sdf(_ p: SIMD3<Float>, _ c: SIMD3<Float>, _ h: SIMD3<Float>) -> Float {
-        let q = simd_abs(p - c) - h
-        return simd_length(simd_max(q, .zero)) + min(max(q.x, max(q.y, q.z)), 0)
-    }
-
-    // MARK: - Texture baking  (UIKit — only called from build() on main thread)
-
-    private func makeButtonTexture(label: String, isActive: Bool) -> UIImage {
-        let w = Self.texW, h = Self.texH
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: w, height: h))
-        return renderer.image { _ in
-            let rect = CGRect(x: 0, y: 0, width: w, height: h)
-
-            // Glass background
-            let bg: UIColor = isActive
-                ? UIColor(red: 0.05, green: 0.18, blue: 0.07, alpha: 0.96)
-                : UIColor(red: 0.04, green: 0.04, blue: 0.14, alpha: 0.94)
-            let path = UIBezierPath(roundedRect: rect.insetBy(dx: 3, dy: 3), cornerRadius: 28)
-            bg.setFill(); path.fill()
-
-            // Border
-            let borderAlpha: CGFloat = isActive ? 0.55 : 0.28
-            let borderColor = isActive
-                ? UIColor(red: 0.30, green: 1.00, blue: 0.40, alpha: borderAlpha)
-                : UIColor(white: 1, alpha: borderAlpha)
-            borderColor.setStroke()
-            path.lineWidth = 4
-            path.stroke()
-
-            // Label
-            let labelColor: UIColor = isActive
-                ? UIColor(red: 0.45, green: 1.00, blue: 0.55, alpha: 1)
-                : UIColor.white
-            let font  = UIFont.systemFont(ofSize: 56, weight: .black)
-            let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: labelColor]
-            let size  = label.size(withAttributes: attrs)
-            label.draw(at: CGPoint(x: (w - size.width) / 2, y: (h - size.height) / 2),
-                       withAttributes: attrs)
-        }
-    }
-
-    // MARK: - Reusable material / node factories
-
-    private func panMaterial(_ color: UIColor) -> SCNMaterial {
-        let m = SCNMaterial()
-        m.lightingModel        = .constant
-        m.diffuse.contents     = color
-        m.blendMode            = .alpha
-        m.writesToDepthBuffer  = false
-        m.readsFromDepthBuffer = false
-        return m
-    }
-
-    private func accentLineMaterial() -> SCNMaterial {
-        let m = SCNMaterial()
-        m.lightingModel        = .constant
-        m.diffuse.contents     = UIColor(red: 0.25, green: 0.55, blue: 1.00, alpha: 0.70)
-        m.emission.contents    = UIColor(red: 0.15, green: 0.40, blue: 1.00, alpha: 0.60)
-        m.writesToDepthBuffer  = false
-        m.readsFromDepthBuffer = false
-        return m
-    }
-
-    private func headerLabelNode(text: String) -> SCNNode {
-        let w: CGFloat = 480, h: CGFloat = 56
-        let renderer = UIGraphicsImageRenderer(size: CGSize(width: w, height: h))
-        let img = renderer.image { _ in
-            let font  = UIFont.systemFont(ofSize: 20, weight: .black)
-            let attrs: [NSAttributedString.Key: Any] = [
-                .font: font,
-                .foregroundColor: UIColor.white.withAlphaComponent(0.38),
-                .kern: 4.5 as NSObject,
-            ]
-            let size = text.size(withAttributes: attrs)
-            text.draw(at: CGPoint(x: (w - size.width)/2, y: (h - size.height)/2),
-                      withAttributes: attrs)
-        }
-        let plane   = SCNPlane(width: CGFloat(Self.btnW + 0.020), height: 0.026)
-        let mat     = panMaterial(.clear)
-        mat.diffuse.contents = img
-        plane.materials      = [mat]
-        return SCNNode(geometry: plane)
+    private static func centered(_ text: String, in rect: CGRect,
+                                  font: UIFont, color: UIColor) {
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        let sz = text.size(withAttributes: attrs)
+        let x  = rect.minX + (rect.width  - sz.width)  / 2
+        let y  = rect.minY + (rect.height - sz.height) / 2
+        text.draw(at: CGPoint(x: x, y: y), withAttributes: attrs)
     }
 }
