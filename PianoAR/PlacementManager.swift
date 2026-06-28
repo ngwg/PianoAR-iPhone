@@ -47,8 +47,12 @@ final class PlacementManager: ObservableObject {
         let rawZ    = SIMD3<Float>(toUser.x, 0, toUser.z)
         let kbZ     = simd_length(rawZ) > 0.01 ? simd_normalize(rawZ)
                                                 : SIMD3<Float>(0, 0, 1)
-        let kbY     = SIMD3<Float>(0, 1, 0)           // always world-up
-        let kbX     = simd_cross(kbZ, kbY)             // keyboard right (low→high notes)
+        let kbY     = SIMD3<Float>(0, 1, 0)             // always world-up
+        // cross(kbY, kbZ) gives a right-handed frame where kbX points from
+        // low notes (user's left) to high notes (user's right).
+        // cross(kbZ, kbY) was the previous, wrong order — it produced -kbX,
+        // mirroring the keyboard and reversing all AR text.
+        let kbX     = simd_cross(kbY, kbZ)             // keyboard right (low→high notes)
 
         var t = hit.worldTransform
         t.columns.0 = SIMD4<Float>(kbX.x, kbX.y, kbX.z, 0)

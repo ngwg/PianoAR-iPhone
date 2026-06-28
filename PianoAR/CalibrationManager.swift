@@ -114,9 +114,10 @@ final class CalibrationManager: ObservableObject {
         let zFlat = SIMD3<Float>(zRaw.x, 0, zRaw.z)
         let kbZ  = simd_normalize(zFlat)
 
-        // Re-derive X from Z and Y for a perfectly orthogonal frame.
-        // cross(kbZ, kbY) gives keyboard-right (low-note side on left, high on right).
-        let kbX = simd_cross(kbZ, kbY)
+        // Re-derive X from Y and Z for a right-handed orthogonal frame.
+        // cross(kbY, kbZ) gives keyboard-right (low notes on user's left, high on right).
+        // cross(kbZ, kbY) was wrong — it produced -kbX, mirroring the whole overlay.
+        let kbX = simd_cross(kbY, kbZ)
 
         let col0 = SIMD4<Float>(kbX.x, kbX.y, kbX.z, 0)
         let col1 = SIMD4<Float>(kbY.x, kbY.y, kbY.z, 0)
