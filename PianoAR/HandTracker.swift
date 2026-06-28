@@ -1,10 +1,18 @@
 import ARKit
 import Vision
 import CoreImage
+import ImageIO
 import simd
 
 final class HandTracker: ObservableObject {
     @Published var detectedHandCount: Int = 0
+
+    /// Orientation to feed Vision so hands appear upright in the ML input.
+    /// Set on the main thread from the live interface orientation. The app is
+    /// locked to landscape, so only `.up` (landscapeRight) and `.down`
+    /// (landscapeLeft) ever occur. Wrong orientation degrades detection and —
+    /// worse — flips left/right chirality, so this must track the real mounting.
+    var imageOrientation: CGImagePropertyOrientation = .up
 
     struct HandResult {
         let isLeft: Bool
@@ -38,6 +46,7 @@ final class HandTracker: ObservableObject {
     private let visionQueue  = DispatchQueue(label: "com.piano.vision", qos: .userInteractive)
     private var smoothed:     [String: SIMD3<Float>]        = [:]
     private var smoothedAge:  [String: TimeInterval]        = [:]
+    private var lastDepthByKey: [String: Float]             = [:]
     private static let smoothedStaleTimeout: TimeInterval   = 0.5
 
     // Reusable downscale buffer — allocated once, reused every frame to avoid heap churn.
@@ -58,9 +67,11 @@ final class HandTracker: ObservableObject {
         let pixelBuffer = frame.capturedImage
         let camera      = frame.camera
         let depthMap    = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
+        let orient      = imageOrientation
 
         visionQueue.async { [weak self] in
-            self?.run(pixelBuffer: pixelBuffer, camera: camera, depthMap: depthMap)
+            self?.run(pixelBuffer: pixelBuffer, camera: camera, depthMap: depthMap,
+                      orientation: orient)
         }
     }
 
@@ -71,7 +82,8 @@ final class HandTracker: ObservableObject {
 
     // MARK: - Vision + LiDAR
 
-    private func run(pixelBuffer: CVPixelBuffer, camera: ARCamera, depthMap: CVPixelBuffer?) {
+    private func run(pixelBuffer: CVPixelBuffer, camera: ARCamera, depthMap: CVPixelBuffer?,
+                     orientation: CGImagePropertyOrientation) {
         defer { isProcessing = false }
 
         // Downscale to ≤640 px on the long side before Vision.
@@ -84,7 +96,7 @@ final class HandTracker: ObservableObject {
         request.maximumHandCount = 2
 
         let handler = VNImageRequestHandler(cvPixelBuffer: visionInput,
-                                            orientation: .up, options: [:])
+                                            orientation: orientation, options: [:])
         guard (try? handler.perform([request])) != nil,
               let observations = request.results, !observations.isEmpty
         else { commit([], count: 0); return }
@@ -101,25 +113,41 @@ final class HandTracker: ObservableObject {
                 guard let pt = try? obs.recognizedPoint(name),
                       pt.confidence > 0.30 else { continue }
 
-                // Vision (y-up, bottom-left) → camera image pixel (y-down, top-left)
-                let px = Float(pt.location.x) * imgW
-                let py = (1.0 - Float(pt.location.y)) * imgH
+                // Vision normalized (oriented, y-up bottom-left) → native captured-image
+                // pixel (y-down top-left). The native buffer is landscape; only .up
+                // (landscapeRight) and .down (landscapeLeft) occur, and both keep the
+                // landscape dimensions, so width/height never swap.
+                let nx: Float, ny: Float
+                if orientation == .down {
+                    nx = (1.0 - Float(pt.location.x)) * imgW
+                    ny =        Float(pt.location.y)  * imgH
+                } else {
+                    nx =        Float(pt.location.x)  * imgW
+                    ny = (1.0 - Float(pt.location.y)) * imgH
+                }
 
-                let depth = depthMap.flatMap {
-                    sampleDepth(from: $0, px: px, py: py, imgW: imgW, imgH: imgH)
-                } ?? 0.4
+                let key    = "\(side)_\(name.rawValue)"
+                let now    = CACurrentMediaTime()
+                let recent = (smoothedAge[key].map { now - $0 < Self.smoothedStaleTimeout }) ?? false
 
-                let world = cameraPixelToWorld(px: px, py: py, depth: depth, camera: camera)
+                // Nearest-biased LiDAR depth: a head-mounted camera looks DOWN at the
+                // keys, so the finger is always the closest surface along its pixel ray.
+                // A per-joint outlier clamp stops a single bad LiDAR reading (a depth-map
+                // hole that falls through to the background) from teleporting the joint.
+                var depth = depthMap.flatMap {
+                    sampleDepthNear(from: $0, px: nx, py: ny, imgW: imgW, imgH: imgH)
+                } ?? (lastDepthByKey[key] ?? 0.4)
+                if recent, let ld = lastDepthByKey[key] {
+                    depth = simd_clamp(depth, ld - 0.05, ld + 0.05)
+                }
+                lastDepthByKey[key] = depth
+
+                let world = cameraPixelToWorld(px: nx, py: ny, depth: depth, camera: camera)
 
                 // Adaptive EMA: fast-follow when the hand moves, heavy-smooth when still.
-                // This eliminates lag on fast gestures while suppressing jitter at rest —
-                // critical for the gesture UI in Phase 6.
-                let key = "\(side)_\(name.rawValue)"
-                let now = CACurrentMediaTime()
+                // Eliminates lag on fast gestures while suppressing jitter at rest.
                 let s: SIMD3<Float>
-                if let prev = smoothed[key],
-                   let age  = smoothedAge[key],
-                   now - age < Self.smoothedStaleTimeout {
+                if recent, let prev = smoothed[key] {
                     let dist  = simd_length(world - prev)
                     // α ≈ 0.2 for < 3 mm/frame movement, ramps to 0.95 at > 4 cm/frame
                     let alpha = simd_clamp(dist / 0.04, 0.2, 0.95)
@@ -176,13 +204,19 @@ final class HandTracker: ObservableObject {
 
     // MARK: - Helpers
 
-    /// Sample LiDAR depth at a 3×3 neighbourhood and return the median valid reading.
-    /// Single-pixel sampling is fragile — LiDAR depth maps have holes and noise at
-    /// object edges, so a joint that lands on a depth-map hole would fall back to the
-    /// 0.4 m default. The 3×3 median is cheap (9 reads) and robust.
-    private func sampleDepth(from map: CVPixelBuffer,
-                               px: Float, py: Float,
-                               imgW: Float, imgH: Float) -> Float? {
+    /// Sample LiDAR depth over a 5×5 neighbourhood and return a *near-biased* reading.
+    ///
+    /// A 3×3 median blends the finger with the key/desk a centimetre behind it, so a
+    /// hovering fingertip reads too far and its world Z drifts toward the surface —
+    /// exactly the jitter that wrecks both the hand model and press detection. Since
+    /// the head-mounted camera looks down at the keys, the finger is the nearest
+    /// surface along its ray, so we bias toward the near end. We take the 2nd-smallest
+    /// valid sample rather than the absolute minimum, which rejects a single spurious
+    /// near pixel while staying firmly on the finger. The wider 5×5 window tolerates a
+    /// pixel or two of joint-localization error.
+    private func sampleDepthNear(from map: CVPixelBuffer,
+                                 px: Float, py: Float,
+                                 imgW: Float, imgH: Float) -> Float? {
         let dW     = CVPixelBufferGetWidth(map)
         let dH     = CVPixelBufferGetHeight(map)
         let cxD    = Int((px / imgW * Float(dW)).rounded())
@@ -195,9 +229,9 @@ final class HandTracker: ObservableObject {
         let data = base.assumingMemoryBound(to: Float32.self)
 
         var samples: [Float] = []
-        samples.reserveCapacity(9)
-        for dy in -1...1 {
-            for dx in -1...1 {
+        samples.reserveCapacity(25)
+        for dy in -2...2 {
+            for dx in -2...2 {
                 let col = max(0, min(dW - 1, cxD + dx))
                 let row = max(0, min(dH - 1, cyD + dy))
                 let v   = data[row * stride + col]
@@ -206,7 +240,7 @@ final class HandTracker: ObservableObject {
         }
         guard !samples.isEmpty else { return nil }
         let sorted = samples.sorted()
-        return sorted[sorted.count / 2]   // median
+        return sorted[min(1, sorted.count - 1)]   // 2nd-nearest: near-biased, noise-robust
     }
 
     // ARKit camera: right-hand coords, looks along -Z, Y up. Image: x-right, y-down.

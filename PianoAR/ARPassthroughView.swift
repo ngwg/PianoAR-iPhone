@@ -1,6 +1,7 @@
 import SwiftUI
 import ARKit
 import SceneKit
+import ImageIO
 
 struct ARPassthroughView: UIViewRepresentable {
     let session:       ARSessionModel
@@ -47,6 +48,14 @@ struct ARPassthroughView: UIViewRepresentable {
     func updateUIView(_ uiView: ARSCNView, context: Context) {
         placement.sceneView   = uiView
         calibration.sceneView = uiView
+
+        // Feed Vision the correct image orientation for the actual mounting.
+        // ARKit's capturedImage is upright for landscapeRight (.up); landscapeLeft
+        // is 180° from that (.down). Getting this right keeps hand detection sharp
+        // and — critically — keeps left/right chirality correct.
+        if let io = uiView.window?.windowScene?.interfaceOrientation {
+            handTracker.imageOrientation = (io == .landscapeLeft) ? .down : .up
+        }
         context.coordinator.onTap         = onTap
         context.coordinator.onMenuAction  = onMenuAction
         context.coordinator.showDebug      = showDebug

@@ -6,15 +6,23 @@ enum MenuAction { case playStop, restart, loadAndPlay(Song?), toggleDebug }
 
 /// Large floating "tablet" AR panel — PianoVision / Quest-3 style.
 ///
-/// Two interactions:
-///   1. **Touch** — index fingertip approaches panel face, UV hit-tests a
-///      CGRect region (buttons, song rows, tabs). Skipped while pinching.
-///   2. **Grab** — pinch (thumb + index) within the top handle strip starts
-///      a drag; panel position follows the pinch midpoint with EMA smoothing;
-///      release pinch to drop. Panel stays where you put it.
+/// Three interactions, all driven by the index fingertip + thumb:
 ///
-/// All UIKit drawing is strictly main-thread via DispatchQueue.main.async.
-/// The render thread only swaps `UIImage` refs (thread-safe per SCNMaterial).
+///   1. **Cursor** — the index fingertip is projected straight onto the panel
+///      plane (panel-local X/Y), and a glowing dot is drawn there. Targeting
+///      therefore relies on X/Y (which Vision gives reliably) and never on the
+///      finger reaching an exact depth in mid-air. You can always *see* where
+///      you're pointing.
+///   2. **Click** — either **poke** (push the finger through the panel: a clean
+///      depth crossing fires instantly) or **dwell** (hold the cursor still on a
+///      control for ~0.5 s: a ring fills and fires). Poke is the fast path; dwell
+///      is the guaranteed fallback when LiDAR depth is too noisy to poke cleanly.
+///   3. **Grab** — pinch (thumb+index) on the top handle strip drags the panel
+///      anywhere in space, with EMA smoothing; release to drop.
+///
+/// All UIKit drawing is strictly main-thread (DispatchQueue.main.async). The
+/// render thread only mutates SCNNode transforms and CGColor/UIImage refs, all
+/// of which are documented thread-safe on SCNMaterial.
 final class ARMenuOverlay {
     let rootNode = SCNNode()
 
@@ -22,7 +30,6 @@ final class ARMenuOverlay {
     private static let panW: Float = 0.48
     private static let panH: Float = 0.30
 
-    // Texture resolution (2000 px/m keeps text sharp)
     private static let texW: CGFloat = 960
     private static let texH: CGFloat = 600
 
@@ -33,22 +40,35 @@ final class ARMenuOverlay {
     private static let songRowH: CGFloat = 70
 
     // ── Default placement (right of keyboard centre, lifted, tilted) ────────
-    private static let initPos = SIMD3<Float>(KeyboardLayout.totalWidth * 0.30,
-                                              0.30,
-                                              0.18)
+    private static let initPos = SIMD3<Float>(KeyboardLayout.totalWidth * 0.30, 0.30, 0.18)
     private static let initRotX: Float = -Float.pi * 0.28
     private static let initRotY: Float = -Float.pi * 0.13
 
-    // ── Touch / grab thresholds ─────────────────────────────────────────────
-    private static let triggerZ:    Float       = 0.024
-    private static let debounce:    TimeInterval = 0.28
-    private static let grabPinchOn:  Float       = 0.030
-    private static let grabPinchOff: Float       = 0.055
-    private static let grabHandleM:  Float       = 0.050   // top 50 mm = handle in panel-local
-    private static let dragSmooth:   Float       = 0.55    // EMA: 0 = no smooth, 1 = no motion
+    // ── Cursor / click thresholds ───────────────────────────────────────────
+    private static let hoverMaxZ:  Float        = 0.11   // show cursor within 11 cm of face
+    private static let pokeArmZ:   Float        = 0.045  // finger must start beyond this …
+    private static let pokeFireZ:  Float        = 0.015  // … then cross inside this to poke
+    private static let dwellTime:  TimeInterval = 0.50
+    private static let debounce:   TimeInterval = 0.32
+    private static let xyMargin:   Float        = 0.018
 
-    // ── Tabs ────────────────────────────────────────────────────────────────
+    // ── Grab thresholds ─────────────────────────────────────────────────────
+    private static let grabPinchOn:  Float = 0.030
+    private static let grabPinchOff: Float = 0.055
+    private static let grabHandleM:  Float = 0.050
+    private static let dragSmooth:   Float = 0.55
+
+    // ── Tabs / regions ──────────────────────────────────────────────────────
     private enum Tab { case library, controls }
+
+    private enum Region: Equatable {
+        case none
+        case tab(Bool)        // true = library, false = controls
+        case song(Int)        // 0 = built-in, i>0 = imported[i-1]
+        case play, restart, debug
+
+        var actionable: Bool { self != .none }
+    }
 
     // ── State (render thread) ───────────────────────────────────────────────
     private var activeTab:      Tab     = .library
@@ -58,19 +78,29 @@ final class ARMenuOverlay {
     private var needsRebake            = true
     private var lastTap: TimeInterval  = -999
 
+    // Cursor / dwell / poke
+    private var dwellRegion:    Region        = .none
+    private var dwellStart:     TimeInterval  = 0
+    private var pokeArmed:      Bool          = false   // finger has pulled back beyond arm dist
+    private var firedRegion:    Region        = .none   // latch: blocks dwell auto-repeat
+    private var cursorLeft:     Bool?         = nil      // which hand currently drives the cursor
+    private var fireFlashUntil: TimeInterval  = 0
+
     // Grab
-    private var grabSide:    Bool?         = nil   // nil=not grabbed, true=left grabbing
-    private var grabOffset:  SIMD3<Float>  = .zero // panelPos - pinchLocal at grab start
-    private var grabTarget:  SIMD3<Float>  = .zero // EMA-smoothed target
+    private var grabSide:   Bool?        = nil
+    private var grabOffset: SIMD3<Float> = .zero
+    private var grabTarget: SIMD3<Float> = .zero
 
     // ── Scene nodes ─────────────────────────────────────────────────────────
-    private var panelNode: SCNNode!
-    private var panelMat:  SCNMaterial!
+    private var panelNode:   SCNNode!
+    private var panelMat:    SCNMaterial!
+    private var cursorNode:  SCNNode!
+    private var cursorMat:   SCNMaterial!
     private var borderNodes: [SCNNode] = []
 
     init() { build() }
 
-    // MARK: - Build  (main thread, init time)
+    // MARK: - Build  (main thread)
 
     private func build() {
         let geo  = SCNPlane(width: CGFloat(Self.panW), height: CGFloat(Self.panH))
@@ -90,6 +120,7 @@ final class ARMenuOverlay {
         rootNode.addChildNode(panelNode)
 
         addBorder()
+        addCursor()
         dispatchBake()
     }
 
@@ -123,6 +154,24 @@ final class ARMenuOverlay {
         }
     }
 
+    private func addCursor() {
+        let geo = SCNSphere(radius: 0.010)
+        geo.segmentCount = 16
+        cursorMat = SCNMaterial()
+        cursorMat.lightingModel        = .constant
+        cursorMat.diffuse.contents     = UIColor.white
+        cursorMat.emission.contents    = UIColor.white.cgColor
+        cursorMat.blendMode            = .alpha
+        cursorMat.writesToDepthBuffer  = false
+        cursorMat.readsFromDepthBuffer = false
+        geo.materials = [cursorMat]
+
+        cursorNode = SCNNode(geometry: geo)
+        cursorNode.renderingOrder = 205
+        cursorNode.isHidden       = true
+        panelNode.addChildNode(cursorNode)
+    }
+
     // MARK: - Per-frame update  (render thread)
 
     func update(hands:          [HandTracker.HandResult],
@@ -140,7 +189,7 @@ final class ARMenuOverlay {
         let oldTitles = self.availableSongs.map { $0.title ?? "" }
         if newTitles != oldTitles { self.availableSongs = availableSongs; dirty = true }
 
-        // ── Pinch info per hand ──────────────────────────────────────────────
+        // ── Pinch info ───────────────────────────────────────────────────────
         struct Pinch { let isLeft: Bool; let mid: SIMD3<Float>; let dist: Float }
         var pinches: [Pinch] = []
         for hand in hands {
@@ -150,7 +199,7 @@ final class ARMenuOverlay {
                                   dist: simd_length(t - i)))
         }
 
-        // ── Grab handling ────────────────────────────────────────────────────
+        // ── Grab ───────────────────────────────────────────────────────────
         let prevGrab = grabSide
         if let side = grabSide {
             if let p = pinches.first(where: { $0.isLeft == side }), p.dist < Self.grabPinchOff,
@@ -165,7 +214,6 @@ final class ARMenuOverlay {
         }
         if grabSide == nil {
             for p in pinches where p.dist < Self.grabPinchOn {
-                // Pinch midpoint must be inside the top handle strip of the panel face
                 let panelLocal = panelNode.simdConvertPosition(p.mid, from: nil)
                 let inHandle = abs(panelLocal.z) < 0.07
                             && abs(panelLocal.x) < Self.panW / 2 + 0.02
@@ -173,117 +221,183 @@ final class ARMenuOverlay {
                             && panelLocal.y <  Self.panH / 2 + 0.025
                 if inHandle, let parent = panelNode.parent {
                     let pinchLocal = parent.simdConvertPosition(p.mid, from: nil)
-                    grabSide       = p.isLeft
-                    grabOffset     = panelNode.simdPosition - pinchLocal
-                    grabTarget     = panelNode.simdPosition
+                    grabSide   = p.isLeft
+                    grabOffset = panelNode.simdPosition - pinchLocal
+                    grabTarget = panelNode.simdPosition
                     break
                 }
             }
         }
         if (prevGrab == nil) != (grabSide == nil) { dirty = true }
 
-        // ── Touch (skipped for any hand currently pinching) ──────────────────
-        let pinchingSides = Set(pinches.filter { $0.dist < Self.grabPinchOff }.map { $0.isLeft })
+        // ── Cursor + click  (skipped while grabbing) ─────────────────────────
         var result: MenuAction? = nil
         if grabSide == nil {
+            let pinchingSides = Set(pinches.filter { $0.dist < Self.grabPinchOff }.map { $0.isLeft })
+
+            // Pick the index fingertip closest to the panel face, within bounds.
+            var best: (local: SIMD3<Float>, isLeft: Bool)? = nil
             for hand in hands {
                 if pinchingSides.contains(hand.isLeft) { continue }
-                guard let idxWorld = hand.joints[.indexTip] else { continue }
-
-                let local = panelNode.simdConvertPosition(idxWorld, from: nil)
-                guard local.z > -0.005, local.z < Self.triggerZ else { continue }
-                guard abs(local.x) < Self.panW / 2,
-                      abs(local.y) < Self.panH / 2 else { continue }
-
-                let u = CGFloat((local.x + Self.panW / 2) / Self.panW)
-                let v = CGFloat(1.0 - (local.y + Self.panH / 2) / Self.panH)
-
-                let (action, tabChanged) = performHitTest(u: u, v: v)
-                if tabChanged { dirty = true }
-
-                if let action, time - lastTap > Self.debounce {
-                    if case .loadAndPlay = action {
-                        activeTab = .controls
-                        dirty = true
-                    }
-                    lastTap = time
-                    result  = action
-                    break
+                guard let tip = hand.joints[.indexTip] else { continue }
+                let local = panelNode.simdConvertPosition(tip, from: nil)
+                guard abs(local.x) < Self.panW/2 + Self.xyMargin,
+                      abs(local.y) < Self.panH/2 + Self.xyMargin,
+                      local.z > -0.03, local.z < Self.hoverMaxZ else { continue }
+                if best == nil || abs(local.z) < abs(best!.local.z) {
+                    best = (local, hand.isLeft)
                 }
             }
+
+            if let b = best {
+                let region = regionAt(localX: b.local.x, localY: b.local.y)
+
+                // Reset per-finger state when a different hand takes the cursor.
+                if cursorLeft != b.isLeft {
+                    cursorLeft  = b.isLeft
+                    pokeArmed   = false
+                    dwellRegion = region
+                    dwellStart  = time
+                }
+
+                // Dwell bookkeeping — restart the timer whenever the target changes.
+                if region != dwellRegion {
+                    dwellRegion = region
+                    dwellStart  = time
+                }
+
+                // Release the latch once the cursor leaves the region it last fired on,
+                // so dwell can fire there again (but won't auto-repeat while held).
+                if region != firedRegion { firedRegion = .none }
+
+                // Poke: arm when the finger is pulled back past the arm distance, then
+                // fire the moment it crosses the (much closer) fire distance. Tracking an
+                // armed flag rather than a single-frame delta lets slower pokes register.
+                // A re-poke needs a fresh pull-back, so it never auto-repeats while held.
+                if b.local.z > Self.pokeArmZ { pokeArmed = true }
+                let poked = pokeArmed && b.local.z < Self.pokeFireZ
+
+                let dwellProg = Float(simd_clamp((time - dwellStart) / Self.dwellTime, 0, 1))
+                let dwellFire = (time - dwellStart) >= Self.dwellTime && firedRegion != region
+
+                if region.actionable, time - lastTap > Self.debounce, poked || dwellFire {
+                    result = fire(region, dirty: &dirty)
+                    lastTap        = time
+                    fireFlashUntil = time + 0.18
+                    pokeArmed      = false
+                    firedRegion    = region
+                    dwellRegion    = .none
+                    dwellStart     = time
+                }
+
+                updateCursor(local: b.local, progress: dwellProg,
+                             actionable: region.actionable, time: time)
+            } else {
+                cursorNode.isHidden = true
+                dwellRegion = .none
+                firedRegion = .none
+                pokeArmed   = false
+                cursorLeft  = nil
+            }
+        } else {
+            cursorNode.isHidden = true
         }
 
-        // Update border emission to reflect grab state — cheap, render-safe (CGColor)
+        // Border emission reflects grab state (CGColor — render-safe)
         let borderEmission: CGColor = grabSide != nil
-            ? UIColor(red: 0.45, green: 1.00, blue: 0.55, alpha: 0.95).cgColor   // green = grabbed
+            ? UIColor(red: 0.45, green: 1.00, blue: 0.55, alpha: 0.95).cgColor
             : UIColor(red: 0.35, green: 0.15, blue: 0.70, alpha: 0.55).cgColor
-        for n in borderNodes {
-            n.geometry?.firstMaterial?.emission.contents = borderEmission
-        }
+        for n in borderNodes { n.geometry?.firstMaterial?.emission.contents = borderEmission }
 
-        if dirty || needsRebake {
-            needsRebake = false
-            dispatchBake()
-        }
+        if dirty || needsRebake { needsRebake = false; dispatchBake() }
         return result
     }
 
-    // MARK: - Hit testing
+    // MARK: - Cursor visuals  (render thread)
 
-    private func performHitTest(u: CGFloat, v: CGFloat) -> (MenuAction?, Bool) {
+    private func updateCursor(local: SIMD3<Float>, progress: Float,
+                              actionable: Bool, time: TimeInterval) {
+        cursorNode.isHidden = false
+        cursorNode.simdPosition = SIMD3<Float>(local.x, local.y, 0.007)
+
+        let flashing = time < fireFlashUntil
+        let scale: Float
+        let color: CGColor
+        if flashing {
+            scale = 1.7
+            color = UIColor(red: 0.10, green: 1.0, blue: 0.40, alpha: 1).cgColor
+        } else if actionable {
+            // White → green as the dwell ring fills
+            scale = 1.0 + progress * 0.7
+            color = CGColor(red: CGFloat(1.0 - progress * 0.9),
+                            green: 1.0,
+                            blue:  CGFloat(1.0 - progress * 0.6),
+                            alpha: 1)
+        } else {
+            scale = 0.7
+            color = UIColor(white: 1, alpha: 0.6).cgColor
+        }
+        cursorNode.scale = SCNVector3(scale, scale, scale)
+        cursorMat.emission.contents = color
+        cursorMat.diffuse.contents  = color
+    }
+
+    // MARK: - Region resolution / firing
+
+    private func regionAt(localX: Float, localY: Float) -> Region {
+        let u  = CGFloat((localX + Self.panW/2) / Self.panW)
+        let v  = CGFloat(1.0 - (localY + Self.panH/2) / Self.panH)
         let px = u * Self.texW
         let py = v * Self.texH
 
-        // Reserve top handle as drag-only — no touch actions
-        if py < Self.handleH { return (nil, false) }
-
-        // Bottom tab bar
+        if py < Self.handleH { return .none }                 // handle = drag only
         if py >= Self.texH - Self.tabBarH {
-            let wanted: Tab = px < Self.texW / 2 ? .library : .controls
-            if activeTab != wanted { activeTab = wanted; return (nil, true) }
-            return (nil, false)
+            return .tab(px < Self.texW / 2)
         }
-
         switch activeTab {
-        case .library:  return (libraryHit(px: px, py: py), false)
-        case .controls: return (controlsHit(px: px, py: py), false)
-        }
-    }
-
-    private func libraryHit(px: CGFloat, py: CGFloat) -> MenuAction? {
-        let startY = Self.handleH + Self.headerH
-        let maxY   = Self.texH - Self.tabBarH
-        let count  = 1 + availableSongs.count
-        for i in 0..<count {
-            let rowY = startY + CGFloat(i) * Self.songRowH
-            guard rowY + Self.songRowH <= maxY else { break }
-            if py >= rowY, py < rowY + Self.songRowH {
-                let song: Song? = i == 0 ? nil : availableSongs[i - 1]
-                return .loadAndPlay(song)
+        case .library:
+            let startY = Self.handleH + Self.headerH
+            let maxY   = Self.texH - Self.tabBarH
+            let count  = 1 + availableSongs.count
+            for i in 0..<count {
+                let rowY = startY + CGFloat(i) * Self.songRowH
+                guard rowY + Self.songRowH <= maxY else { break }
+                if py >= rowY, py < rowY + Self.songRowH { return .song(i) }
             }
+            return .none
+        case .controls:
+            let cx    = Self.texW / 2
+            let topY  = Self.handleH + Self.headerH
+            let contH = Self.texH - Self.tabBarH - topY
+            let midY  = topY + contH / 2
+            if CGRect(x: 28, y: topY + 12, width: 200, height: 44).contains(CGPoint(x: px, y: py)) { return .debug }
+            if CGRect(x: cx - 150, y: midY - 50, width: 300, height: 88).contains(CGPoint(x: px, y: py)) { return .play }
+            if CGRect(x: cx - 110, y: midY + 56, width: 220, height: 54).contains(CGPoint(x: px, y: py)) { return .restart }
+            return .none
         }
-        return nil
     }
 
-    private func controlsHit(px: CGFloat, py: CGFloat) -> MenuAction? {
-        let cx    = Self.texW / 2
-        let topY  = Self.handleH + Self.headerH
-        let contH = Self.texH - Self.tabBarH - topY
-        let midY  = topY + contH / 2
-
-        let dbg = CGRect(x: 28, y: topY + 12, width: 200, height: 44)
-        if dbg.contains(CGPoint(x: px, y: py)) { return .toggleDebug }
-
-        let play = CGRect(x: cx - 150, y: midY - 50, width: 300, height: 88)
-        if play.contains(CGPoint(x: px, y: py)) { return .playStop }
-
-        let rst = CGRect(x: cx - 110, y: midY + 56, width: 220, height: 54)
-        if rst.contains(CGPoint(x: px, y: py)) { return .restart }
-
-        return nil
+    /// Apply a region's effect. Returns a MenuAction for the caller to dispatch
+    /// (or nil for pure UI navigation like tab switches).
+    private func fire(_ region: Region, dirty: inout Bool) -> MenuAction? {
+        switch region {
+        case .none:
+            return nil
+        case .tab(let library):
+            let wanted: Tab = library ? .library : .controls
+            if activeTab != wanted { activeTab = wanted; dirty = true }
+            return nil
+        case .song(let i):
+            activeTab = .controls; dirty = true
+            let song: Song? = i == 0 ? nil : (i - 1 < availableSongs.count ? availableSongs[i - 1] : nil)
+            return .loadAndPlay(song)
+        case .play:    return .playStop
+        case .restart: return .restart
+        case .debug:   return .toggleDebug
+        }
     }
 
-    // MARK: - Proximity query (for Hand3DOverlay cursor colour)
+    // MARK: - Proximity query (for Hand3DOverlay fingertip colour)
 
     func maxProximity(worldPos: SIMD3<Float>, keyboardNode: SCNNode) -> Float {
         let local  = panelNode.simdConvertPosition(worldPos, from: nil)
@@ -305,7 +419,7 @@ final class ARMenuOverlay {
         }
     }
 
-    // MARK: - Texture baking  (main thread only)
+    // MARK: - Texture baking  (main thread only — UIKit)
 
     private struct PanelSnap {
         let tab:       Tab
@@ -319,8 +433,7 @@ final class ARMenuOverlay {
         let sz = CGSize(width: texW, height: texH)
         return UIGraphicsImageRenderer(size: sz).image { _ in
             UIColor(red: 0.06, green: 0.03, blue: 0.18, alpha: 0.97).setFill()
-            UIBezierPath(roundedRect: CGRect(origin: .zero, size: sz),
-                         cornerRadius: 24).fill()
+            UIBezierPath(roundedRect: CGRect(origin: .zero, size: sz), cornerRadius: 24).fill()
 
             drawGrabHandle(s)
             drawTabBar(s)
@@ -338,10 +451,7 @@ final class ARMenuOverlay {
         bg.setFill()
         UIBezierPath(rect: CGRect(x: 0, y: 0, width: texW, height: handleH)).fill()
 
-        // Three grip dots in the centre — the canonical "drag me" affordance
-        let dotColor: UIColor = s.grabbing
-            ? UIColor(white: 1, alpha: 0.95)
-            : UIColor(white: 1, alpha: 0.55)
+        let dotColor: UIColor = s.grabbing ? UIColor(white: 1, alpha: 0.95) : UIColor(white: 1, alpha: 0.55)
         dotColor.setFill()
         let cy: CGFloat = handleH / 2
         let r:  CGFloat = 4.5
@@ -350,7 +460,6 @@ final class ARMenuOverlay {
             UIBezierPath(ovalIn: CGRect(x: x - r, y: cy - r, width: r*2, height: r*2)).fill()
         }
 
-        // Label on left
         let title = s.grabbing ? "MOVING…" : "PIANO"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: UIFont.systemFont(ofSize: 18, weight: .black),
@@ -360,7 +469,6 @@ final class ARMenuOverlay {
         let sz = title.size(withAttributes: attrs)
         title.draw(at: CGPoint(x: 22, y: (handleH - sz.height) / 2), withAttributes: attrs)
 
-        // Bottom hairline
         UIColor(white: 1, alpha: 0.13).setFill()
         UIBezierPath(rect: CGRect(x: 0, y: handleH - 1, width: texW, height: 1)).fill()
     }
@@ -415,11 +523,9 @@ final class ARMenuOverlay {
             UIBezierPath(ovalIn: iconRect).fill()
             centered(icon, in: iconRect, font: .systemFont(ofSize: 20, weight: .bold), color: .white)
 
-            let tAttrs: [NSAttributedString.Key: Any] = [
-                .font: titleFont, .foregroundColor: UIColor.white]
+            let tAttrs: [NSAttributedString.Key: Any] = [.font: titleFont, .foregroundColor: UIColor.white]
             let tSize  = title.size(withAttributes: tAttrs)
-            title.draw(at: CGPoint(x: 74, y: rowY + (songRowH - tSize.height) / 2),
-                       withAttributes: tAttrs)
+            title.draw(at: CGPoint(x: 74, y: rowY + (songRowH - tSize.height) / 2), withAttributes: tAttrs)
 
             centered("›", in: CGRect(x: texW - 40, y: rowY, width: 28, height: songRowH),
                      font: chevFont, color: UIColor(white: 1, alpha: 0.30))
@@ -432,12 +538,10 @@ final class ARMenuOverlay {
         let cx    = texW / 2
         let midY  = topY + contH / 2
 
-        // Section header
         centered("CONTROLS", in: CGRect(x: 0, y: handleH, width: texW, height: headerH),
                  font: .systemFont(ofSize: 24, weight: .black),
                  color: UIColor(white: 1, alpha: 0.55))
 
-        // Debug button (top-left)
         let dbgBg = s.debugOn
             ? UIColor(red: 0.10, green: 0.48, blue: 0.18, alpha: 0.85)
             : UIColor(white: 1, alpha: 0.09)
@@ -450,7 +554,6 @@ final class ARMenuOverlay {
                  color: s.debugOn ? UIColor(red: 0.55, green: 1.00, blue: 0.65, alpha: 1)
                                   : UIColor(white: 1, alpha: 0.55))
 
-        // Status label
         centered(s.isPlaying ? "● PLAYING" : "— READY —",
                  in: CGRect(x: 0, y: topY + 72, width: texW, height: 40),
                  font: .systemFont(ofSize: 22, weight: .black),
@@ -458,7 +561,6 @@ final class ARMenuOverlay {
                     ? UIColor(red: 0.45, green: 1.00, blue: 0.55, alpha: 1)
                     : UIColor(white: 1, alpha: 0.40))
 
-        // Play / Stop button
         let playBg: UIColor = s.isPlaying
             ? UIColor(red: 0.80, green: 0.10, blue: 0.10, alpha: 0.94)
             : UIColor(red: 0.13, green: 0.46, blue: 0.96, alpha: 0.94)
@@ -466,16 +568,12 @@ final class ARMenuOverlay {
         let playRect = CGRect(x: cx - 150, y: midY - 50, width: 300, height: 88)
         UIBezierPath(roundedRect: playRect, cornerRadius: 22).fill()
         UIColor(white: 1, alpha: 0.22).setStroke()
-        let border = UIBezierPath(roundedRect: playRect.insetBy(dx: 1, dy: 1),
-                                  cornerRadius: 22)
-        border.lineWidth = 1.5
-        border.stroke()
+        let pb = UIBezierPath(roundedRect: playRect.insetBy(dx: 1, dy: 1), cornerRadius: 22)
+        pb.lineWidth = 1.5
+        pb.stroke()
         centered(s.isPlaying ? "■   STOP" : "▶   PLAY",
-                 in: playRect,
-                 font: .systemFont(ofSize: 38, weight: .black),
-                 color: .white)
+                 in: playRect, font: .systemFont(ofSize: 38, weight: .black), color: .white)
 
-        // Restart button
         UIColor(white: 1, alpha: 0.11).setFill()
         let rstRect = CGRect(x: cx - 110, y: midY + 56, width: 220, height: 54)
         UIBezierPath(roundedRect: rstRect, cornerRadius: 14).fill()
@@ -486,8 +584,7 @@ final class ARMenuOverlay {
 
     private static func centered(_ text: String, in rect: CGRect,
                                   font: UIFont, color: UIColor) {
-        let attrs: [NSAttributedString.Key: Any] = [
-            .font: font, .foregroundColor: color]
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
         let sz = text.size(withAttributes: attrs)
         let x  = rect.minX + (rect.width  - sz.width)  / 2
         let y  = rect.minY + (rect.height - sz.height) / 2
