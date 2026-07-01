@@ -5,21 +5,18 @@ import ImageIO
 
 struct ARPassthroughView: UIViewRepresentable {
     let session:       ARSessionModel
-    let placement:     PlacementManager
     let calibration:   CalibrationManager
     let handTracker:   HandTracker
     let songPlayer:    SongPlayer
     let pressDetector: PressDetector
     let audioDetector: AudioPitchDetector
     let keyTuning:     KeyTuning
-    var onMenuAction:          ((MenuAction) -> Void)?
-    var showDebug:             Bool   = false
-    var availableSongs:        [Song] = []
-    var modeSelectionActive:   Bool   = false
-    var onModeSelected:        ((AppMode) -> Void)?
+    var onMenuAction:   ((MenuAction) -> Void)?
+    var showDebug:      Bool   = false
+    var availableSongs: [Song] = []
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(placement: placement, calibration: calibration,
+        Coordinator(calibration: calibration,
                     handTracker: handTracker, songPlayer: songPlayer,
                     pressDetector: pressDetector, audioDetector: audioDetector,
                     keyTuning: keyTuning,
@@ -36,13 +33,15 @@ struct ARPassthroughView: UIViewRepresentable {
         view.contentMode                  = .scaleAspectFill
         view.debugOptions                 = []
 
-        placement.sceneView   = view
         calibration.sceneView = view
+
+        let tap = UITapGestureRecognizer(target: context.coordinator,
+                                         action: #selector(Coordinator.handleTap(_:)))
+        view.addGestureRecognizer(tap)
         return view
     }
 
     func updateUIView(_ uiView: ARSCNView, context: Context) {
-        placement.sceneView   = uiView
         calibration.sceneView = uiView
 
         // Feed Vision the correct image orientation for the actual mounting.
@@ -52,48 +51,39 @@ struct ARPassthroughView: UIViewRepresentable {
         if let io = uiView.window?.windowScene?.interfaceOrientation {
             handTracker.imageOrientation = (io == .landscapeLeft) ? .down : .up
         }
-        context.coordinator.onMenuAction        = onMenuAction
-        context.coordinator.showDebug           = showDebug
-        context.coordinator.availableSongs      = availableSongs
-        context.coordinator.modeSelectionActive = modeSelectionActive
-        context.coordinator.onModeSelected      = onModeSelected
-        context.coordinator.songPlayer          = songPlayer
-        context.coordinator.pressDetector       = pressDetector
-        context.coordinator.audioDetector       = audioDetector
-        context.coordinator.keyTuning           = keyTuning
+        context.coordinator.onMenuAction   = onMenuAction
+        context.coordinator.showDebug      = showDebug
+        context.coordinator.availableSongs = availableSongs
+        context.coordinator.songPlayer     = songPlayer
+        context.coordinator.pressDetector  = pressDetector
+        context.coordinator.audioDetector  = audioDetector
+        context.coordinator.keyTuning      = keyTuning
     }
 
     // MARK: - Coordinator
 
     final class Coordinator: NSObject, ARSCNViewDelegate {
-        let placement:     PlacementManager
         let calibration:   CalibrationManager
         let handTracker:   HandTracker
         var songPlayer:    SongPlayer
         var pressDetector: PressDetector
         var audioDetector: AudioPitchDetector
         var keyTuning:     KeyTuning
-        var onMenuAction:          ((MenuAction) -> Void)?
-        var showDebug:             Bool   = false
-        var availableSongs:        [Song] = []
-        var modeSelectionActive:   Bool   = false
-        var onModeSelected:        ((AppMode) -> Void)?
+        var onMenuAction:   ((MenuAction) -> Void)?
+        var showDebug:      Bool   = false
+        var availableSongs: [Song] = []
 
-        private var hand3D:       Hand3DOverlay?
-        private var highway:      NoteHighway?
-        private var menuOverlay:  ARMenuOverlay?
-        private var launchSelect: LaunchSelectOverlay?
-        private var reticle:      HandPointReticle?
-        private var hintBar:      HintBarOverlay?
-        private let gestureDetector = GestureDetector()
+        private var hand3D:      Hand3DOverlay?
+        private var highway:     NoteHighway?
+        private var menuOverlay: ARMenuOverlay?
+        private var hintBar:     HintBarOverlay?
         private weak var keyboardNode: SCNNode?
 
-        init(placement: PlacementManager, calibration: CalibrationManager,
+        init(calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
              pressDetector: PressDetector, audioDetector: AudioPitchDetector,
              keyTuning: KeyTuning,
              onMenuAction: ((MenuAction) -> Void)? = nil) {
-            self.placement     = placement
             self.calibration   = calibration
             self.handTracker   = handTracker
             self.songPlayer    = songPlayer
@@ -101,6 +91,11 @@ struct ARPassthroughView: UIViewRepresentable {
             self.audioDetector = audioDetector
             self.keyTuning     = keyTuning
             self.onMenuAction  = onMenuAction
+        }
+
+        @objc func handleTap(_ g: UITapGestureRecognizer) {
+            guard let v = g.view as? ARSCNView else { return }
+            calibration.handleTap(at: g.location(in: v))
         }
 
         func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
@@ -113,54 +108,12 @@ struct ARPassthroughView: UIViewRepresentable {
 
             handTracker.maybeProcess(frame)
             let hands = handTracker.snapshot()
-
-            // ── Mode-select gate ─────────────────────────────────────────────
-            // While choosing Virtual/Real, show only the tracked hand + the
-            // camera-locked picker panel. Nothing else runs until a mode is chosen.
-            if modeSelectionActive {
-                hand3D?.update(hands: hands, menu: nil, keyboardNode: nil)
-                if launchSelect == nil, let cam = sceneView.pointOfView {
-                    launchSelect = LaunchSelectOverlay(cameraNode: cam)
-                }
-                if let ls = launchSelect, let chosen = ls.update(hands: hands, time: time) {
-                    let cb = onModeSelected
-                    DispatchQueue.main.async { cb?(chosen) }
-                }
-                reticle?.update(point: nil, progress: 0)
-                hintBar?.update(text: "")
-                return
-            } else if let ls = launchSelect {
-                ls.remove()
-                launchSelect = nil
-            }
-
             let audio = audioDetector.snapshot()
             let expectedKeyIndices = songPlayer.expectedKeyIndicesNow()
             // Hand model renders above UI (renderingOrder 300 > buttons 200)
             hand3D?.update(hands: hands, menu: menuOverlay, keyboardNode: keyboardNode)
 
-            // ── Hand-driven placement / calibration ───────────────────────────
-            // No screen access once the phone is in the headset shell: point at
-            // the target with one hand and hold it roughly still — a filling
-            // reticle ring confirms it, same feel as the AR menu's dwell click.
-            if placement.state == .readyToPlace || calibration.state.isCollecting {
-                if reticle == nil { reticle = HandPointReticle(scene: sceneView.scene) }
-                let pick = gestureDetector.dwellPick(hands: hands, time: time)
-
-                if placement.state == .readyToPlace {
-                    let preview = placement.updateHandPlacement(
-                        pointTip: pick.point, confirmed: pick.confirmed, frame: frame)
-                    reticle?.update(point: preview, progress: pick.progress)
-                } else {
-                    calibration.updateHandCalibration(point: pick.point, confirmed: pick.confirmed)
-                    reticle?.update(point: pick.point, progress: pick.progress)
-                }
-                if pick.confirmed { reticle?.pulse() }
-            } else {
-                reticle?.update(point: nil, progress: 0)
-            }
-
-            // ── Setup hint bar (camera-locked AR text — no 2-D overlay) ────────
+            // ── Setup hint bar (camera-locked AR text) ─────────────────────────
             if hintBar == nil, let cam = sceneView.pointOfView {
                 hintBar = HintBarOverlay(cameraNode: cam)
             }
@@ -168,13 +121,15 @@ struct ARPassthroughView: UIViewRepresentable {
 
             // AR menu: direct fingertip touch — no pinch required
             if let kb = keyboardNode, let menu = menuOverlay {
+                let camT = frame.camera.transform.columns.3
                 if let action = menu.update(
                     hands: hands,
                     keyboardNode: kb,
                     time: time,
                     isPlaying: songPlayer.isPlaying,
                     debugOn: showDebug,
-                    availableSongs: availableSongs
+                    availableSongs: availableSongs,
+                    cameraWorldPos: SIMD3<Float>(camT.x, camT.y, camT.z)
                 ) {
                     let cb = onMenuAction
                     DispatchQueue.main.async { cb?(action) }
@@ -205,18 +160,6 @@ struct ARPassthroughView: UIViewRepresentable {
         // MARK: Anchor → node
 
         func renderer(_ renderer: SCNSceneRenderer, nodeFor anchor: ARAnchor) -> SCNNode? {
-            if anchor.name == "keyboard" {
-                let n  = KeyboardNode.make()
-                let hw = NoteHighway()
-                n.addChildNode(hw.rootNode)
-                highway = hw
-                let menu = ARMenuOverlay()
-                n.addChildNode(menu.rootNode)
-                menuOverlay = menu
-                keyboardNode = n
-                pressDetector.reset()
-                return n
-            }
             if anchor.name == "keyboard_calibrated" {
                 let n = KeyboardNode.makeOverlay()
                 if let d = calibration.calibrationData {
@@ -234,7 +177,6 @@ struct ARPassthroughView: UIViewRepresentable {
             }
             if let name = anchor.name, name.hasPrefix("corner_") { return cornerMarker() }
             if let plane = anchor as? ARPlaneAnchor {
-                placement.onPlaneAdded()
                 return planeNode(for: plane)
             }
             return nil
@@ -247,23 +189,19 @@ struct ARPassthroughView: UIViewRepresentable {
         }
 
         private func currentHintText() -> String {
-            if calibration.state.isCollecting {
-                switch calibration.state {
-                case .collecting(let n):
-                    let labels = [
-                        "Point at corner 1/4 (near-left) — hold still to confirm",
-                        "Point at corner 2/4 (near-right) — hold still to confirm",
-                        "Point at corner 3/4 (far-right) — hold still to confirm",
-                        "Point at corner 4/4 (far-left) — hold still to confirm",
-                    ]
-                    return labels[min(n, 3)]
-                default: return ""
-                }
-            }
-            switch placement.state {
-            case .scanning:     return "Looking for a flat surface…"
-            case .readyToPlace: return "Point at the table and hold still to place"
-            case .placed:       return ""
+            switch calibration.state {
+            case .idle:
+                return "Tap the screen at each corner of your piano"
+            case .collecting(let n):
+                let labels = [
+                    "Tap corner 1/4 — near-left (low notes, front)",
+                    "Tap corner 2/4 — near-right (high notes, front)",
+                    "Tap corner 3/4 — far-right (high notes, back)",
+                    "Tap corner 4/4 — far-left (low notes, back)",
+                ]
+                return labels[min(n, 3)]
+            case .done:
+                return ""
             }
         }
 
@@ -292,61 +230,10 @@ struct ARPassthroughView: UIViewRepresentable {
     }
 }
 
-// MARK: - Hand-point reticle
-//
-// Small floating marker shown at the pointing fingertip during hand-driven
-// placement/calibration. Fills white → green as the dwell timer confirms it,
-// matching the same "hold still to confirm" feel as the AR menu's dwell click.
-// Pulses on confirm for feedback.
-
-private final class HandPointReticle {
-    private let node: SCNNode
-    private let mat:  SCNMaterial
-
-    init(scene: SCNScene) {
-        let geo = SCNSphere(radius: 0.009)
-        geo.segmentCount = 14
-        mat = SCNMaterial()
-        mat.lightingModel        = .constant
-        mat.diffuse.contents     = UIColor.white
-        mat.emission.contents    = CGColor(red: 0.30, green: 0.85, blue: 1.00, alpha: 1)
-        mat.blendMode            = .alpha
-        mat.writesToDepthBuffer  = false
-        mat.readsFromDepthBuffer = false
-        geo.materials = [mat]
-
-        node = SCNNode(geometry: geo)
-        node.renderingOrder = 260
-        node.isHidden        = true
-        scene.rootNode.addChildNode(node)
-    }
-
-    func update(point: SIMD3<Float>?, progress: Float) {
-        guard let p = point else { node.isHidden = true; return }
-        node.isHidden       = false
-        node.simdPosition   = p
-        let scale = 1.0 + progress * 0.9
-        node.scale = SCNVector3(scale, scale, scale)
-        let color = CGColor(red: CGFloat(0.30 - progress * 0.22),
-                            green: CGFloat(0.85 + progress * 0.15),
-                            blue:  CGFloat(1.00 - progress * 0.65),
-                            alpha: 1)
-        mat.emission.contents = color
-        mat.diffuse.contents  = color
-    }
-
-    func pulse() {
-        node.removeAction(forKey: "pulse")
-        let up = SCNAction.scale(to: 2.4, duration: 0.10); up.timingMode = .easeOut
-        let dn = SCNAction.scale(to: 1.0, duration: 0.18); dn.timingMode = .easeIn
-        node.runAction(SCNAction.sequence([up, dn]), forKey: "pulse")
-    }
-}
-
 // MARK: - Camera-locked hint bar
 //
 // Small always-in-view text pill for setup guidance (surface scanning, corner
-// calibration instructions). Camera-locked exactly like LaunchSelectOverlay,
+// calibration instructions). Parented to the camera node so it stays in view,
 // so this is the last piece of UI in the app that's fully in AR — nothing is
 // drawn in 2-D SwiftUI over the video feed.
 

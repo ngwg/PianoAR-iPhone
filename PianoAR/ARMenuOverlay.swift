@@ -2,7 +2,7 @@ import SceneKit
 import UIKit
 import simd
 
-enum MenuAction { case playStop, restart, loadAndPlay(Song?), toggleDebug, changeMode }
+enum MenuAction { case playStop, restart, loadAndPlay(Song?), toggleDebug, recalibrate }
 
 /// Large floating "tablet" AR panel — PianoVision / Quest-3 style.
 ///
@@ -82,6 +82,18 @@ final class ARMenuOverlay {
     private static let grabDropTime:   TimeInterval = 0.50
     private static let dragSmooth:     Float         = 0.55
 
+    // ── Distance-adaptive scale ─────────────────────────────────────────────
+    // The panel has a fixed world size, so from farther away it shrinks to
+    // hand-size and its touch targets become impossible. Scale it with camera
+    // distance so it keeps a roughly constant apparent (angular) size: at the
+    // reference distance it's 1×, and it grows linearly beyond that. Because
+    // fingertip → panel-local conversion goes through the node transform, the
+    // touch zones scale up with it automatically.
+    private static let refDistance: Float = 0.55   // metres at which scale = 1×
+    private static let minScale:    Float = 1.0
+    private static let maxScale:    Float = 2.4
+    private static let scaleSmooth: Float = 0.10   // per-frame EMA toward target
+
     // ── Tabs / regions ──────────────────────────────────────────────────────
     private enum Tab { case library, controls }
 
@@ -89,7 +101,7 @@ final class ARMenuOverlay {
         case none
         case tab(Bool)        // true = library, false = controls
         case song(Int)
-        case play, restart, debug, changeMode
+        case play, restart, debug, recalibrate
 
         var actionable: Bool { self != .none }
     }
@@ -117,6 +129,10 @@ final class ARMenuOverlay {
     private var grabTarget:   SIMD3<Float>   = .zero
     private var grabAnchor:   SIMD3<Float>?  = nil
     private var grabDwellStart: TimeInterval = 0
+
+    // Distance-adaptive scale + fire-flash (border feedback)
+    private var curScale:   Float        = 1.0
+    private var flashUntil: TimeInterval = 0
 
     // ── Scene nodes ─────────────────────────────────────────────────────────
     private var panelNode:   SCNNode!
@@ -207,7 +223,8 @@ final class ARMenuOverlay {
                 time:           TimeInterval,
                 isPlaying:      Bool,
                 debugOn:        Bool = false,
-                availableSongs: [Song] = []) -> MenuAction? {
+                availableSongs: [Song] = [],
+                cameraWorldPos: SIMD3<Float>? = nil) -> MenuAction? {
 
         var dirty = false
         if self.isPlaying != isPlaying { self.isPlaying = isPlaying; dirty = true }
@@ -216,6 +233,17 @@ final class ARMenuOverlay {
         let newTitles = availableSongs.map { $0.title ?? "" }
         let oldTitles = self.availableSongs.map { $0.title ?? "" }
         if newTitles != oldTitles { self.availableSongs = availableSongs; dirty = true }
+
+        // ── Distance-adaptive scale ──────────────────────────────────────────
+        // Keeps the panel a usable apparent size no matter how far the user
+        // stands from it. Touch zones ride along automatically because the
+        // fingertip → panel-local transform includes node scale.
+        if let cp = cameraWorldPos {
+            let d      = simd_length(cp - panelNode.simdWorldPosition)
+            let target = simd_clamp(d / Self.refDistance, Self.minScale, Self.maxScale)
+            curScale  += Self.scaleSmooth * (target - curScale)
+            panelNode.scale = SCNVector3(curScale, curScale, curScale)
+        }
 
         // ── Grab (already picked up): follow the same hand's fingertip; hold
         // still to drop — same "hold still to confirm" language as everywhere
@@ -318,10 +346,13 @@ final class ARMenuOverlay {
             cursorLeft  = nil
         }
 
-        // Border emission reflects grab state (CGColor — render-safe)
-        let borderEmission: CGColor = grabbed
-            ? UIColor(red: 0.45, green: 1.00, blue: 0.55, alpha: 0.95).cgColor
-            : UIColor(red: 0.42, green: 0.20, blue: 0.85, alpha: 0.65).cgColor
+        // Border emission reflects grab / fire-flash state (CGColor — render-safe)
+        let borderEmission: CGColor
+        if grabbed || time < flashUntil {
+            borderEmission = UIColor(red: 0.45, green: 1.00, blue: 0.55, alpha: 0.95).cgColor
+        } else {
+            borderEmission = UIColor(red: 0.42, green: 0.20, blue: 0.85, alpha: 0.65).cgColor
+        }
         for n in borderNodes { n.geometry?.firstMaterial?.emission.contents = borderEmission }
 
         if dirty || needsRebake { needsRebake = false; dispatchBake() }
@@ -379,7 +410,7 @@ final class ARMenuOverlay {
             let contH = Self.texH - Self.tabBarH - topY
             let midY  = topY + contH / 2
             if CGRect(x: 28, y: topY + 12, width: 190, height: 44).contains(CGPoint(x: px, y: py)) { return .debug }
-            if CGRect(x: Self.texW - 218, y: topY + 12, width: 190, height: 44).contains(CGPoint(x: px, y: py)) { return .changeMode }
+            if CGRect(x: Self.texW - 248, y: topY + 12, width: 220, height: 44).contains(CGPoint(x: px, y: py)) { return .recalibrate }
             if CGRect(x: cx - 150, y: midY - 44, width: 300, height: 88).contains(CGPoint(x: px, y: py)) { return .play }
             if CGRect(x: cx - 110, y: midY + 62, width: 220, height: 54).contains(CGPoint(x: px, y: py)) { return .restart }
             return .none
@@ -400,10 +431,10 @@ final class ARMenuOverlay {
             activeTab = .controls; dirty = true
             let song: Song? = (i >= 0 && i < availableSongs.count) ? availableSongs[i] : nil
             return .loadAndPlay(song)
-        case .play:       return .playStop
-        case .restart:    return .restart
-        case .debug:      return .toggleDebug
-        case .changeMode: return .changeMode
+        case .play:        return .playStop
+        case .restart:     return .restart
+        case .debug:       return .toggleDebug
+        case .recalibrate: return .recalibrate
         }
     }
 
@@ -596,9 +627,9 @@ final class ARMenuOverlay {
                                   : UIColor(white: 1, alpha: 0.60))
 
         UIColor(white: 1, alpha: 0.09).setFill()
-        let modeRect = CGRect(x: texW - 218, y: topY + 12, width: 190, height: 44)
+        let modeRect = CGRect(x: texW - 248, y: topY + 12, width: 220, height: 44)
         UIBezierPath(roundedRect: modeRect, cornerRadius: 13).fill()
-        centered("⇄ MODE", in: modeRect,
+        centered("⌖ RECALIBRATE", in: modeRect,
                  font: .systemFont(ofSize: 17, weight: .semibold),
                  color: UIColor(white: 1, alpha: 0.60))
 
@@ -655,20 +686,18 @@ final class ARMenuOverlay {
 
     // MARK: - Entrance / feedback animation  (render thread — SCNAction is safe)
 
+    // Note: no scale-based animations here — the distance-adaptive scale pass
+    // owns panelNode.scale every frame, so entrance is a fade and tap feedback
+    // is a border flash (via `flashUntil`) instead of a scale pulse.
+
     private func animateIn() {
         panelNode.opacity = 0
-        panelNode.scale   = SCNVector3(0.7, 0.7, 0.7)
-        let grow = SCNAction.scale(to: 1.0, duration: 0.42)
-        grow.timingMode = .easeOut
-        let fade = SCNAction.fadeIn(duration: 0.42)
-        panelNode.runAction(SCNAction.group([grow, fade]))
+        panelNode.runAction(SCNAction.fadeIn(duration: 0.42))
     }
 
-    /// Quick scale pulse when a control fires, for tactile confirmation.
+    /// Border flashes green briefly when a control fires (checked per frame in
+    /// update() alongside the grab state).
     private func pulse() {
-        panelNode.removeAction(forKey: "pulse")
-        let up = SCNAction.scale(to: 1.04, duration: 0.08); up.timingMode = .easeOut
-        let dn = SCNAction.scale(to: 1.0,  duration: 0.11); dn.timingMode = .easeIn
-        panelNode.runAction(SCNAction.sequence([up, dn]), forKey: "pulse")
+        flashUntil = CACurrentMediaTime() + 0.20
     }
 }
