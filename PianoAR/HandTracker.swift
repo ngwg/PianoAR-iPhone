@@ -56,6 +56,16 @@ final class HandTracker: ObservableObject {
     private var localPose:    [String: [Int: SIMD3<Float>]] = [:]
     private static let smoothedStaleTimeout: TimeInterval   = 0.5
 
+    // Anti-flicker holdover: Vision misses individual joints (and sometimes a
+    // whole hand) for a frame or two constantly — without a grace period the
+    // rendered hand strobes. Joints coast on their last smoothed position for
+    // `jointHoldover`; an entirely missed hand is re-served from cache for
+    // `handHoldover`. Everything coasted is flagged `estimated`, so press
+    // detection ignores it — this is purely visual/UI continuity.
+    private static let jointHoldover: TimeInterval = 0.30
+    private static let handHoldover:  TimeInterval = 0.25
+    private var lastHands: [Bool: (hand: HandResult, t: TimeInterval)] = [:]
+
     // Reusable downscale buffer — allocated once, reused every frame to avoid heap churn.
     private var scaledBuf:  CVPixelBuffer?
     private var scaledSize: CGSize = .zero
@@ -106,7 +116,19 @@ final class HandTracker: ObservableObject {
                                             orientation: orientation, options: [:])
         guard (try? handler.perform([request])) != nil,
               let observations = request.results, !observations.isEmpty
-        else { commit([], count: 0); return }
+        else {
+            // Nothing detected this frame — serve held-over hands (if fresh)
+            // instead of blanking, so a 1-2 frame Vision miss doesn't strobe.
+            let now = CACurrentMediaTime()
+            var held: [HandResult] = []
+            for (_, cached) in lastHands where now - cached.t < Self.handHoldover {
+                var h = cached.hand
+                h.estimated = Set(h.joints.keys)
+                held.append(h)
+            }
+            commit(held, count: 0)
+            return
+        }
 
         let imgW = Float(camera.imageResolution.width)
         let imgH = Float(camera.imageResolution.height)
@@ -169,9 +191,37 @@ final class HandTracker: ObservableObject {
             }
 
             if !joints.isEmpty {
-                let estimated = completeHand(side: side, joints: &joints)
-                results.append(HandResult(isLeft: obs.chirality == .left,
-                                          joints: joints, estimated: estimated))
+                var estimated = completeHand(side: side, joints: &joints)
+
+                // Per-joint holdover: anything still missing coasts on its last
+                // smoothed position while that cache entry is fresh.
+                let now = CACurrentMediaTime()
+                for name in HandTracker.allJoints where joints[name] == nil {
+                    let key = "\(side)_\(name.rawValue)"
+                    if let s = smoothed[key], let age = smoothedAge[key],
+                       now - age < Self.jointHoldover {
+                        joints[name] = s
+                        estimated.insert(name)
+                    }
+                }
+
+                let hand = HandResult(isLeft: obs.chirality == .left,
+                                      joints: joints, estimated: estimated)
+                results.append(hand)
+                lastHands[hand.isLeft] = (hand, now)
+            }
+        }
+
+        // Whole-hand holdover: a hand Vision missed entirely this frame is
+        // re-served from cache briefly (all joints flagged estimated) so it
+        // fades out of tracking rather than blinking.
+        let now = CACurrentMediaTime()
+        let present = Set(results.map { $0.isLeft })
+        for (isLeft, cached) in lastHands where !present.contains(isLeft) {
+            if now - cached.t < Self.handHoldover {
+                var held = cached.hand
+                held.estimated = Set(held.joints.keys)
+                results.append(held)
             }
         }
 
