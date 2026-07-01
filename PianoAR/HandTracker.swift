@@ -56,21 +56,6 @@ final class HandTracker: ObservableObject {
     private var localPose:    [String: [Int: SIMD3<Float>]] = [:]
     private static let smoothedStaleTimeout: TimeInterval   = 0.5
 
-    // Anti-flicker holdover: Vision misses individual joints (and sometimes a
-    // whole hand) for a frame or two constantly — without a grace period the
-    // rendered hand strobes. Joints coast on their last smoothed position for
-    // `jointHoldover`; an entirely missed hand is re-served from cache for
-    // `handHoldover`. Everything coasted is flagged `estimated`, so press
-    // detection ignores it — this is purely visual/UI continuity.
-    // A cached hand is only re-served if no LIVE hand is nearby: Vision
-    // flip-flops chirality on a single physical hand (L one frame, R the
-    // next), and blindly re-serving the stale side would draw a second
-    // skeleton on top of the same hand.
-    private static let jointHoldover: TimeInterval = 0.22
-    private static let handHoldover:  TimeInterval = 0.15
-    private static let sameHandDist:  Float        = 0.11
-    private var lastHands: [Bool: (hand: HandResult, t: TimeInterval)] = [:]
-
     // Reusable downscale buffer — allocated once, reused every frame to avoid heap churn.
     private var scaledBuf:  CVPixelBuffer?
     private var scaledSize: CGSize = .zero
@@ -121,19 +106,7 @@ final class HandTracker: ObservableObject {
                                             orientation: orientation, options: [:])
         guard (try? handler.perform([request])) != nil,
               let observations = request.results, !observations.isEmpty
-        else {
-            // Nothing detected this frame — serve held-over hands (if fresh)
-            // instead of blanking, so a 1-2 frame Vision miss doesn't strobe.
-            let now = CACurrentMediaTime()
-            var held: [HandResult] = []
-            for (_, cached) in lastHands where now - cached.t < Self.handHoldover {
-                var h = cached.hand
-                h.estimated = Set(h.joints.keys)
-                held.append(h)
-            }
-            commit(held, count: 0)
-            return
-        }
+        else { commit([], count: 0); return }
 
         let imgW = Float(camera.imageResolution.width)
         let imgH = Float(camera.imageResolution.height)
@@ -183,8 +156,10 @@ final class HandTracker: ObservableObject {
                 let s: SIMD3<Float>
                 if recent, let prev = smoothed[key] {
                     let dist  = simd_length(world - prev)
-                    // α ≈ 0.2 for < 3 mm/frame movement, ramps to 0.95 at > 4 cm/frame
-                    let alpha = simd_clamp(dist / 0.04, 0.2, 0.95)
+                    // Heavier floor than before (α 0.10 vs 0.20): sub-5 mm/frame
+                    // deltas are almost entirely sensor noise, so smooth them
+                    // hard; real motion still ramps to α 0.9 by ~4.5 cm/frame.
+                    let alpha = simd_clamp(dist / 0.05, 0.10, 0.90)
                     s = prev + alpha * (world - prev)
                 } else {
                     // Stale or first appearance — jump directly to avoid "snap" from old position.
@@ -196,67 +171,22 @@ final class HandTracker: ObservableObject {
             }
 
             if !joints.isEmpty {
-                var estimated = completeHand(side: side, joints: &joints)
-
-                // Per-joint holdover: anything still missing coasts on its last
-                // smoothed position while that cache entry is fresh.
-                let now = CACurrentMediaTime()
-                for name in HandTracker.allJoints where joints[name] == nil {
-                    let key = "\(side)_\(name.rawValue)"
-                    if let s = smoothed[key], let age = smoothedAge[key],
-                       now - age < Self.jointHoldover {
-                        joints[name] = s
-                        estimated.insert(name)
-                    }
-                }
-
-                let hand = HandResult(isLeft: obs.chirality == .left,
-                                      joints: joints, estimated: estimated)
-                results.append(hand)
+                let estimated = completeHand(side: side, joints: &joints)
+                results.append(HandResult(isLeft: obs.chirality == .left,
+                                          joints: joints, estimated: estimated))
             }
         }
 
-        let now = CACurrentMediaTime()
-
-        // ── Chirality-flap dedupe ──────────────────────────────────────────
-        // Two opposite-handed detections almost on top of each other are the
-        // same physical hand seen twice (Vision's L/R call is unstable when
-        // only one hand is in frame). Keep the richer detection, and kill the
-        // opposite side's cache so holdover can't resurrect it as a ghost.
-        if results.count == 2,
-           results[0].isLeft != results[1].isLeft,
-           simd_length(Self.centroid(results[0]) - Self.centroid(results[1])) < Self.sameHandDist {
+        // Chirality-flap dedupe: with one physical hand in frame, Vision
+        // sometimes reports it TWICE (as left and right on top of each other),
+        // which drew two skeletons on one hand. Two opposite-handed detections
+        // whose centroids are within ~11 cm are the same hand — keep the one
+        // with more genuinely-detected joints.
+        if results.count == 2, results[0].isLeft != results[1].isLeft,
+           simd_length(Self.centroid(results[0]) - Self.centroid(results[1])) < 0.11 {
             let q0 = results[0].joints.count - results[0].estimated.count
             let q1 = results[1].joints.count - results[1].estimated.count
-            let keep = q0 >= q1 ? results[0] : results[1]
-            results = [keep]
-            lastHands[!keep.isLeft] = nil
-        }
-        // A live hand near the opposite side's cached position also means the
-        // chirality flipped between frames — invalidate that stale cache.
-        for r in results {
-            if let cached = lastHands[!r.isLeft],
-               simd_length(Self.centroid(cached.hand) - Self.centroid(r)) < Self.sameHandDist {
-                lastHands[!r.isLeft] = nil
-            }
-        }
-        for r in results { lastHands[r.isLeft] = (r, now) }
-
-        // ── Whole-hand holdover ────────────────────────────────────────────
-        // A hand missed entirely this frame is re-served from cache briefly
-        // (all joints flagged estimated) — but never on top of a live hand.
-        let present = Set(results.map { $0.isLeft })
-        for (isLeft, cached) in lastHands where !present.contains(isLeft) {
-            guard now - cached.t < Self.handHoldover else { continue }
-            let c = Self.centroid(cached.hand)
-            let overlapsLive = results.contains {
-                simd_length(Self.centroid($0) - c) < Self.sameHandDist
-            }
-            if !overlapsLive {
-                var held = cached.hand
-                held.estimated = Set(held.joints.keys)
-                results.append(held)
-            }
+            results = [q0 >= q1 ? results[0] : results[1]]
         }
 
         commit(results, count: observations.count)
