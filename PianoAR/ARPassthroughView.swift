@@ -113,6 +113,12 @@ struct ARPassthroughView: UIViewRepresentable {
             // Hand model renders above UI (renderingOrder 300 > buttons 200)
             hand3D?.update(hands: hands, menu: menuOverlay, keyboardNode: keyboardNode)
 
+            // Try to find the keyboard automatically while waiting for the
+            // first corner tap (manual taps always take precedence).
+            calibration.attemptAutoDetect(frame: frame,
+                                          orientation: handTracker.imageOrientation,
+                                          time: time)
+
             // ── Setup hint bar (camera-locked AR text) ─────────────────────────
             if hintBar == nil, let cam = sceneView.pointOfView {
                 hintBar = HintBarOverlay(cameraNode: cam)
@@ -194,7 +200,7 @@ struct ARPassthroughView: UIViewRepresentable {
                 return "Tap the screen at each corner of your piano"
             case .collecting(let n):
                 let labels = [
-                    "Tap corner 1/4 — near-left (low notes, front)",
+                    "Auto-scanning for your keyboard… or tap corner 1/4 (near-left)",
                     "Tap corner 2/4 — near-right (high notes, front)",
                     "Tap corner 3/4 — far-right (high notes, back)",
                     "Tap corner 4/4 — far-left (low notes, back)",
