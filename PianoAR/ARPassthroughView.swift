@@ -333,54 +333,59 @@ private final class HintBarOverlay {
 
 // MARK: - 3-D hand overlay
 //
-// Renders a hologram-style "glove" skeleton around the user's real hand:
-// translucent additive cyan bones + joints, so the real hand stays visible
-// through it in passthrough instead of being covered by opaque blobs.
+// Renders a translucent frosted-glass "glove" around the user's real hand:
+// finger-thick capsule segments, joint spheres, and a palm plate, all in a
+// soft cyan glass that lets the real hand show through in passthrough. This
+// reads as one solid glove rather than a wire skeleton.
 //
 // When a HandProfile is set (measured at first launch, saved on device), the
-// skeleton is driven through a forward-kinematics pass that enforces the
-// user's real bone lengths: per-frame Vision noise can slide a joint along
-// its bone but can no longer stretch or shrink the bone, which makes the
-// whole hand read as one rigid model instead of independently jittering dots.
+// skeleton is driven through a soft forward-kinematics pass that pulls each
+// bone toward the user's real measured length: per-frame Vision noise can
+// slide a joint slightly, but the hand keeps its true proportions and moves
+// as one rigid model instead of independently jittering dots.
 //
 // renderingOrder = 300 ensures the hand always appears in front of the AR
 // menu panel (200) and note-highway geometry (50–100). The index-fingertip
-// node doubles as a touch cursor: blue near the AR menu, green at trigger.
+// node doubles as a touch cursor: brightens near the AR menu, green at trigger.
 
 private final class Hand3DOverlay {
 
-    // Joint sphere radii (m), indexed by HandTracker.allJoints order
+    // Joint sphere radii (m), indexed by HandTracker.allJoints order —
+    // finger-scale so the segments read as a glove, not dots on wires.
     // [0]=wrist, [1-4]=thumb, [5-8]=index, [9-12]=middle, [13-16]=ring, [17-20]=little
     private static let sphereR: [Float] = [
-        0.011,                              // wrist
-        0.007, 0.006, 0.0055, 0.0065,      // thumb CMC MP IP TIP
-        0.007, 0.006, 0.0055, 0.0065,      // index
-        0.007, 0.006, 0.0055, 0.0065,      // middle
-        0.007, 0.006, 0.0055, 0.0065,      // ring
-        0.0065, 0.0055, 0.005, 0.006,      // little
+        0.014,                              // wrist
+        0.0090, 0.0085, 0.0080, 0.0085,    // thumb CMC MP IP TIP
+        0.0090, 0.0080, 0.0075, 0.0080,    // index
+        0.0090, 0.0080, 0.0075, 0.0080,    // middle
+        0.0085, 0.0078, 0.0072, 0.0078,    // ring
+        0.0078, 0.0070, 0.0065, 0.0072,    // little
     ]
-    private static let cylR: Float = 0.0032
+    private static let cylR: Float = 0.0068   // finger-thick segments
 
     private static let indexTipJoint = 8
 
-    // Hologram palette (CGColor — thread-safe for render-thread changes)
-    private static let cgBone   = CGColor(red: 0.35, green: 0.75, blue: 1.00, alpha: 0.55)
-    private static let cgJoint  = CGColor(red: 0.55, green: 0.85, blue: 1.00, alpha: 0.75)
-    private static let cgTip    = CGColor(red: 0.80, green: 0.95, blue: 1.00, alpha: 0.95)
-    private static let cgCursorTouch = CGColor(red: 0.10, green: 0.98, blue: 0.45, alpha: 1)
+    // Frosted-glass palette
+    private static let glassDiffuse  = UIColor(red: 0.55, green: 0.82, blue: 1.00, alpha: 0.34)
+    private static let glassEmission = CGColor(red: 0.10, green: 0.25, blue: 0.45, alpha: 1)
+    private static let tipDiffuse    = UIColor(red: 0.75, green: 0.92, blue: 1.00, alpha: 0.55)
+    private static let cgTipIdle     = CGColor(red: 0.20, green: 0.45, blue: 0.75, alpha: 1)
+    private static let cgCursorTouch = CGColor(red: 0.05, green: 0.85, blue: 0.35, alpha: 1)
 
     /// Bone-length profile measured at first launch; nil until scanned.
     var profile: HandProfile?
+    /// How hard to pull bones toward their measured length (0 = off, 1 = snap).
+    private static let fkBlend: Float = 0.5
 
-    // Nodes: [hand 0=left, 1=right][joint/bone index]
-    private var sph: [[SCNNode]] = []
-    private var cyl: [[SCNNode]] = []
+    // Nodes: [hand 0=left, 1=right][joint/bone index] + one palm plate per hand
+    private var sph:  [[SCNNode]] = []
+    private var cyl:  [[SCNNode]] = []
+    private var palm: [SCNNode]   = []
     private var idxTipMat: [SCNMaterial] = []
 
     init(scene: SCNScene) {
-        let jointMat = Self.makeMat(Self.cgJoint)
-        let tipMat   = Self.makeMat(Self.cgTip)
-        let boneMat  = Self.makeMat(Self.cgBone)
+        let jointMat = Self.makeMat(diffuse: Self.glassDiffuse, emission: Self.glassEmission)
+        let tipMat   = Self.makeMat(diffuse: Self.tipDiffuse,   emission: Self.cgTipIdle)
 
         for _ in 0..<2 {
             var sNodes: [SCNNode] = []
@@ -389,11 +394,11 @@ private final class Hand3DOverlay {
 
             for i in 0..<HandTracker.allJoints.count {
                 let geo = SCNSphere(radius: CGFloat(Self.sphereR[i]))
-                geo.segmentCount = 12
+                geo.segmentCount = 14
                 let isTip = (i == 4 || i == 8 || i == 12 || i == 16 || i == 20)
                 let mat: SCNMaterial
                 if i == Self.indexTipJoint {
-                    mat = Self.makeMat(Self.cgTip)     // dedicated: cursor glow
+                    mat = Self.makeMat(diffuse: Self.tipDiffuse, emission: Self.cgTipIdle)
                     idxMat = mat
                 } else {
                     mat = isTip ? tipMat : jointMat
@@ -407,9 +412,9 @@ private final class Hand3DOverlay {
             }
 
             for _ in 0..<HandTracker.boneConnections.count {
-                let geo = SCNCylinder(radius: CGFloat(Self.cylR), height: 1.0)
-                geo.radialSegmentCount = 8
-                geo.materials    = [boneMat]
+                let geo = SCNCapsule(capRadius: CGFloat(Self.cylR), height: 1.0)
+                geo.radialSegmentCount = 10
+                geo.materials    = [jointMat]
                 let n = SCNNode(geometry: geo)
                 n.isHidden       = true
                 n.renderingOrder = 300
@@ -417,9 +422,18 @@ private final class Hand3DOverlay {
                 cNodes.append(n)
             }
 
+            // Palm plate: a rounded slab spanning wrist → knuckles.
+            let plateGeo = SCNBox(width: 1, height: 0.012, length: 1, chamferRadius: 0.006)
+            plateGeo.materials = [jointMat]
+            let plate = SCNNode(geometry: plateGeo)
+            plate.isHidden       = true
+            plate.renderingOrder = 299   // just under fingers
+            scene.rootNode.addChildNode(plate)
+            palm.append(plate)
+
             sph.append(sNodes)
             cyl.append(cNodes)
-            idxTipMat.append(idxMat ?? Self.makeMat(Self.cgTip))
+            idxTipMat.append(idxMat ?? Self.makeMat(diffuse: Self.tipDiffuse, emission: Self.cgTipIdle))
         }
     }
 
@@ -427,8 +441,9 @@ private final class Hand3DOverlay {
     func update(hands: [HandTracker.HandResult],
                 menu: ARMenuOverlay?,
                 keyboardNode: SCNNode?) {
-        sph.forEach { $0.forEach { $0.isHidden = true } }
-        cyl.forEach { $0.forEach { $0.isHidden = true } }
+        sph.forEach  { $0.forEach { $0.isHidden = true } }
+        cyl.forEach  { $0.forEach { $0.isHidden = true } }
+        palm.forEach { $0.isHidden = true }
 
         for hand in hands {
             let h = hand.isLeft ? 0 : 1
@@ -440,11 +455,11 @@ private final class Hand3DOverlay {
                 if let p = hand.joints[name] { pos[i] = p }
             }
 
-            // Forward-kinematics pass: walk each finger chain from the wrist
-            // outward, re-projecting every child joint onto its calibrated
-            // bone length. boneConnections lists chains in wrist→tip order,
-            // so parents are always corrected before their children. The 3
-            // palm cross-links at the end are visual-only and stay free.
+            // Soft forward-kinematics: walk each finger chain wrist→tip,
+            // pulling every child joint halfway toward its calibrated bone
+            // length. Full snapping amplified angular noise at the fingertips
+            // (a fixed-length lever arm swings further), so a 0.5 blend keeps
+            // the proportions right while staying glued to the observation.
             if let lens = profile?.lengths(isLeft: hand.isLeft) {
                 for i in 0..<min(HandProfile.chainBoneCount, lens.count) {
                     let (a, b) = HandTracker.boneConnections[i]
@@ -452,7 +467,8 @@ private final class Hand3DOverlay {
                     let d = pb - pa
                     let l = simd_length(d)
                     guard l > 1e-4 else { continue }
-                    pos[b] = pa + d / l * lens[i]
+                    let ideal = pa + d / l * lens[i]
+                    pos[b] = pb + (ideal - pb) * Self.fkBlend
                 }
             }
 
@@ -464,8 +480,9 @@ private final class Hand3DOverlay {
                 guard let a = pos[fi], let b = pos[ti] else { continue }
                 placeCylinder(cyl[h][i], from: a, to: b)
             }
+            updatePalm(palm[h], pos: pos)
 
-            // Touch cursor: index-tip colour tracks AR-menu proximity.
+            // Touch cursor: index-tip glow tracks AR-menu proximity.
             if let idxWorld = pos[Self.indexTipJoint],
                let m = menu, let kb = keyboardNode {
                 let prox = m.maxProximity(worldPos: idxWorld, keyboardNode: kb)
@@ -474,24 +491,56 @@ private final class Hand3DOverlay {
                     cursorColor = Self.cgCursorTouch
                 } else if prox > 0.20 {
                     let t = CGFloat((prox - 0.20) / 0.68)
-                    cursorColor = CGColor(red: 0.30 + t * 0.2, green: 0.75,
-                                          blue: 1.0, alpha: 0.85 + t * 0.15)
+                    cursorColor = CGColor(red: 0.20 + t * 0.15, green: 0.45 + t * 0.30,
+                                          blue: 0.75 + t * 0.25, alpha: 1)
                 } else {
-                    cursorColor = Self.cgTip
+                    cursorColor = Self.cgTipIdle
                 }
                 idxTipMat[h].emission.contents = cursorColor
             }
         }
     }
 
-    // ── Material factory (additive hologram) ──────────────────────────────
+    /// Places the palm plate over wrist + knuckles: sized to the actual hand,
+    /// oriented by the palm frame (forward = wrist→knuckles, across = index→
+    /// little knuckle).
+    private func updatePalm(_ node: SCNNode, pos: [Int: SIMD3<Float>]) {
+        guard let wrist = pos[0] else { return }
+        let mcps = [pos[5], pos[9], pos[13], pos[17]].compactMap { $0 }
+        guard mcps.count >= 3 else { return }
 
-    private static func makeMat(_ color: CGColor) -> SCNMaterial {
+        let centroid = mcps.reduce(SIMD3<Float>(repeating: 0), +) / Float(mcps.count)
+        var forward  = centroid - wrist
+        let fLen     = simd_length(forward)
+        guard fLen > 0.02 else { return }
+        forward /= fLen
+
+        let acrossRaw = (pos[5] != nil && pos[17] != nil)
+            ? pos[17]! - pos[5]!
+            : mcps.last! - mcps.first!
+        var across = acrossRaw - forward * simd_dot(acrossRaw, forward)
+        let aLen   = simd_length(across)
+        guard aLen > 0.02 else { return }
+        across /= aLen
+
+        let normal   = simd_normalize(simd_cross(forward, across))
+        let across2  = simd_cross(normal, forward)
+        let rot      = simd_float3x3(columns: (across2, normal, forward))
+
+        node.simdPosition    = (wrist + centroid) * 0.5
+        node.simdOrientation = simd_quatf(rot)
+        node.scale           = SCNVector3(aLen + 0.024, 1, fLen + 0.020)
+        node.isHidden        = false
+    }
+
+    // ── Material factory (frosted glass) ──────────────────────────────────
+
+    private static func makeMat(diffuse: UIColor, emission: CGColor) -> SCNMaterial {
         let m = SCNMaterial()
         m.lightingModel        = .constant
-        m.diffuse.contents     = UIColor.black          // additive: colour via emission
-        m.emission.contents    = color
-        m.blendMode            = .add
+        m.diffuse.contents     = diffuse
+        m.emission.contents    = emission
+        m.blendMode            = .alpha
         m.writesToDepthBuffer  = false
         m.readsFromDepthBuffer = false   // always render, never hidden by virtual geometry
         m.isDoubleSided        = true

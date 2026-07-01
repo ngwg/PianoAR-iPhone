@@ -62,8 +62,13 @@ final class HandTracker: ObservableObject {
     // `jointHoldover`; an entirely missed hand is re-served from cache for
     // `handHoldover`. Everything coasted is flagged `estimated`, so press
     // detection ignores it — this is purely visual/UI continuity.
-    private static let jointHoldover: TimeInterval = 0.30
-    private static let handHoldover:  TimeInterval = 0.25
+    // A cached hand is only re-served if no LIVE hand is nearby: Vision
+    // flip-flops chirality on a single physical hand (L one frame, R the
+    // next), and blindly re-serving the stale side would draw a second
+    // skeleton on top of the same hand.
+    private static let jointHoldover: TimeInterval = 0.22
+    private static let handHoldover:  TimeInterval = 0.15
+    private static let sameHandDist:  Float        = 0.11
     private var lastHands: [Bool: (hand: HandResult, t: TimeInterval)] = [:]
 
     // Reusable downscale buffer — allocated once, reused every frame to avoid heap churn.
@@ -208,17 +213,46 @@ final class HandTracker: ObservableObject {
                 let hand = HandResult(isLeft: obs.chirality == .left,
                                       joints: joints, estimated: estimated)
                 results.append(hand)
-                lastHands[hand.isLeft] = (hand, now)
             }
         }
 
-        // Whole-hand holdover: a hand Vision missed entirely this frame is
-        // re-served from cache briefly (all joints flagged estimated) so it
-        // fades out of tracking rather than blinking.
         let now = CACurrentMediaTime()
+
+        // ── Chirality-flap dedupe ──────────────────────────────────────────
+        // Two opposite-handed detections almost on top of each other are the
+        // same physical hand seen twice (Vision's L/R call is unstable when
+        // only one hand is in frame). Keep the richer detection, and kill the
+        // opposite side's cache so holdover can't resurrect it as a ghost.
+        if results.count == 2,
+           results[0].isLeft != results[1].isLeft,
+           simd_length(Self.centroid(results[0]) - Self.centroid(results[1])) < Self.sameHandDist {
+            let q0 = results[0].joints.count - results[0].estimated.count
+            let q1 = results[1].joints.count - results[1].estimated.count
+            let keep = q0 >= q1 ? results[0] : results[1]
+            results = [keep]
+            lastHands[!keep.isLeft] = nil
+        }
+        // A live hand near the opposite side's cached position also means the
+        // chirality flipped between frames — invalidate that stale cache.
+        for r in results {
+            if let cached = lastHands[!r.isLeft],
+               simd_length(Self.centroid(cached.hand) - Self.centroid(r)) < Self.sameHandDist {
+                lastHands[!r.isLeft] = nil
+            }
+        }
+        for r in results { lastHands[r.isLeft] = (r, now) }
+
+        // ── Whole-hand holdover ────────────────────────────────────────────
+        // A hand missed entirely this frame is re-served from cache briefly
+        // (all joints flagged estimated) — but never on top of a live hand.
         let present = Set(results.map { $0.isLeft })
         for (isLeft, cached) in lastHands where !present.contains(isLeft) {
-            if now - cached.t < Self.handHoldover {
+            guard now - cached.t < Self.handHoldover else { continue }
+            let c = Self.centroid(cached.hand)
+            let overlapsLive = results.contains {
+                simd_length(Self.centroid($0) - c) < Self.sameHandDist
+            }
+            if !overlapsLive {
                 var held = cached.hand
                 held.estimated = Set(held.joints.keys)
                 results.append(held)
@@ -226,6 +260,12 @@ final class HandTracker: ObservableObject {
         }
 
         commit(results, count: observations.count)
+    }
+
+    private static func centroid(_ h: HandResult) -> SIMD3<Float> {
+        var s = SIMD3<Float>(repeating: 0)
+        for (_, p) in h.joints { s += p }
+        return h.joints.isEmpty ? s : s / Float(h.joints.count)
     }
 
     // MARK: - Occlusion reconstruction
