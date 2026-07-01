@@ -79,11 +79,12 @@ struct ARPassthroughView: UIViewRepresentable {
         var modeSelectionActive:   Bool   = false
         var onModeSelected:        ((AppMode) -> Void)?
 
-        private var hand3D:      Hand3DOverlay?
-        private var highway:     NoteHighway?
-        private var menuOverlay: ARMenuOverlay?
+        private var hand3D:       Hand3DOverlay?
+        private var highway:      NoteHighway?
+        private var menuOverlay:  ARMenuOverlay?
         private var launchSelect: LaunchSelectOverlay?
         private var reticle:      HandPointReticle?
+        private var hintBar:      HintBarOverlay?
         private let gestureDetector = GestureDetector()
         private weak var keyboardNode: SCNNode?
 
@@ -125,7 +126,8 @@ struct ARPassthroughView: UIViewRepresentable {
                     let cb = onModeSelected
                     DispatchQueue.main.async { cb?(chosen) }
                 }
-                reticle?.update(point: nil)
+                reticle?.update(point: nil, progress: 0)
+                hintBar?.update(text: "")
                 return
             } else if let ls = launchSelect {
                 ls.remove()
@@ -139,23 +141,30 @@ struct ARPassthroughView: UIViewRepresentable {
 
             // ── Hand-driven placement / calibration ───────────────────────────
             // No screen access once the phone is in the headset shell: point at
-            // the target with one hand, pinch the other hand to confirm.
+            // the target with one hand and hold it roughly still — a filling
+            // reticle ring confirms it, same feel as the AR menu's dwell click.
             if placement.state == .readyToPlace || calibration.state.isCollecting {
                 if reticle == nil { reticle = HandPointReticle(scene: sceneView.scene) }
-                let pac = gestureDetector.pointAndConfirm(hands: hands, time: time)
-                if pac.confirmed { reticle?.pulse() }
+                let pick = gestureDetector.dwellPick(hands: hands, time: time)
 
                 if placement.state == .readyToPlace {
                     let preview = placement.updateHandPlacement(
-                        pointTip: pac.point, confirmed: pac.confirmed, frame: frame)
-                    reticle?.update(point: preview)
+                        pointTip: pick.point, confirmed: pick.confirmed, frame: frame)
+                    reticle?.update(point: preview, progress: pick.progress)
                 } else {
-                    calibration.updateHandCalibration(point: pac.point, confirmed: pac.confirmed)
-                    reticle?.update(point: pac.point)
+                    calibration.updateHandCalibration(point: pick.point, confirmed: pick.confirmed)
+                    reticle?.update(point: pick.point, progress: pick.progress)
                 }
+                if pick.confirmed { reticle?.pulse() }
             } else {
-                reticle?.update(point: nil)
+                reticle?.update(point: nil, progress: 0)
             }
+
+            // ── Setup hint bar (camera-locked AR text — no 2-D overlay) ────────
+            if hintBar == nil, let cam = sceneView.pointOfView {
+                hintBar = HintBarOverlay(cameraNode: cam)
+            }
+            hintBar?.update(text: currentHintText())
 
             // AR menu: direct fingertip touch — no pinch required
             if let kb = keyboardNode, let menu = menuOverlay {
@@ -237,6 +246,27 @@ struct ARPassthroughView: UIViewRepresentable {
             updatePlane(node, for: plane)
         }
 
+        private func currentHintText() -> String {
+            if calibration.state.isCollecting {
+                switch calibration.state {
+                case .collecting(let n):
+                    let labels = [
+                        "Point at corner 1/4 (near-left) — hold still to confirm",
+                        "Point at corner 2/4 (near-right) — hold still to confirm",
+                        "Point at corner 3/4 (far-right) — hold still to confirm",
+                        "Point at corner 4/4 (far-left) — hold still to confirm",
+                    ]
+                    return labels[min(n, 3)]
+                default: return ""
+                }
+            }
+            switch placement.state {
+            case .scanning:     return "Looking for a flat surface…"
+            case .readyToPlace: return "Point at the table and hold still to place"
+            case .placed:       return ""
+            }
+        }
+
         private func cornerMarker() -> SCNNode {
             let s = SCNSphere(radius: 0.012); let m = SCNMaterial()
             m.diffuse.contents = UIColor.orange; m.emission.contents = UIColor.orange.withAlphaComponent(0.6)
@@ -264,9 +294,10 @@ struct ARPassthroughView: UIViewRepresentable {
 
 // MARK: - Hand-point reticle
 //
-// Small floating marker shown at the "pointing" fingertip during hand-driven
-// placement/calibration, so the user can see exactly where a pinch-confirm
-// (from the other hand) will place a point. Pulses on confirm for feedback.
+// Small floating marker shown at the pointing fingertip during hand-driven
+// placement/calibration. Fills white → green as the dwell timer confirms it,
+// matching the same "hold still to confirm" feel as the AR menu's dwell click.
+// Pulses on confirm for feedback.
 
 private final class HandPointReticle {
     private let node: SCNNode
@@ -277,7 +308,7 @@ private final class HandPointReticle {
         geo.segmentCount = 14
         mat = SCNMaterial()
         mat.lightingModel        = .constant
-        mat.diffuse.contents     = UIColor(red: 0.30, green: 0.85, blue: 1.00, alpha: 1)
+        mat.diffuse.contents     = UIColor.white
         mat.emission.contents    = CGColor(red: 0.30, green: 0.85, blue: 1.00, alpha: 1)
         mat.blendMode            = .alpha
         mat.writesToDepthBuffer  = false
@@ -290,17 +321,100 @@ private final class HandPointReticle {
         scene.rootNode.addChildNode(node)
     }
 
-    func update(point: SIMD3<Float>?) {
+    func update(point: SIMD3<Float>?, progress: Float) {
         guard let p = point else { node.isHidden = true; return }
         node.isHidden       = false
         node.simdPosition   = p
+        let scale = 1.0 + progress * 0.9
+        node.scale = SCNVector3(scale, scale, scale)
+        let color = CGColor(red: CGFloat(0.30 - progress * 0.22),
+                            green: CGFloat(0.85 + progress * 0.15),
+                            blue:  CGFloat(1.00 - progress * 0.65),
+                            alpha: 1)
+        mat.emission.contents = color
+        mat.diffuse.contents  = color
     }
 
     func pulse() {
         node.removeAction(forKey: "pulse")
-        let up = SCNAction.scale(to: 2.2, duration: 0.10); up.timingMode = .easeOut
-        let dn = SCNAction.scale(to: 1.0, duration: 0.16); dn.timingMode = .easeIn
+        let up = SCNAction.scale(to: 2.4, duration: 0.10); up.timingMode = .easeOut
+        let dn = SCNAction.scale(to: 1.0, duration: 0.18); dn.timingMode = .easeIn
         node.runAction(SCNAction.sequence([up, dn]), forKey: "pulse")
+    }
+}
+
+// MARK: - Camera-locked hint bar
+//
+// Small always-in-view text pill for setup guidance (surface scanning, corner
+// calibration instructions). Camera-locked exactly like LaunchSelectOverlay,
+// so this is the last piece of UI in the app that's fully in AR — nothing is
+// drawn in 2-D SwiftUI over the video feed.
+
+private final class HintBarOverlay {
+    private static let w: Float = 0.34
+    private static let h: Float = 0.052
+    private static let texW: CGFloat = 760
+    private static let texH: CGFloat = 116
+    private static let camOffset = SCNVector3(0, -0.15, -0.55)
+
+    private let node: SCNNode
+    private let mat:  SCNMaterial
+    private var lastText = ""
+
+    init(cameraNode: SCNNode) {
+        let geo = SCNPlane(width: CGFloat(Self.w), height: CGFloat(Self.h))
+        mat = SCNMaterial()
+        mat.lightingModel        = .constant
+        mat.diffuse.contents     = UIColor(red: 0.04, green: 0.03, blue: 0.10, alpha: 0.85)
+        mat.blendMode            = .alpha
+        mat.isDoubleSided        = true
+        mat.writesToDepthBuffer  = false
+        mat.readsFromDepthBuffer = false
+        geo.materials = [mat]
+
+        node = SCNNode(geometry: geo)
+        node.position       = Self.camOffset
+        node.renderingOrder = 240
+        node.opacity        = 0
+        cameraNode.addChildNode(node)
+    }
+
+    func update(text: String) {
+        guard !text.isEmpty else {
+            if node.opacity > 0.01 { node.runAction(SCNAction.fadeOut(duration: 0.20)) }
+            lastText = ""
+            return
+        }
+        if node.opacity < 0.95 { node.runAction(SCNAction.fadeIn(duration: 0.25)) }
+        guard text != lastText else { return }
+        lastText = text
+        let m = mat!
+        DispatchQueue.main.async { m.diffuse.contents = HintBarOverlay.bake(text) }
+    }
+
+    func remove() { node.removeFromParentNode() }
+
+    private static func bake(_ text: String) -> UIImage {
+        let sz = CGSize(width: texW, height: texH)
+        return UIGraphicsImageRenderer(size: sz).image { _ in
+            let rect = CGRect(origin: .zero, size: sz).insetBy(dx: 4, dy: 4)
+            UIColor(red: 0.04, green: 0.03, blue: 0.10, alpha: 0.88).setFill()
+            UIBezierPath(roundedRect: rect, cornerRadius: 28).fill()
+            UIColor(white: 1, alpha: 0.16).setStroke()
+            let b = UIBezierPath(roundedRect: rect.insetBy(dx: 1, dy: 1), cornerRadius: 28)
+            b.lineWidth = 1.5
+            b.stroke()
+
+            let para = NSMutableParagraphStyle()
+            para.alignment     = .center
+            para.lineBreakMode = .byWordWrapping
+            let attrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 30, weight: .semibold),
+                .foregroundColor: UIColor.white,
+                .paragraphStyle: para,
+            ]
+            (text as NSString).draw(in: rect.insetBy(dx: 24, dy: 14), withAttributes: attrs)
+        }
     }
 }
 

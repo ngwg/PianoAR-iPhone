@@ -10,38 +10,69 @@ struct PressEvent {
     let timestamp: TimeInterval
 }
 
+/// Vision-only key-press detection — there is no MIDI ground truth anywhere in
+/// this project, so this is the core deliverable, not an experimental extra.
+///
+/// A real piano press has a distinctive SHAPE: the finger descends with real
+/// speed, then decelerates hard right at the moment of contact (the "valley"
+/// in its Y trajectory), sometimes with a small rebound. This detector looks
+/// for that valley rather than a single-frame threshold crossing, using two
+/// robustness measures over the old approach:
+///
+///  1. **Velocity is a least-squares slope**, not a 2-point finite difference.
+///     Differentiating noisy position data amplifies noise; a short regression
+///     over the last several samples smooths that out while staying responsive
+///     (well under 200ms of added lag at Vision's throttled frame rate).
+///  2. **Depth is measured relative to each finger's own recent rest height**
+///     (a slowly-adapted baseline, frozen during a stroke), not an absolute
+///     geometric key-surface Y. The absolute geometry depends on plane
+///     detection, hand-point calibration, and LiDAR depth — all individually
+///     noisy — so a fixed-mm threshold against it is fragile. Measuring the
+///     dip against the finger's own hover height self-calibrates away that
+///     bias. A loose absolute-geometry envelope still rejects detections that
+///     are obviously implausible (e.g. a hand gesturing far above the keys).
 final class PressDetector: ObservableObject {
     @Published var lastDetected: String = ""
     @Published var fingerDebugLines: [String] = []
 
-    // ── Non-guided (depth + trajectory) ──────────────────────────────────
-    private let pressDepth:        Float    = 0.008
-    private let minDescendVel:     Float    = -0.001
-    private let debounceInterval:  TimeInterval = 0.18
+    // ── Trajectory shape thresholds ──────────────────────────────────────────
+    private let historySize:    Int   = 6       // regression window
+    private let armDip:         Float = 0.003   // 3mm dip to arm "descending"
+    private let pressDip:       Float = 0.006   // 6mm dip (from own baseline) confirms
+    private let releaseDip:     Float = 0.002   // back within 2mm of baseline = released
+    private let descendVel:     Float = 0.05    // m/s downward to arm descending
+    private let settleVel:      Float = 0.02    // m/s — under this = "stopped" (the valley)
+    private let baselineAlpha:  Float = 0.06    // slow EMA — adapts over ~1-2s, never mid-press
+    private let envelopeY:      Float = 0.030   // ±30mm coarse geometric plausibility gate
+
+    private let debounceInterval:   TimeInterval = 0.18
     private let keyLockoutInterval: TimeInterval = 0.24
-    private let historyCount = 12
-    private let flashRetain:       TimeInterval = 2.0
+    private let flashRetain:        TimeInterval = 2.0
 
     // ── Guided (audio-primary) ────────────────────────────────────────────
-    // Window after an audio onset timestamp during which we accept a press.
     private let guidedAttackWindow:  TimeInterval = 0.22
-    // Minimum onset confidence to fire — raise to cut false positives.
     private let guidedMinAttackConf: Float = 0.28
-    // Pitch hint tolerance: ±N semitones of expected key counts as a match.
     private let pitchSemitoneWindow: Int   = 3
-    // Keyboard presence check — Y range around key surface.
     private let kbAreaYMin:          Float = -0.06
     private let kbAreaYMax:          Float =  0.10
-    // Extra Z tolerance beyond standard key depth.
     private let kbAreaZExtra:        Float =  0.040
+    // Window around an audio onset in which a vision-side valley counts as
+    // strong corroboration — much stronger evidence than "some finger is
+    // somewhere over the whole keyboard".
+    private let visionCorroborateWindow: TimeInterval = 0.15
 
     // ── State ─────────────────────────────────────────────────────────────
 
     enum Phase: String { case idle, descending, pressed }
+
     private struct FingerTrack {
-        var yHistory:      [Float] = []
-        var phase:         Phase   = .idle
-        var lastPressTime: TimeInterval = 0
+        var samples:        [(y: Float, t: TimeInterval)] = []
+        var baseline:       Float = .nan
+        var phase:          Phase = .idle
+        var peakDescentVel: Float = 0
+        var lastPressTime:  TimeInterval = 0
+        var lastKeyIndex:   Int? = nil
+        var lastValleyTime: TimeInterval = -999
     }
     private struct FingertipLocal {
         let fingerID: String
@@ -73,113 +104,130 @@ final class PressDetector: ObservableObject {
                 expectedKeyIndices: Set<Int> = [],
                 keyTuning: KeyTuning? = nil) -> [PressEvent] {
 
-        var newPresses: [PressEvent] = []
+        var visionCandidates: [PressEvent] = []
         var seen = Set<String>()
         var debugLines = [String]()
 
-        let guided = !expectedKeyIndices.isEmpty
-
-        if guided, let kb = keyboardNode {
-            // ── Guided path: audio onset + loose presence check ──────────
-            let events = guidedPressEvents(
-                hands:              hands,
-                keyboardNode:       kb,
-                expectedKeyIndices: expectedKeyIndices,
-                snapshot:           audioSnapshot,
-                time:               time
-            )
-            newPresses.append(contentsOf: events)
-
-            // Debug lines
-            for hand in hands {
-                let side = hand.isLeft ? "L" : "R"
-                for (joint, name) in Self.tips {
-                    guard let wp = hand.joints[joint] else { continue }
-                    let lp = kb.simdConvertPosition(wp, from: nil)
-                    debugLines.append(String(format: "%@_%@ y%+.0fmm", side, name, lp.y * 1000))
-                }
-            }
-            if let atk = audioSnapshot?.attack {
-                debugLines.append(String(format: "onset conf %.2f score %.2f", atk.confidence, atk.onsetScore))
-            }
-
-        } else if let kb = keyboardNode {
-            // ── Non-guided path: depth + trajectory ──────────────────────
+        if let kb = keyboardNode {
+            // Trajectory tracking runs every frame regardless of guided/non-guided
+            // — it's the primary signal in freeplay and the corroboration signal
+            // for guided mode's audio-primary detection.
             for hand in hands {
                 let side = hand.isLeft ? "L" : "R"
                 for (joint, fingerName) in Self.tips {
+                    let fid = "\(side)_\(fingerName)"
                     guard let wp = hand.joints[joint] else { continue }
-                    // Skip occlusion-reconstructed tips: a guessed fingertip must
-                    // never register a press in the depth/trajectory path.
+
+                    // Occlusion-reconstructed (guessed) fingertips must never fire —
+                    // there's no real observation behind them.
                     if hand.estimated.contains(joint) {
-                        fingers["\(side)_\(fingerName)"] = FingerTrack()
+                        fingers[fid] = FingerTrack()
                         continue
                     }
-                    let fid  = "\(side)_\(fingerName)"
                     seen.insert(fid)
-                    let lp   = kb.simdConvertPosition(wp, from: nil)
+
+                    let lp = kb.simdConvertPosition(wp, from: nil)
                     var track = fingers[fid] ?? FingerTrack()
 
-                    track.yHistory.append(lp.y)
-                    if track.yHistory.count > historyCount { track.yHistory.removeFirst() }
+                    // Dedupe: HandTracker's snapshot repeats between Vision updates
+                    // (Vision is throttled well below the 60fps render loop) — only
+                    // grow the regression buffer on genuinely new samples so the fit
+                    // isn't biased toward "flat" by repeated identical values.
+                    let isNew = track.samples.last.map { abs($0.y - lp.y) > 0.00002 } ?? true
+                    if isNew {
+                        track.samples.append((lp.y, time))
+                        if track.samples.count > historySize { track.samples.removeFirst() }
+                    }
 
-                    let key      = findKey(localX: lp.x, localZ: lp.z, keyTuning: keyTuning)
+                    let vel = regressionSlope(track.samples)
+                    let key = findKey(localX: lp.x, localZ: lp.z,
+                                      lastKeyIndex: track.lastKeyIndex, keyTuning: keyTuning)
                     let surfaceY = key?.isBlack == true
                         ? KeyboardLayout.whiteKeyHeight + KeyboardLayout.blackKeyExtraHeight
                         : KeyboardLayout.whiteKeyHeight
-                    let depth    = lp.y - surfaceY
-                    let vel: Float = track.yHistory.count >= 3
-                        ? (track.yHistory.last! - track.yHistory[track.yHistory.count - 3]) / 2.0
-                        : 0
+                    let inEnvelope = abs(lp.y - surfaceY) < envelopeY
+
+                    // Baseline only adapts while genuinely at rest, so a press dip
+                    // never drags its own reference point down with it.
+                    if track.phase == .idle, abs(vel) < descendVel * 0.4 {
+                        track.baseline = track.baseline.isNaN
+                            ? lp.y : track.baseline + baselineAlpha * (lp.y - track.baseline)
+                    }
+                    let dip = track.baseline.isNaN ? 0 : track.baseline - lp.y   // + = below rest
 
                     switch track.phase {
                     case .idle:
-                        if vel < minDescendVel && depth < 0.025 { track.phase = .descending }
+                        if vel < -descendVel, dip > armDip, inEnvelope {
+                            track.phase = .descending
+                            track.peakDescentVel = vel
+                        }
 
                     case .descending:
-                        if depth < -pressDepth,
-                           let k = key,
+                        track.peakDescentVel = min(track.peakDescentVel, vel)
+                        if vel > -settleVel, dip > pressDip,
                            time - track.lastPressTime > debounceInterval,
-                           time - lastKeyPressTime[k.index] > keyLockoutInterval {
-                            let h = track.yHistory
-                            let pv = h.count >= 4 ? (h[h.count - 2] - h[h.count - 4]) / 2.0 : vel
-                            if vel > pv * 0.4 || depth < -pressDepth * 2.5 {
-                                let micBoost = audioBoost(audioSnapshot, time: time)
-                                newPresses.append(PressEvent(
-                                    keyIndex:   k.index,
-                                    noteName:   k.noteName,
-                                    confidence: min(1.0, abs(depth) / 0.020 + micBoost),
-                                    fingerID:   fid,
-                                    timestamp:  time
-                                ))
-                                track.phase = .pressed
-                                track.lastPressTime = time
-                                lastKeyPressTime[k.index] = time
-                            }
+                           let k = key, time - lastKeyPressTime[k.index] > keyLockoutInterval {
+                            // ── The valley: descent has stopped right after a real dip ──
+                            let dipRatio  = simd_clamp(dip / 0.010, 0, 1)               // 10mm ~ full key travel
+                            let sharpness = simd_clamp(abs(track.peakDescentVel) / 0.35, 0, 1)
+                            let micBoost  = audioBoost(audioSnapshot, time: time)
+                            let confidence: Float = min(1.0, 0.55 * dipRatio + 0.35 * sharpness + micBoost)
+
+                            track.phase          = .pressed
+                            track.lastPressTime   = time
+                            track.lastValleyTime  = time
+                            track.lastKeyIndex     = k.index
+                            lastKeyPressTime[k.index] = time
+
+                            visionCandidates.append(PressEvent(
+                                keyIndex: k.index, noteName: k.noteName,
+                                confidence: confidence, fingerID: fid, timestamp: time
+                            ))
+                        } else if dip < armDip {
+                            // Pulled back up without really pressing — a false start.
+                            track.phase = .idle
+                            track.peakDescentVel = 0
                         }
-                        if vel > 0.001 && depth > 0.005 { track.phase = .idle }
 
                     case .pressed:
-                        if depth > pressDepth * 0.5 { track.phase = .idle }
+                        if dip < releaseDip { track.phase = .idle; track.peakDescentVel = 0 }
                     }
 
                     fingers[fid] = track
-                    debugLines.append(String(format: "%@ %+.0fmm %@ [%@]",
-                                            fid, depth * 1000, track.phase.rawValue,
+                    debugLines.append(String(format: "%@ dip%+.0fmm v%+.2f %@ [%@]",
+                                            fid, dip * 1000, vel, track.phase.rawValue,
                                             key?.noteName ?? "-"))
                 }
             }
             for fid in fingers.keys where !seen.contains(fid) { fingers[fid] = FingerTrack() }
         }
 
-        recentPresses.append(contentsOf: newPresses)
+        let guided = !expectedKeyIndices.isEmpty
+        let finalPresses: [PressEvent]
+
+        if guided, let kb = keyboardNode {
+            let recentValley = fingers.values.contains { time - $0.lastValleyTime < visionCorroborateWindow }
+            finalPresses = guidedPressEvents(
+                hands: hands, keyboardNode: kb,
+                expectedKeyIndices: expectedKeyIndices,
+                snapshot: audioSnapshot, time: time,
+                recentValley: recentValley
+            )
+            if let atk = audioSnapshot?.attack {
+                debugLines.append(String(format: "onset conf %.2f score %.2f", atk.confidence, atk.onsetScore))
+            }
+        } else {
+            finalPresses = visionCandidates
+        }
+
+        recentPresses.append(contentsOf: finalPresses)
         recentPresses.removeAll { time - $0.timestamp > flashRetain }
 
         if time - lastDebugUpdate > 0.10 {
             lastDebugUpdate = time
             let detected: String
-            if !newPresses.isEmpty {
-                detected = newPresses.map(\.noteName).joined(separator: " ")
+            if !finalPresses.isEmpty {
+                detected = finalPresses.map(\.noteName).joined(separator: " ")
             } else if let last = recentPresses.last, time - last.timestamp < 1.5 {
                 detected = last.noteName
             } else {
@@ -192,7 +240,7 @@ final class PressDetector: ObservableObject {
             }
         }
 
-        return newPresses
+        return finalPresses
     }
 
     func reset() {
@@ -207,20 +255,25 @@ final class PressDetector: ObservableObject {
     // In guided mode the song tells us exactly which key(s) to play — we don't
     // need to identify a key from fingertip X position. Instead:
     //
-    //   1. Audio onset = "something was played" (timing signal).
-    //   2. Loose keyboard-area presence check = "a hand is at the piano".
+    //   1. Audio onset = "something was played" (timing signal, primary).
+    //   2. A vision-side valley within `visionCorroborateWindow` of the onset =
+    //      strong corroboration (this finger genuinely just struck something),
+    //      falling back to a loose keyboard-area presence check if no valley
+    //      fired (a very light touch might not reach `pressDip`, but the hand
+    //      being at the keyboard at all is still useful signal).
     //   3. Pitch FFT hints optionally add confidence (not required — mic at
-    //      ~50 cm is noisy for bass notes and we don't want false rejections).
+    //      ~50cm is noisy for bass notes and we don't want false rejections).
     //
-    // We explicitly avoid identifying the key from vision X position because
-    // Vision + LiDAR gives ≥1 cm world-space error on 23.5 mm keys — the math
-    // cannot be reliable at that resolution.
+    // We still explicitly avoid identifying the key from vision X position:
+    // Vision + LiDAR gives ≥1cm world-space error on 23.5mm keys, unreliable
+    // at that resolution.
 
     private func guidedPressEvents(hands: [HandTracker.HandResult],
                                    keyboardNode kb: SCNNode,
                                    expectedKeyIndices: Set<Int>,
                                    snapshot: PitchSnapshot?,
-                                   time: TimeInterval) -> [PressEvent] {
+                                   time: TimeInterval,
+                                   recentValley: Bool) -> [PressEvent] {
         guard let snap   = snapshot,
               let attack = snap.attack,
               attack.confidence >= guidedMinAttackConf,
@@ -228,25 +281,20 @@ final class PressDetector: ObservableObject {
               attack.timestamp > lastGuidedAttackTime
         else { return [] }
 
-        // Loose keyboard presence check.
-        let fingerPresent = anyFingerInKeyboardArea(hands: hands, keyboardNode: kb)
-
-        // Pitch score: does the FFT hint agree with any expected key?
+        let fingerPresent = recentValley || anyFingerInKeyboardArea(hands: hands, keyboardNode: kb)
         let pitchScore = bestPitchScore(expectedKeyIndices: expectedKeyIndices, snapshot: snap)
 
-        // Confidence:  onset (0…0.55) + pitch (0…0.30) + hand-present (0…0.15)
-        var confidence  = attack.confidence * 0.55
+        // Confidence: onset (0…0.50) + pitch (0…0.30) + presence (0…0.20, more
+        // if a real vision valley corroborated it, less for loose presence only)
+        var confidence  = attack.confidence * 0.50
         confidence     += pitchScore * 0.30
-        confidence     += fingerPresent ? 0.15 : 0.0
+        confidence     += recentValley ? 0.20 : (fingerPresent ? 0.10 : 0.0)
 
-        // Reject when pitch data is present and clearly contradicts expected note.
         let pitchContradict = !snap.activeNotes.isEmpty && pitchScore < 0.07
         guard confidence >= 0.30, !pitchContradict else { return [] }
 
         lastGuidedAttackTime = attack.timestamp
 
-        // Assign best nearby fingertip to each expected key (fingerID only — not
-        // used for key identification, just for debug display and dedup).
         let tips = collectFingertips(hands: hands, keyboardNode: kb)
         var usedFingers = Set<String>()
 
@@ -261,11 +309,9 @@ final class PressDetector: ObservableObject {
             if let f = best { usedFingers.insert(f.fingerID) }
 
             return PressEvent(
-                keyIndex:   keyIndex,
-                noteName:   key.noteName,
-                confidence: min(1.0, confidence),
-                fingerID:   best?.fingerID ?? "audio",
-                timestamp:  time
+                keyIndex: keyIndex, noteName: key.noteName,
+                confidence: min(1.0, confidence), fingerID: best?.fingerID ?? "audio",
+                timestamp: time
             )
         }
     }
@@ -283,7 +329,7 @@ final class PressDetector: ObservableObject {
                 let lp = kb.simdConvertPosition(wp, from: nil)
                 out.append(FingertipLocal(
                     fingerID: "\(side)_\(name)",
-                    localX:   lp.x - leftEdge,  // relative to left edge, matching key.xCenter
+                    localX:   lp.x - leftEdge,
                     localY:   lp.y,
                     localZ:   lp.z
                 ))
@@ -301,8 +347,7 @@ final class PressDetector: ObservableObject {
                 guard let wp = hand.joints[joint] else { continue }
                 let lp = kb.simdConvertPosition(wp, from: nil)
                 if lp.y > kbAreaYMin && lp.y < kbAreaYMax
-                    && abs(lp.x) < halfW
-                    && abs(lp.z) < halfZ {
+                    && abs(lp.x) < halfW && abs(lp.z) < halfZ {
                     return true
                 }
             }
@@ -310,8 +355,7 @@ final class PressDetector: ObservableObject {
         return false
     }
 
-    private func bestPitchScore(expectedKeyIndices: Set<Int>,
-                                snapshot: PitchSnapshot) -> Float {
+    private func bestPitchScore(expectedKeyIndices: Set<Int>, snapshot: PitchSnapshot) -> Float {
         guard !snapshot.activeNotes.isEmpty else { return 0 }
         var best: Float = 0
         for keyIndex in expectedKeyIndices {
@@ -327,20 +371,54 @@ final class PressDetector: ObservableObject {
     }
 
     private func audioBoost(_ snapshot: PitchSnapshot?, time: TimeInterval) -> Float {
-        guard let snap   = snapshot,
-              let attack = snap.attack,
-              abs(time - attack.timestamp) <= 0.12
-        else { return 0 }
+        guard let snap = snapshot, let attack = snap.attack,
+              abs(time - attack.timestamp) <= 0.12 else { return 0 }
         return 0.06 + attack.confidence * 0.10
     }
 
-    // MARK: - Key lookup (non-guided mode only)
+    /// Least-squares slope of y vs t (m/s). Far more robust to single-frame
+    /// noise than a 2-point finite difference — differentiating noisy position
+    /// data amplifies that noise, while a short regression window averages it
+    /// out with negligible added lag (well under 200ms at Vision's frame rate).
+    private func regressionSlope(_ samples: [(y: Float, t: TimeInterval)]) -> Float {
+        guard samples.count >= 3 else { return 0 }
+        let n = Float(samples.count)
+        let t0 = samples[0].t
+        var sumT: Float = 0, sumY: Float = 0, sumTT: Float = 0, sumTY: Float = 0
+        for s in samples {
+            let t = Float(s.t - t0)
+            sumT += t; sumY += s.y; sumTT += t * t; sumTY += t * s.y
+        }
+        let denom = n * sumTT - sumT * sumT
+        guard abs(denom) > 1e-9 else { return 0 }
+        return (n * sumTY - sumT * sumY) / denom
+    }
 
-    private func findKey(localX: Float,
-                         localZ: Float,
-                         extraX: Float = 0.004,
-                         extraZ: Float = 0.018,
+    // MARK: - Key lookup (non-guided mode / debug display)
+
+    /// Resolves the nearest key, preferring the finger's last-resolved key if
+    /// the position is still plausibly within it (expanded tolerance). This
+    /// hysteresis stops a finger resting near a key boundary from flickering
+    /// between two keys frame to frame.
+    private func findKey(localX: Float, localZ: Float,
+                         lastKeyIndex: Int? = nil,
+                         extraX: Float = 0.004, extraZ: Float = 0.018,
                          keyTuning: KeyTuning? = nil) -> KeyboardLayout.Key? {
+        if let li = lastKeyIndex, li >= 0, li < KeyboardLayout.keys.count {
+            let k = KeyboardLayout.keys[li]
+            let leftEdge = -KeyboardLayout.totalWidth / 2
+            let relX = localX - leftEdge
+            let halfW = (k.isBlack ? KeyboardLayout.blackKeyWidth : KeyboardLayout.whiteKeyWidth) / 2
+            if abs(relX - tunedX(k, keyTuning)) < halfW * 1.4 + tunedWE(k, keyTuning) {
+                return k
+            }
+        }
+        return resolveKey(localX: localX, localZ: localZ, extraX: extraX, extraZ: extraZ, keyTuning: keyTuning)
+    }
+
+    private func resolveKey(localX: Float, localZ: Float,
+                            extraX: Float, extraZ: Float,
+                            keyTuning: KeyTuning?) -> KeyboardLayout.Key? {
         let leftEdge = -KeyboardLayout.totalWidth / 2
         let relX     = localX - leftEdge
         guard relX >= -extraX, relX <= KeyboardLayout.totalWidth + extraX else { return nil }

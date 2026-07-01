@@ -47,11 +47,11 @@ final class CalibrationManager: ObservableObject {
 
     /// Call every render frame while `state.isCollecting`. `point` is the
     /// pointing hand's fingertip world position (from
-    /// `GestureDetector.pointAndConfirm`) — already a real 3D position via
-    /// LiDAR, so no raycast is needed. `confirmed` is true on the single frame
-    /// the other hand's pinch fires, which locks in that corner. The phone is
-    /// inside a headset shell during normal use, so a screen tap was never
-    /// reachable here — this two-hand point/confirm gesture replaces it.
+    /// `GestureDetector.dwellPick`) — already a real 3D position via LiDAR, so
+    /// no raycast is needed. `confirmed` is true on the single frame the
+    /// hold-still dwell fires, which locks in that corner. The phone is inside
+    /// a headset shell during normal use, so a screen tap was never reachable
+    /// here — this single-hand point-and-hold-still gesture replaces it.
     @discardableResult
     func updateHandCalibration(point: SIMD3<Float>?, confirmed: Bool) -> Bool {
         guard case .collecting(let count) = state, count < 4, confirmed,

@@ -61,7 +61,7 @@ final class LaunchSelectOverlay {
         let geo  = SCNPlane(width: CGFloat(Self.panW), height: CGFloat(Self.panH))
         panelMat = SCNMaterial()
         panelMat.lightingModel        = .constant
-        panelMat.diffuse.contents     = UIColor(red: 0.05, green: 0.03, blue: 0.14, alpha: 0.97)
+        panelMat.diffuse.contents     = UIColor(red: 0.04, green: 0.03, blue: 0.11, alpha: 0.97)
         panelMat.blendMode            = .alpha
         panelMat.isDoubleSided        = true
         panelMat.writesToDepthBuffer  = false
@@ -219,52 +219,78 @@ final class LaunchSelectOverlay {
 
     private static func bake() -> UIImage {
         let sz = CGSize(width: texW, height: texH)
-        return UIGraphicsImageRenderer(size: sz).image { _ in
-            UIColor(red: 0.05, green: 0.03, blue: 0.14, alpha: 0.97).setFill()
-            UIBezierPath(roundedRect: CGRect(origin: .zero, size: sz), cornerRadius: 32).fill()
+        return UIGraphicsImageRenderer(size: sz).image { ctx in
+            let full = CGRect(origin: .zero, size: sz)
+            UIColor(red: 0.03, green: 0.02, blue: 0.08, alpha: 0.97).setFill()
+            UIBezierPath(roundedRect: full, cornerRadius: 34).fill()
 
-            centered("PIANOAR", in: CGRect(x: 0, y: 22, width: texW, height: 44),
-                     font: .systemFont(ofSize: 26, weight: .black), color: UIColor(white: 1, alpha: 0.85))
-            centered("Choose how you want to play", in: CGRect(x: 0, y: 64, width: texW, height: 28),
-                     font: .systemFont(ofSize: 15, weight: .medium), color: UIColor(white: 1, alpha: 0.5))
+            let gradient = CGGradient(
+                colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                colors: [
+                    UIColor(red: 0.11, green: 0.05, blue: 0.24, alpha: 1).cgColor,
+                    UIColor(red: 0.04, green: 0.03, blue: 0.11, alpha: 1).cgColor,
+                ] as CFArray, locations: [0, 1])!
+            ctx.cgContext.saveGState()
+            UIBezierPath(roundedRect: full, cornerRadius: 34).addClip()
+            ctx.cgContext.drawLinearGradient(gradient, start: .zero,
+                                             end: CGPoint(x: 0, y: texH), options: [])
+            ctx.cgContext.restoreGState()
+
+            UIColor(white: 1, alpha: 0.12).setStroke()
+            let outerBorder = UIBezierPath(roundedRect: full.insetBy(dx: 1, dy: 1), cornerRadius: 34)
+            outerBorder.lineWidth = 1.5
+            outerBorder.stroke()
+
+            centered("PIANOAR", in: CGRect(x: 0, y: 24, width: texW, height: 44),
+                     font: .systemFont(ofSize: 27, weight: .black), color: UIColor(white: 1, alpha: 0.90))
+            centered("Choose how you want to play", in: CGRect(x: 0, y: 66, width: texW, height: 28),
+                     font: .systemFont(ofSize: 15, weight: .medium), color: UIColor(white: 1, alpha: 0.52))
 
             let pad: CGFloat = 40, gap: CGFloat = 24
             let cardW = (texW - pad * 2 - gap) / 2
-            let cardTop: CGFloat = 118
+            let cardTop: CGFloat = 120
             let card0 = CGRect(x: pad, y: cardTop, width: cardW, height: texH - cardTop - 30)
             let card1 = CGRect(x: pad + cardW + gap, y: cardTop, width: cardW, height: texH - cardTop - 30)
 
             drawCard(card0, icon: "▥", title: "VIRTUAL PIANO",
                      blurb: "Place a full 88-key keyboard on any table.",
-                     accent: UIColor(red: 0.20, green: 0.55, blue: 1.0, alpha: 1))
+                     accent: UIColor(red: 0.30, green: 0.62, blue: 1.0, alpha: 1))
             drawCard(card1, icon: "♫", title: "REAL PIANO",
                      blurb: "Overlay the note guide onto your real keys.",
-                     accent: UIColor(red: 0.70, green: 0.35, blue: 1.0, alpha: 1))
+                     accent: UIColor(red: 0.75, green: 0.42, blue: 1.0, alpha: 1))
         }
     }
 
     private static func drawCard(_ rect: CGRect, icon: String, title: String,
                                  blurb: String, accent: UIColor) {
-        UIColor(white: 1, alpha: 0.06).setFill()
-        UIBezierPath(roundedRect: rect, cornerRadius: 22).fill()
-        accent.withAlphaComponent(0.55).setStroke()
-        let border = UIBezierPath(roundedRect: rect.insetBy(dx: 1, dy: 1), cornerRadius: 22)
+        UIColor(red: 0.10, green: 0.06, blue: 0.20, alpha: 0.85).setFill()
+        UIBezierPath(roundedRect: rect, cornerRadius: 24).fill()
+        accent.withAlphaComponent(0.60).setStroke()
+        let border = UIBezierPath(roundedRect: rect.insetBy(dx: 1, dy: 1), cornerRadius: 24)
         border.lineWidth = 2
         border.stroke()
+        // Soft top highlight — cheap fake-glass touch, matches the main AR menu.
+        UIColor(white: 1, alpha: 0.05).setFill()
+        UIBezierPath(roundedRect: CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height * 0.35),
+                    cornerRadius: 24).fill()
 
-        let iconRect = CGRect(x: rect.midX - 34, y: rect.minY + 24, width: 68, height: 68)
-        accent.withAlphaComponent(0.20).setFill()
+        let iconRect = CGRect(x: rect.midX - 36, y: rect.minY + 26, width: 72, height: 72)
+        accent.withAlphaComponent(0.22).setFill()
         UIBezierPath(ovalIn: iconRect).fill()
+        accent.withAlphaComponent(0.50).setStroke()
+        let iconBorder = UIBezierPath(ovalIn: iconRect.insetBy(dx: 1, dy: 1))
+        iconBorder.lineWidth = 1.5
+        iconBorder.stroke()
         centered(icon, in: iconRect, font: .systemFont(ofSize: 30, weight: .bold), color: accent)
 
-        centered(title, in: CGRect(x: rect.minX, y: iconRect.maxY + 12, width: rect.width, height: 28),
+        centered(title, in: CGRect(x: rect.minX, y: iconRect.maxY + 14, width: rect.width, height: 28),
                  font: .systemFont(ofSize: 19, weight: .bold), color: .white)
 
-        let blurbTop  = iconRect.maxY + 46
+        let blurbTop  = iconRect.maxY + 48
         let blurbRect = CGRect(x: rect.minX + 16, y: blurbTop,
                                width: rect.width - 32, height: max(0, rect.maxY - blurbTop - 12))
         wrapped(blurb, in: blurbRect, font: .systemFont(ofSize: 13, weight: .regular),
-                color: UIColor(white: 1, alpha: 0.55))
+                color: UIColor(white: 1, alpha: 0.58))
     }
 
     private static func centered(_ text: String, in rect: CGRect, font: UIFont, color: UIColor) {

@@ -12,8 +12,8 @@ enum PlacementState {
 ///
 /// The phone is inside a headset shell during normal use, so the touchscreen
 /// isn't reachable — placement is entirely hand-driven: point at the desired
-/// spot on the table with one hand (that fingertip's LiDAR-derived 3D position
-/// IS the point, no raycast needed), then pinch with the OTHER hand to confirm.
+/// spot on the table (that fingertip's LiDAR-derived 3D position IS the point,
+/// no raycast needed), then hold it roughly still to confirm.
 final class PlacementManager: ObservableObject {
     @Published var state: PlacementState = .scanning
 
@@ -26,8 +26,8 @@ final class PlacementManager: ObservableObject {
     }
 
     /// Call every render frame while `state == .readyToPlace`. `pointTip` is the
-    /// pointing hand's fingertip world position (from `GestureDetector.pointAndConfirm`);
-    /// `confirmed` is true on the single frame the other hand's pinch fires.
+    /// pointing hand's fingertip world position (from `GestureDetector.dwellPick`);
+    /// `confirmed` is true on the single frame the hold-still dwell fires.
     /// Returns a live preview position (fingertip XZ, snapped to the nearest
     /// detected plane's height) for a reticle, or nil if there's nothing to show.
     @discardableResult

@@ -2,108 +2,55 @@ import Foundation
 import simd
 import Vision
 
-struct PinchEvent {
-    let worldPosition: SIMD3<Float>
-    let isLeft: Bool
-    let timestamp: TimeInterval
-}
-
 final class GestureDetector {
-    // Distance thresholds (metres)
-    private let onThreshold:  Float = 0.030
-    private let offThreshold: Float = 0.050
-    // Minimum time between consecutive pinches on the same hand
-    private let debounce: TimeInterval = 0.22
+    // ── Single-hand "hold still to confirm" point picker ────────────────────
+    // Used wherever a screen tap would normally pick a world point (virtual-
+    // keyboard placement, real-piano corner calibration) — the phone is inside
+    // a headset shell, so the screen isn't reachable. Pinch-based two-hand
+    // confirm turned out unreliable (thumb/index landmarks are noisy at close
+    // range, and coordinating two hands blind is awkward), so this matches the
+    // AR menu's own dwell-click instead: whichever hand is available becomes
+    // the pointer, and holding its fingertip roughly still for `dwellTime`
+    // confirms that point. Single hand, no pinch distance measurement at all.
+    private static let stillRadius: Float        = 0.014   // 14mm — must hold within this
+    private static let dwellTime:   TimeInterval = 0.6
 
-    private var pinching:      [String: Bool]          = [:]
-    private var lastPinchTime: [String: TimeInterval]  = [:]
-    private var pointingIsLeft: Bool? = nil
+    private var anchor:   SIMD3<Float>?  = nil
+    private var start:    TimeInterval   = 0
+    private var fired:    Bool           = false
+    private var handIsLeft: Bool?        = nil
 
-    // Call once per render frame. Returns any new pinch-began events.
-    func update(hands: [HandTracker.HandResult],
-                time: TimeInterval) -> [PinchEvent] {
-        var events: [PinchEvent] = []
+    /// Call once per render frame. Returns the current candidate point (for a
+    /// live reticle) and whether it was just confirmed (fires once per dwell).
+    /// `progress` is 0…1 dwell fill, for visual feedback.
+    func dwellPick(hands: [HandTracker.HandResult],
+                   time: TimeInterval) -> (point: SIMD3<Float>?, progress: Float, confirmed: Bool) {
+        // Prefer continuing with whichever hand we were already tracking, so the
+        // reticle doesn't jump if a second hand briefly enters frame.
+        var hand: HandTracker.HandResult? = nil
+        if let cur = handIsLeft { hand = hands.first { $0.isLeft == cur } }
+        if hand == nil { hand = hands.first { $0.joints[.indexTip] != nil } }
+        handIsLeft = hand?.isLeft
 
-        for hand in hands {
-            let side = hand.isLeft ? "L" : "R"
-            guard let thumb = hand.joints[.thumbTip],
-                  let index = hand.joints[.indexTip] else {
-                pinching[side] = false
-                continue
-            }
-
-            let dist      = simd_length(thumb - index)
-            let wasPinch  = pinching[side] ?? false
-
-            if dist < onThreshold, !wasPinch {
-                let last = lastPinchTime[side] ?? -999
-                guard time - last > debounce else { continue }
-                pinching[side]      = true
-                lastPinchTime[side] = time
-                events.append(PinchEvent(
-                    worldPosition: (thumb + index) * 0.5,
-                    isLeft: hand.isLeft,
-                    timestamp: time
-                ))
-            } else if dist > offThreshold {
-                pinching[side] = false
-            }
+        guard let tip = hand?.joints[.indexTip] else {
+            anchor = nil; fired = false
+            return (nil, 0, false)
         }
 
-        return events
-    }
-
-    // True while the pinch is currently held (for hover / drag use).
-    func isPinching(hand: String) -> Bool { pinching[hand] ?? false }
-
-    // World-space midpoint of thumb+index for a given hand, if available.
-    func pinchMidpoint(for hands: [HandTracker.HandResult],
-                       isLeft: Bool) -> SIMD3<Float>? {
-        guard let hand = hands.first(where: { $0.isLeft == isLeft }),
-              let thumb = hand.joints[.thumbTip],
-              let index = hand.joints[.indexTip]
-        else { return nil }
-        return (thumb + index) * 0.5
-    }
-
-    /// Two-handed "point and confirm", used wherever a screen tap would normally
-    /// pick a world point (virtual-keyboard placement, real-piano corner
-    /// calibration) — but the phone is inside a headset shell, so the screen
-    /// isn't reachable at all. Instead: one hand's index fingertip IS the point
-    /// (its 3D world position already comes from LiDAR via HandTracker, so no
-    /// raycast is needed), and a pinch on the OTHER hand confirms it.
-    ///
-    /// The pointing-hand assignment is sticky across frames (stored in
-    /// `pointingIsLeft`) so the reticle doesn't jump between hands frame to
-    /// frame; it only reassigns when the current pointing hand disappears or
-    /// itself starts pinching (which reads as "that hand just became the
-    /// confirm hand instead").
-    func pointAndConfirm(hands: [HandTracker.HandResult],
-                         time: TimeInterval) -> (point: SIMD3<Float>?, confirmed: Bool) {
-        let events = update(hands: hands, time: time)
-
-        func usable(_ isLeft: Bool) -> HandTracker.HandResult? {
-            guard let h = hands.first(where: { $0.isLeft == isLeft }),
-                  h.joints[.indexTip] != nil,
-                  !isPinching(hand: isLeft ? "L" : "R") else { return nil }
-            return h
-        }
-
-        var pointHand: HandTracker.HandResult? = nil
-        if let cur = pointingIsLeft, let h = usable(cur) {
-            pointHand = h
+        if let a = anchor, simd_length(tip - a) < Self.stillRadius {
+            // Still within the settle radius — keep accumulating dwell time.
         } else {
-            // Default to the right hand pointing (left hand confirms) when both
-            // are free — an arbitrary but consistent starting convention.
-            pointHand = usable(false) ?? usable(true)
+            anchor = tip
+            start  = time
+            fired  = false
         }
-        pointingIsLeft = pointHand?.isLeft
 
-        let point = pointHand?.joints[.indexTip]
-        let confirmed = events.contains { ev in
-            guard let pIsLeft = pointingIsLeft else { return false }
-            return ev.isLeft != pIsLeft
+        let progress = Float(simd_clamp((time - start) / Self.dwellTime, 0, 1))
+        var confirmed = false
+        if !fired, progress >= 1.0 {
+            fired = true
+            confirmed = true
         }
-        return (point, confirmed)
+        return (tip, progress, confirmed)
     }
 }

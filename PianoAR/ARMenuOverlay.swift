@@ -2,23 +2,25 @@ import SceneKit
 import UIKit
 import simd
 
-enum MenuAction { case playStop, restart, loadAndPlay(Song?), toggleDebug }
+enum MenuAction { case playStop, restart, loadAndPlay(Song?), toggleDebug, changeMode }
 
 /// Large floating "tablet" AR panel — PianoVision / Quest-3 style.
 ///
-/// Three interactions, all driven by the index fingertip + thumb:
+/// Interaction, all single-hand, no pinch:
 ///
 ///   1. **Cursor** — the index fingertip is projected straight onto the panel
 ///      plane (panel-local X/Y), and a glowing dot is drawn there. Targeting
-///      therefore relies on X/Y (which Vision gives reliably) and never on the
-///      finger reaching an exact depth in mid-air. You can always *see* where
-///      you're pointing.
-///   2. **Click** — either **poke** (push the finger through the panel: a clean
-///      depth crossing fires instantly) or **dwell** (hold the cursor still on a
-///      control for ~0.5 s: a ring fills and fires). Poke is the fast path; dwell
-///      is the guaranteed fallback when LiDAR depth is too noisy to poke cleanly.
-///   3. **Grab** — pinch (thumb+index) on the top handle strip drags the panel
-///      anywhere in space, with EMA smoothing; release to drop.
+///      relies on X/Y (which Vision gives reliably), never on the finger
+///      reaching an exact depth in mid-air.
+///   2. **Click** — either **poke** (push the finger through: a clean depth
+///      crossing fires instantly) or **dwell** (hold the cursor still on a
+///      control for ~0.45s: a ring fills and fires). Poke is the fast path;
+///      dwell is the guaranteed fallback when depth is noisy.
+///   3. **Grab** — poke the handle strip to pick the panel up; it then follows
+///      your fingertip until you hold still for ~0.5s, which drops it. (An
+///      earlier pinch-based grab was unreliable — thumb/index landmarks are
+///      noisy at close range — so this reuses the same poke/dwell primitives
+///      as everything else instead of a second gesture vocabulary.)
 ///
 /// All UIKit drawing is strictly main-thread (DispatchQueue.main.async). The
 /// render thread only mutates SCNNode transforms and CGColor/UIImage refs, all
@@ -28,15 +30,15 @@ final class ARMenuOverlay {
 
     // ── Panel geometry ──────────────────────────────────────────────────────
     private static let panW: Float = 0.48
-    private static let panH: Float = 0.30
+    private static let panH: Float = 0.32
 
     private static let texW: CGFloat = 960
-    private static let texH: CGFloat = 600
+    private static let texH: CGFloat = 640
 
     // UI zone heights (texture pixels)
-    private static let handleH:  CGFloat = 56
-    private static let tabBarH:  CGFloat = 70
-    private static let headerH:  CGFloat = 54
+    private static let handleH:  CGFloat = 58
+    private static let tabBarH:  CGFloat = 72
+    private static let headerH:  CGFloat = 56
 
     // Library is a 2-column grid of song cards (fits up to 12 = 6 rows)
     private static let libCols:  Int     = 2
@@ -68,21 +70,17 @@ final class ARMenuOverlay {
     private static let initRotY: Float = -Float.pi * 0.13
 
     // ── Cursor / click thresholds ───────────────────────────────────────────
-    // Generous reach: the cursor appears (and dwell works) from up to ~28 cm in
-    // front of the panel, so you can tap from a comfortable distance without
-    // having to push your finger all the way to the virtual surface.
-    private static let hoverMaxZ:  Float        = 0.28   // show cursor within 28 cm of face
-    private static let pokeArmZ:   Float        = 0.090  // finger must start beyond this …
-    private static let pokeFireZ:  Float        = 0.040  // … then cross inside this to poke
+    private static let hoverMaxZ:  Float        = 0.28
+    private static let pokeArmZ:   Float        = 0.090
+    private static let pokeFireZ:  Float        = 0.040
     private static let dwellTime:  TimeInterval = 0.45
     private static let debounce:   TimeInterval = 0.32
     private static let xyMargin:   Float        = 0.030
 
-    // ── Grab thresholds ─────────────────────────────────────────────────────
-    private static let grabPinchOn:  Float = 0.030
-    private static let grabPinchOff: Float = 0.055
-    private static let grabHandleM:  Float = 0.050
-    private static let dragSmooth:   Float = 0.55
+    // ── Grab thresholds (poke to pick up, dwell to drop) ────────────────────
+    private static let grabDropRadius: Float        = 0.012
+    private static let grabDropTime:   TimeInterval = 0.50
+    private static let dragSmooth:     Float         = 0.55
 
     // ── Tabs / regions ──────────────────────────────────────────────────────
     private enum Tab { case library, controls }
@@ -90,8 +88,8 @@ final class ARMenuOverlay {
     private enum Region: Equatable {
         case none
         case tab(Bool)        // true = library, false = controls
-        case song(Int)        // 0 = built-in, i>0 = imported[i-1]
-        case play, restart, debug
+        case song(Int)
+        case play, restart, debug, changeMode
 
         var actionable: Bool { self != .none }
     }
@@ -107,15 +105,18 @@ final class ARMenuOverlay {
     // Cursor / dwell / poke
     private var dwellRegion:    Region        = .none
     private var dwellStart:     TimeInterval  = 0
-    private var pokeArmed:      Bool          = false   // finger has pulled back beyond arm dist
-    private var firedRegion:    Region        = .none   // latch: blocks dwell auto-repeat
-    private var cursorLeft:     Bool?         = nil      // which hand currently drives the cursor
+    private var pokeArmed:      Bool          = false
+    private var firedRegion:    Region        = .none
+    private var cursorLeft:     Bool?         = nil
     private var fireFlashUntil: TimeInterval  = 0
 
-    // Grab
-    private var grabSide:   Bool?        = nil
-    private var grabOffset: SIMD3<Float> = .zero
-    private var grabTarget: SIMD3<Float> = .zero
+    // Grab (poke handle to pick up, dwell to drop)
+    private var grabbed:      Bool           = false
+    private var grabSide:     Bool?          = nil
+    private var grabOffset:   SIMD3<Float>   = .zero
+    private var grabTarget:   SIMD3<Float>   = .zero
+    private var grabAnchor:   SIMD3<Float>?  = nil
+    private var grabDwellStart: TimeInterval = 0
 
     // ── Scene nodes ─────────────────────────────────────────────────────────
     private var panelNode:   SCNNode!
@@ -132,7 +133,7 @@ final class ARMenuOverlay {
         let geo  = SCNPlane(width: CGFloat(Self.panW), height: CGFloat(Self.panH))
         panelMat = SCNMaterial()
         panelMat.lightingModel        = .constant
-        panelMat.diffuse.contents     = UIColor(red: 0.06, green: 0.03, blue: 0.18, alpha: 0.97)
+        panelMat.diffuse.contents     = UIColor(red: 0.045, green: 0.03, blue: 0.13, alpha: 0.97)
         panelMat.blendMode            = .alpha
         panelMat.isDoubleSided        = true
         panelMat.writesToDepthBuffer  = false
@@ -152,9 +153,9 @@ final class ARMenuOverlay {
     }
 
     private func addBorder() {
-        let baseEmission = UIColor(red: 0.35, green: 0.15, blue: 0.70, alpha: 0.55).cgColor
-        let baseDiffuse  = UIColor(red: 0.45, green: 0.22, blue: 0.85, alpha: 0.70)
-        let t: Float = 0.003
+        let baseEmission = UIColor(red: 0.42, green: 0.20, blue: 0.85, alpha: 0.65).cgColor
+        let baseDiffuse  = UIColor(red: 0.55, green: 0.30, blue: 0.98, alpha: 0.75)
+        let t: Float = 0.0032
 
         struct Edge { var w: Float; var h: Float; var x: Float; var y: Float }
         let edges: [Edge] = [
@@ -216,125 +217,111 @@ final class ARMenuOverlay {
         let oldTitles = self.availableSongs.map { $0.title ?? "" }
         if newTitles != oldTitles { self.availableSongs = availableSongs; dirty = true }
 
-        // ── Pinch info ───────────────────────────────────────────────────────
-        struct Pinch { let isLeft: Bool; let mid: SIMD3<Float>; let dist: Float }
-        var pinches: [Pinch] = []
-        for hand in hands {
-            guard let t = hand.joints[.thumbTip],
-                  let i = hand.joints[.indexTip] else { continue }
-            pinches.append(Pinch(isLeft: hand.isLeft, mid: (t + i) * 0.5,
-                                  dist: simd_length(t - i)))
-        }
-
-        // ── Grab ───────────────────────────────────────────────────────────
-        let prevGrab = grabSide
-        if let side = grabSide {
-            if let p = pinches.first(where: { $0.isLeft == side }), p.dist < Self.grabPinchOff,
-               let parent = panelNode.parent {
-                let pinchLocal = parent.simdConvertPosition(p.mid, from: nil)
-                let target     = pinchLocal + grabOffset
-                grabTarget     = grabTarget * Self.dragSmooth + target * (1 - Self.dragSmooth)
+        // ── Grab (already picked up): follow the same hand's fingertip; hold
+        // still to drop — same "hold still to confirm" language as everywhere
+        // else in the app, just applied to releasing instead of selecting.
+        if grabbed {
+            if let side = grabSide, let hand = hands.first(where: { $0.isLeft == side }),
+               let tip = hand.joints[.indexTip], let parent = panelNode.parent {
+                let parentLocal = parent.simdConvertPosition(tip, from: nil)
+                let target      = parentLocal + grabOffset
+                grabTarget      = grabTarget * Self.dragSmooth + target * (1 - Self.dragSmooth)
                 panelNode.simdPosition = grabTarget
+
+                if let a = grabAnchor, simd_length(tip - a) < Self.grabDropRadius {
+                    if time - grabDwellStart >= Self.grabDropTime {
+                        grabbed = false; grabSide = nil; grabAnchor = nil
+                        dirty = true
+                        pulse()
+                    }
+                } else {
+                    grabAnchor = tip
+                    grabDwellStart = time
+                }
             } else {
-                grabSide = nil
+                grabbed = false; grabSide = nil; grabAnchor = nil
+                dirty = true
             }
+            cursorNode.isHidden = true
+            if dirty || needsRebake { needsRebake = false; dispatchBake() }
+            return nil
         }
-        if grabSide == nil {
-            for p in pinches where p.dist < Self.grabPinchOn {
-                let panelLocal = panelNode.simdConvertPosition(p.mid, from: nil)
-                let inHandle = abs(panelLocal.z) < 0.07
-                            && abs(panelLocal.x) < Self.panW / 2 + 0.02
-                            && panelLocal.y >  Self.panH / 2 - Self.grabHandleM
-                            && panelLocal.y <  Self.panH / 2 + 0.025
-                if inHandle, let parent = panelNode.parent {
-                    let pinchLocal = parent.simdConvertPosition(p.mid, from: nil)
-                    grabSide   = p.isLeft
-                    grabOffset = panelNode.simdPosition - pinchLocal
-                    grabTarget = panelNode.simdPosition
-                    break
-                }
-            }
-        }
-        if (prevGrab == nil) != (grabSide == nil) { dirty = true }
 
-        // ── Cursor + click  (skipped while grabbing) ─────────────────────────
+        // ── Cursor + click ────────────────────────────────────────────────────
         var result: MenuAction? = nil
-        if grabSide == nil {
-            let pinchingSides = Set(pinches.filter { $0.dist < Self.grabPinchOff }.map { $0.isLeft })
 
-            // Pick the index fingertip closest to the panel face, within bounds.
-            var best: (local: SIMD3<Float>, isLeft: Bool)? = nil
-            for hand in hands {
-                if pinchingSides.contains(hand.isLeft) { continue }
-                guard let tip = hand.joints[.indexTip] else { continue }
-                let local = panelNode.simdConvertPosition(tip, from: nil)
-                guard abs(local.x) < Self.panW/2 + Self.xyMargin,
-                      abs(local.y) < Self.panH/2 + Self.xyMargin,
-                      local.z > -0.03, local.z < Self.hoverMaxZ else { continue }
-                if best == nil || abs(local.z) < abs(best!.local.z) {
-                    best = (local, hand.isLeft)
-                }
+        // Pick the index fingertip closest to the panel face, within bounds.
+        var best: (local: SIMD3<Float>, isLeft: Bool)? = nil
+        for hand in hands {
+            guard let tip = hand.joints[.indexTip] else { continue }
+            let local = panelNode.simdConvertPosition(tip, from: nil)
+            guard abs(local.x) < Self.panW/2 + Self.xyMargin,
+                  abs(local.y) < Self.panH/2 + Self.xyMargin,
+                  local.z > -0.03, local.z < Self.hoverMaxZ else { continue }
+            if best == nil || abs(local.z) < abs(best!.local.z) {
+                best = (local, hand.isLeft)
             }
+        }
 
-            if let b = best {
-                let region = regionAt(localX: b.local.x, localY: b.local.y)
+        if let b = best {
+            let region = regionAt(localX: b.local.x, localY: b.local.y)
+            let inHandle = b.local.y > Self.panH/2 - Float(Self.handleH / Self.texH) * Self.panH
 
-                // Reset per-finger state when a different hand takes the cursor.
-                if cursorLeft != b.isLeft {
-                    cursorLeft  = b.isLeft
-                    pokeArmed   = false
-                    dwellRegion = region
-                    dwellStart  = time
-                }
+            if cursorLeft != b.isLeft {
+                cursorLeft  = b.isLeft
+                pokeArmed   = false
+                dwellRegion = region
+                dwellStart  = time
+            }
+            if region != dwellRegion { dwellRegion = region; dwellStart = time }
+            if region != firedRegion { firedRegion = .none }
 
-                // Dwell bookkeeping — restart the timer whenever the target changes.
-                if region != dwellRegion {
-                    dwellRegion = region
-                    dwellStart  = time
-                }
+            if b.local.z > Self.pokeArmZ { pokeArmed = true }
+            let poked = pokeArmed && b.local.z < Self.pokeFireZ
 
-                // Release the latch once the cursor leaves the region it last fired on,
-                // so dwell can fire there again (but won't auto-repeat while held).
-                if region != firedRegion { firedRegion = .none }
+            let dwellProg = Float(simd_clamp((time - dwellStart) / Self.dwellTime, 0, 1))
+            let dwellFire = (time - dwellStart) >= Self.dwellTime && firedRegion != region
 
-                // Poke: arm when the finger is pulled back past the arm distance, then
-                // fire the moment it crosses the (much closer) fire distance. Tracking an
-                // armed flag rather than a single-frame delta lets slower pokes register.
-                // A re-poke needs a fresh pull-back, so it never auto-repeats while held.
-                if b.local.z > Self.pokeArmZ { pokeArmed = true }
-                let poked = pokeArmed && b.local.z < Self.pokeFireZ
-
-                let dwellProg = Float(simd_clamp((time - dwellStart) / Self.dwellTime, 0, 1))
-                let dwellFire = (time - dwellStart) >= Self.dwellTime && firedRegion != region
-
-                if region.actionable, time - lastTap > Self.debounce, poked || dwellFire {
-                    result = fire(region, dirty: &dirty)
+            if inHandle, time - lastTap > Self.debounce, poked {
+                // Pick up the panel instead of a normal button fire.
+                if let parent = panelNode.parent, let hand = hands.first(where: { $0.isLeft == b.isLeft }),
+                   let tip = hand.joints[.indexTip] {
+                    grabbed        = true
+                    grabSide       = b.isLeft
+                    grabOffset     = panelNode.simdPosition - parent.simdConvertPosition(tip, from: nil)
+                    grabTarget     = panelNode.simdPosition
+                    grabAnchor     = tip
+                    grabDwellStart = time
                     lastTap        = time
                     fireFlashUntil = time + 0.18
-                    pokeArmed      = false
-                    firedRegion    = region
-                    dwellRegion    = .none
-                    dwellStart     = time
+                    dirty = true
                     pulse()
                 }
-
-                updateCursor(local: b.local, progress: dwellProg,
-                             actionable: region.actionable, time: time)
-            } else {
-                cursorNode.isHidden = true
-                dwellRegion = .none
-                firedRegion = .none
-                pokeArmed   = false
-                cursorLeft  = nil
+            } else if region.actionable, time - lastTap > Self.debounce, poked || dwellFire {
+                result = fire(region, dirty: &dirty)
+                lastTap        = time
+                fireFlashUntil = time + 0.18
+                pokeArmed      = false
+                firedRegion    = region
+                dwellRegion    = .none
+                dwellStart     = time
+                pulse()
             }
+
+            updateCursor(local: b.local, progress: inHandle ? 0 : dwellProg,
+                         actionable: region.actionable, time: time)
         } else {
             cursorNode.isHidden = true
+            dwellRegion = .none
+            firedRegion = .none
+            pokeArmed   = false
+            cursorLeft  = nil
         }
 
         // Border emission reflects grab state (CGColor — render-safe)
-        let borderEmission: CGColor = grabSide != nil
+        let borderEmission: CGColor = grabbed
             ? UIColor(red: 0.45, green: 1.00, blue: 0.55, alpha: 0.95).cgColor
-            : UIColor(red: 0.35, green: 0.15, blue: 0.70, alpha: 0.55).cgColor
+            : UIColor(red: 0.42, green: 0.20, blue: 0.85, alpha: 0.65).cgColor
         for n in borderNodes { n.geometry?.firstMaterial?.emission.contents = borderEmission }
 
         if dirty || needsRebake { needsRebake = false; dispatchBake() }
@@ -353,17 +340,14 @@ final class ARMenuOverlay {
         let color: CGColor
         if flashing {
             scale = 1.7
-            color = UIColor(red: 0.10, green: 1.0, blue: 0.40, alpha: 1).cgColor
+            color = CGColor(red: 0.10, green: 1.0, blue: 0.40, alpha: 1)
         } else if actionable {
-            // White → green as the dwell ring fills
             scale = 1.0 + progress * 0.7
-            color = CGColor(red: CGFloat(1.0 - progress * 0.9),
-                            green: 1.0,
-                            blue:  CGFloat(1.0 - progress * 0.6),
-                            alpha: 1)
+            color = CGColor(red: CGFloat(1.0 - progress * 0.9), green: 1.0,
+                            blue: CGFloat(1.0 - progress * 0.6), alpha: 1)
         } else {
             scale = 0.7
-            color = UIColor(white: 1, alpha: 0.6).cgColor
+            color = CGColor(red: 1, green: 1, blue: 1, alpha: 0.6)
         }
         cursorNode.scale = SCNVector3(scale, scale, scale)
         cursorMat.emission.contents = color
@@ -378,7 +362,7 @@ final class ARMenuOverlay {
         let px = u * Self.texW
         let py = v * Self.texH
 
-        if py < Self.handleH { return .none }                 // handle = drag only
+        if py < Self.handleH { return .none }                 // handle = grab-pickup only
         if py >= Self.texH - Self.tabBarH {
             return .tab(px < Self.texW / 2)
         }
@@ -394,9 +378,10 @@ final class ARMenuOverlay {
             let topY  = Self.handleH + Self.headerH
             let contH = Self.texH - Self.tabBarH - topY
             let midY  = topY + contH / 2
-            if CGRect(x: 28, y: topY + 12, width: 200, height: 44).contains(CGPoint(x: px, y: py)) { return .debug }
-            if CGRect(x: cx - 150, y: midY - 50, width: 300, height: 88).contains(CGPoint(x: px, y: py)) { return .play }
-            if CGRect(x: cx - 110, y: midY + 56, width: 220, height: 54).contains(CGPoint(x: px, y: py)) { return .restart }
+            if CGRect(x: 28, y: topY + 12, width: 190, height: 44).contains(CGPoint(x: px, y: py)) { return .debug }
+            if CGRect(x: texW - 218, y: topY + 12, width: 190, height: 44).contains(CGPoint(x: px, y: py)) { return .changeMode }
+            if CGRect(x: cx - 150, y: midY - 44, width: 300, height: 88).contains(CGPoint(x: px, y: py)) { return .play }
+            if CGRect(x: cx - 110, y: midY + 62, width: 220, height: 54).contains(CGPoint(x: px, y: py)) { return .restart }
             return .none
         }
     }
@@ -415,9 +400,10 @@ final class ARMenuOverlay {
             activeTab = .controls; dirty = true
             let song: Song? = (i >= 0 && i < availableSongs.count) ? availableSongs[i] : nil
             return .loadAndPlay(song)
-        case .play:    return .playStop
-        case .restart: return .restart
-        case .debug:   return .toggleDebug
+        case .play:       return .playStop
+        case .restart:    return .restart
+        case .debug:      return .toggleDebug
+        case .changeMode: return .changeMode
         }
     }
 
@@ -436,7 +422,7 @@ final class ARMenuOverlay {
     private func dispatchBake() {
         let snap = PanelSnap(tab: activeTab, songs: availableSongs,
                              isPlaying: isPlaying, debugOn: debugOn,
-                             grabbing: grabSide != nil)
+                             grabbing: grabbed)
         let mat  = panelMat!
         DispatchQueue.main.async {
             mat.diffuse.contents = ARMenuOverlay.bake(snap)
@@ -455,9 +441,25 @@ final class ARMenuOverlay {
 
     private static func bake(_ s: PanelSnap) -> UIImage {
         let sz = CGSize(width: texW, height: texH)
-        return UIGraphicsImageRenderer(size: sz).image { _ in
-            UIColor(red: 0.06, green: 0.03, blue: 0.18, alpha: 0.97).setFill()
-            UIBezierPath(roundedRect: CGRect(origin: .zero, size: sz), cornerRadius: 24).fill()
+        return UIGraphicsImageRenderer(size: sz).image { ctx in
+            // Layered background gives a soft depth cue without a real shadow API.
+            let full = CGRect(origin: .zero, size: sz)
+            UIColor(red: 0.03, green: 0.02, blue: 0.09, alpha: 0.97).setFill()
+            UIBezierPath(roundedRect: full, cornerRadius: 28).fill()
+
+            let gradient = CGGradient(
+                colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                colors: [
+                    UIColor(red: 0.10, green: 0.05, blue: 0.22, alpha: 1).cgColor,
+                    UIColor(red: 0.05, green: 0.03, blue: 0.14, alpha: 1).cgColor,
+                ] as CFArray,
+                locations: [0, 1]
+            )!
+            ctx.cgContext.saveGState()
+            UIBezierPath(roundedRect: full, cornerRadius: 28).addClip()
+            ctx.cgContext.drawLinearGradient(gradient, start: .zero,
+                                             end: CGPoint(x: 0, y: texH), options: [])
+            ctx.cgContext.restoreGState()
 
             drawGrabHandle(s)
             drawTabBar(s)
@@ -470,8 +472,8 @@ final class ARMenuOverlay {
 
     private static func drawGrabHandle(_ s: PanelSnap) {
         let bg: UIColor = s.grabbing
-            ? UIColor(red: 0.18, green: 0.50, blue: 0.22, alpha: 0.95)
-            : UIColor(red: 0.10, green: 0.05, blue: 0.26, alpha: 0.92)
+            ? UIColor(red: 0.16, green: 0.46, blue: 0.22, alpha: 0.95)
+            : UIColor(red: 0.13, green: 0.07, blue: 0.30, alpha: 0.92)
         bg.setFill()
         UIBezierPath(rect: CGRect(x: 0, y: 0, width: texW, height: handleH)).fill()
 
@@ -484,49 +486,61 @@ final class ARMenuOverlay {
             UIBezierPath(ovalIn: CGRect(x: x - r, y: cy - r, width: r*2, height: r*2)).fill()
         }
 
-        let title = s.grabbing ? "MOVING…" : "PIANO"
+        let title = s.grabbing ? "MOVING…" : "PIANOAR"
         let attrs: [NSAttributedString.Key: Any] = [
             .font: UIFont.systemFont(ofSize: 18, weight: .black),
-            .foregroundColor: UIColor(white: 1, alpha: s.grabbing ? 0.95 : 0.55),
-            .kern: 3.0 as NSObject,
+            .foregroundColor: UIColor(white: 1, alpha: s.grabbing ? 0.95 : 0.60),
+            .kern: 3.2 as NSObject,
         ]
-        let sz = title.size(withAttributes: attrs)
-        title.draw(at: CGPoint(x: 22, y: (handleH - sz.height) / 2), withAttributes: attrs)
+        let tsz = title.size(withAttributes: attrs)
+        title.draw(at: CGPoint(x: 24, y: (handleH - tsz.height) / 2), withAttributes: attrs)
 
-        UIColor(white: 1, alpha: 0.13).setFill()
+        UIColor(white: 1, alpha: 0.14).setFill()
         UIBezierPath(rect: CGRect(x: 0, y: handleH - 1, width: texW, height: 1)).fill()
     }
 
     private static func drawTabBar(_ s: PanelSnap) {
         let y = texH - tabBarH
         let activeX: CGFloat = s.tab == .library ? 0 : texW / 2
-        UIColor(red: 0.30, green: 0.12, blue: 0.62, alpha: 0.80).setFill()
-        UIBezierPath(rect: CGRect(x: activeX, y: y, width: texW/2, height: tabBarH)).fill()
 
-        UIColor(white: 1, alpha: 0.15).setFill()
+        UIColor(white: 1, alpha: 0.04).setFill()
+        UIBezierPath(rect: CGRect(x: 0, y: y, width: texW, height: tabBarH)).fill()
+
+        let gradient = CGGradient(
+            colorsSpace: CGColorSpaceCreateDeviceRGB(),
+            colors: [
+                UIColor(red: 0.42, green: 0.18, blue: 0.90, alpha: 0.85).cgColor,
+                UIColor(red: 0.28, green: 0.10, blue: 0.68, alpha: 0.85).cgColor,
+            ] as CFArray, locations: [0, 1])!
+        UIGraphicsGetCurrentContext()?.saveGState()
+        UIBezierPath(rect: CGRect(x: activeX, y: y, width: texW/2, height: tabBarH)).addClip()
+        UIGraphicsGetCurrentContext()?.drawLinearGradient(
+            gradient, start: CGPoint(x: 0, y: y), end: CGPoint(x: 0, y: y + tabBarH), options: [])
+        UIGraphicsGetCurrentContext()?.restoreGState()
+
+        UIColor(white: 1, alpha: 0.16).setFill()
         UIBezierPath(rect: CGRect(x: 0, y: y, width: texW, height: 1)).fill()
         UIColor(white: 1, alpha: 0.10).setFill()
-        UIBezierPath(rect: CGRect(x: texW/2 - 0.5, y: y + 12, width: 1, height: tabBarH - 24)).fill()
+        UIBezierPath(rect: CGRect(x: texW/2 - 0.5, y: y + 14, width: 1, height: tabBarH - 28)).fill()
 
-        let f = UIFont.systemFont(ofSize: 22, weight: .bold)
+        let f = UIFont.systemFont(ofSize: 21, weight: .bold)
         centered("LIBRARY",  in: CGRect(x: 0,      y: y, width: texW/2, height: tabBarH),
-                 font: f, color: s.tab == .library  ? .white : UIColor(white:1,alpha:0.38))
+                 font: f, color: s.tab == .library  ? .white : UIColor(white:1,alpha:0.40))
         centered("CONTROLS", in: CGRect(x: texW/2, y: y, width: texW/2, height: tabBarH),
-                 font: f, color: s.tab == .controls ? .white : UIColor(white:1,alpha:0.38))
+                 font: f, color: s.tab == .controls ? .white : UIColor(white:1,alpha:0.40))
     }
 
     private static func drawLibrary(_ s: PanelSnap) {
         centered("LIBRARY", in: CGRect(x: 0, y: handleH, width: texW, height: headerH),
-                 font: .systemFont(ofSize: 24, weight: .black),
-                 color: UIColor(white: 1, alpha: 0.55))
+                 font: .systemFont(ofSize: 23, weight: .black),
+                 color: UIColor(white: 1, alpha: 0.60))
 
-        // Per-card accent colours, cycled so the grid reads as distinct tiles.
         let accents: [UIColor] = [
-            UIColor(red: 0.22, green: 0.55, blue: 1.00, alpha: 1),
-            UIColor(red: 0.70, green: 0.35, blue: 1.00, alpha: 1),
-            UIColor(red: 0.20, green: 0.78, blue: 0.62, alpha: 1),
-            UIColor(red: 0.98, green: 0.55, blue: 0.25, alpha: 1),
-            UIColor(red: 0.95, green: 0.35, blue: 0.55, alpha: 1),
+            UIColor(red: 0.30, green: 0.62, blue: 1.00, alpha: 1),
+            UIColor(red: 0.75, green: 0.42, blue: 1.00, alpha: 1),
+            UIColor(red: 0.24, green: 0.82, blue: 0.68, alpha: 1),
+            UIColor(red: 1.00, green: 0.60, blue: 0.28, alpha: 1),
+            UIColor(red: 1.00, green: 0.40, blue: 0.60, alpha: 1),
         ]
 
         let count = min(s.songs.count, libMaxVisible())
@@ -534,21 +548,22 @@ final class ARMenuOverlay {
             let rect   = libCellRect(i)
             let accent = accents[i % accents.count]
 
-            // Card background
-            UIColor(red: 0.10, green: 0.06, blue: 0.26, alpha: 0.95).setFill()
-            UIBezierPath(roundedRect: rect, cornerRadius: 14).fill()
-            accent.withAlphaComponent(0.45).setStroke()
-            let border = UIBezierPath(roundedRect: rect.insetBy(dx: 0.75, dy: 0.75), cornerRadius: 14)
+            UIColor(red: 0.11, green: 0.07, blue: 0.24, alpha: 0.95).setFill()
+            UIBezierPath(roundedRect: rect, cornerRadius: 15).fill()
+            accent.withAlphaComponent(0.55).setStroke()
+            let border = UIBezierPath(roundedRect: rect.insetBy(dx: 0.75, dy: 0.75), cornerRadius: 15)
             border.lineWidth = 1.5
             border.stroke()
+            // Subtle inner highlight along the top edge, cheap fake-glass touch.
+            UIColor(white: 1, alpha: 0.06).setFill()
+            UIBezierPath(roundedRect: CGRect(x: rect.minX, y: rect.minY, width: rect.width, height: rect.height * 0.4),
+                        cornerRadius: 15).fill()
 
-            // Note-icon chip on the left
             let chip = CGRect(x: rect.minX + 10, y: rect.midY - 18, width: 36, height: 36)
-            accent.withAlphaComponent(0.85).setFill()
-            UIBezierPath(roundedRect: chip, cornerRadius: 9).fill()
+            accent.setFill()
+            UIBezierPath(roundedRect: chip, cornerRadius: 10).fill()
             centered("♪", in: chip, font: .systemFont(ofSize: 20, weight: .bold), color: .white)
 
-            // Title (single line, truncated to fit)
             let title = s.songs[i].title ?? "Untitled"
             let textRect = CGRect(x: chip.maxX + 10, y: rect.minY,
                                   width: rect.maxX - chip.maxX - 18, height: rect.height)
@@ -564,47 +579,55 @@ final class ARMenuOverlay {
         let midY  = topY + contH / 2
 
         centered("CONTROLS", in: CGRect(x: 0, y: handleH, width: texW, height: headerH),
-                 font: .systemFont(ofSize: 24, weight: .black),
-                 color: UIColor(white: 1, alpha: 0.55))
+                 font: .systemFont(ofSize: 23, weight: .black),
+                 color: UIColor(white: 1, alpha: 0.60))
 
+        // Debug (left) / Change Mode (right) — a matched pair of pill buttons
         let dbgBg = s.debugOn
             ? UIColor(red: 0.10, green: 0.48, blue: 0.18, alpha: 0.85)
             : UIColor(white: 1, alpha: 0.09)
         dbgBg.setFill()
-        let dbgRect = CGRect(x: 28, y: topY + 12, width: 200, height: 44)
-        UIBezierPath(roundedRect: dbgRect, cornerRadius: 11).fill()
-        centered(s.debugOn ? "⚙  DEBUG ON" : "⚙  DEBUG",
+        let dbgRect = CGRect(x: 28, y: topY + 12, width: 190, height: 44)
+        UIBezierPath(roundedRect: dbgRect, cornerRadius: 13).fill()
+        centered(s.debugOn ? "⚙ DEBUG ON" : "⚙ DEBUG",
                  in: dbgRect,
-                 font: .systemFont(ofSize: 18, weight: .semibold),
+                 font: .systemFont(ofSize: 17, weight: .semibold),
                  color: s.debugOn ? UIColor(red: 0.55, green: 1.00, blue: 0.65, alpha: 1)
-                                  : UIColor(white: 1, alpha: 0.55))
+                                  : UIColor(white: 1, alpha: 0.60))
+
+        UIColor(white: 1, alpha: 0.09).setFill()
+        let modeRect = CGRect(x: texW - 218, y: topY + 12, width: 190, height: 44)
+        UIBezierPath(roundedRect: modeRect, cornerRadius: 13).fill()
+        centered("⇄ MODE", in: modeRect,
+                 font: .systemFont(ofSize: 17, weight: .semibold),
+                 color: UIColor(white: 1, alpha: 0.60))
 
         centered(s.isPlaying ? "● PLAYING" : "— READY —",
-                 in: CGRect(x: 0, y: topY + 72, width: texW, height: 40),
-                 font: .systemFont(ofSize: 22, weight: .black),
+                 in: CGRect(x: 0, y: topY + 72, width: texW, height: 38),
+                 font: .systemFont(ofSize: 21, weight: .black),
                  color: s.isPlaying
                     ? UIColor(red: 0.45, green: 1.00, blue: 0.55, alpha: 1)
-                    : UIColor(white: 1, alpha: 0.40))
+                    : UIColor(white: 1, alpha: 0.42))
 
         let playBg: UIColor = s.isPlaying
-            ? UIColor(red: 0.80, green: 0.10, blue: 0.10, alpha: 0.94)
-            : UIColor(red: 0.13, green: 0.46, blue: 0.96, alpha: 0.94)
+            ? UIColor(red: 0.82, green: 0.12, blue: 0.12, alpha: 0.95)
+            : UIColor(red: 0.16, green: 0.50, blue: 0.98, alpha: 0.95)
         playBg.setFill()
-        let playRect = CGRect(x: cx - 150, y: midY - 50, width: 300, height: 88)
-        UIBezierPath(roundedRect: playRect, cornerRadius: 22).fill()
-        UIColor(white: 1, alpha: 0.22).setStroke()
-        let pb = UIBezierPath(roundedRect: playRect.insetBy(dx: 1, dy: 1), cornerRadius: 22)
+        let playRect = CGRect(x: cx - 150, y: midY - 44, width: 300, height: 88)
+        UIBezierPath(roundedRect: playRect, cornerRadius: 24).fill()
+        UIColor(white: 1, alpha: 0.24).setStroke()
+        let pb = UIBezierPath(roundedRect: playRect.insetBy(dx: 1, dy: 1), cornerRadius: 24)
         pb.lineWidth = 1.5
         pb.stroke()
         centered(s.isPlaying ? "■   STOP" : "▶   PLAY",
-                 in: playRect, font: .systemFont(ofSize: 38, weight: .black), color: .white)
+                 in: playRect, font: .systemFont(ofSize: 36, weight: .black), color: .white)
 
         UIColor(white: 1, alpha: 0.11).setFill()
-        let rstRect = CGRect(x: cx - 110, y: midY + 56, width: 220, height: 54)
-        UIBezierPath(roundedRect: rstRect, cornerRadius: 14).fill()
+        let rstRect = CGRect(x: cx - 110, y: midY + 62, width: 220, height: 54)
+        UIBezierPath(roundedRect: rstRect, cornerRadius: 15).fill()
         centered("↺   RESTART", in: rstRect,
-                 font: .systemFont(ofSize: 22, weight: .bold),
-                 color: UIColor(white: 1, alpha: 0.78))
+                 font: .systemFont(ofSize: 21, weight: .bold),
+                 color: UIColor(white: 1, alpha: 0.80))
     }
 
     private static func centered(_ text: String, in rect: CGRect,
