@@ -10,7 +10,7 @@ struct CalibrationData {
 
 enum CalibrationState: Equatable {
     case idle
-    case collecting(count: Int)  // 0–3 corners tapped
+    case collecting(count: Int)  // 0–3 corners confirmed
     case done
 
     static func == (lhs: CalibrationState, rhs: CalibrationState) -> Bool {
@@ -20,6 +20,11 @@ enum CalibrationState: Equatable {
         case (.done, .done): return true
         default: return false
         }
+    }
+
+    var isCollecting: Bool {
+        if case .collecting = self { return true }
+        return false
     }
 }
 
@@ -40,26 +45,23 @@ final class CalibrationManager: ObservableObject {
         state = .collecting(count: 0)
     }
 
-    // Called on the main thread from the tap gesture.
-    func handleTap(at screenPoint: CGPoint) {
-        guard case .collecting(let count) = state, count < 4,
-              let sv = sceneView else { return }
+    /// Call every render frame while `state.isCollecting`. `point` is the
+    /// pointing hand's fingertip world position (from
+    /// `GestureDetector.pointAndConfirm`) — already a real 3D position via
+    /// LiDAR, so no raycast is needed. `confirmed` is true on the single frame
+    /// the other hand's pinch fires, which locks in that corner. The phone is
+    /// inside a headset shell during normal use, so a screen tap was never
+    /// reachable here — this two-hand point/confirm gesture replaces it.
+    @discardableResult
+    func updateHandCalibration(point: SIMD3<Float>?, confirmed: Bool) -> Bool {
+        guard case .collecting(let count) = state, count < 4, confirmed,
+              let p = point, let sv = sceneView else { return false }
 
-        guard let query = sv.raycastQuery(
-                from: screenPoint,
-                allowing: .estimatedPlane,
-                alignment: .horizontal),
-              let hit = sv.session.raycast(query).first
-        else { return }
+        var t = matrix_identity_float4x4
+        t.columns.3 = SIMD4<Float>(p.x, p.y, p.z, 1)
 
-        let pos = SIMD3<Float>(
-            hit.worldTransform.columns.3.x,
-            hit.worldTransform.columns.3.y,
-            hit.worldTransform.columns.3.z
-        )
-        corners.append(pos)
-
-        let markerAnchor = ARAnchor(name: "corner_\(count)", transform: hit.worldTransform)
+        corners.append(p)
+        let markerAnchor = ARAnchor(name: "corner_\(count)", transform: t)
         sv.session.add(anchor: markerAnchor)
         cornerAnchorIDs.append(markerAnchor.identifier)
 
@@ -71,10 +73,11 @@ final class CalibrationManager: ObservableObject {
                                         transform: data.anchorTransform)
                 sv.session.add(anchor: kbAnchor)
             }
-            state = .done
+            DispatchQueue.main.async { self.state = .done }
         } else {
-            state = .collecting(count: next)
+            DispatchQueue.main.async { self.state = .collecting(count: next) }
         }
+        return true
     }
 
     func reset() {

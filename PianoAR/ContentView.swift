@@ -2,9 +2,12 @@ import SwiftUI
 
 enum AppMode { case virtualPiano, realPiano }
 
-/// Minimal SwiftUI shell. The AR scene carries all in-session UI; the only
-/// 2-D SwiftUI surfaces are the launch mode-select screen and a small setup
-/// hint shown while placing the keyboard or tapping calibration corners.
+/// Minimal SwiftUI shell. Every interactive surface — mode selection, keyboard
+/// placement, real-piano calibration, the song library, playback controls — is
+/// hand-driven and rendered in AR (see LaunchSelectOverlay / ARMenuOverlay /
+/// GestureDetector.pointAndConfirm). The phone is inside a headset shell during
+/// normal use, so the touchscreen was never reachable; the only 2-D SwiftUI
+/// surface left is a small always-safe setup hint at the bottom.
 struct ContentView: View {
     @StateObject private var session       = ARSessionModel()
     @StateObject private var placement     = PlacementManager()
@@ -19,9 +22,9 @@ struct ContentView: View {
     @State private var showDebug      = false
     @State private var importedSongs: [Song] = []
 
-    // Launch / mode selection
-    @State private var showModeSelect = true
-    @State private var everSelected   = false
+    // The AR launch picker is active until a mode is chosen; re-openable later
+    // via the top-left chip.
+    @State private var modeSelectionActive = true
 
     private var allSongs: [Song] { BuiltInSongs.all + importedSongs }
 
@@ -32,14 +35,15 @@ struct ContentView: View {
                 calibration: calibration, handTracker: handTracker,
                 songPlayer: songPlayer, pressDetector: pressDetector,
                 audioDetector: audioDetector, keyTuning: keyTuning,
-                onTap: handleTap, onMenuAction: handleMenuAction,
+                onMenuAction: handleMenuAction,
                 showDebug: showDebug,
-                availableSongs: allSongs
+                availableSongs: allSongs,
+                modeSelectionActive: modeSelectionActive,
+                onModeSelected: selectMode
             )
             .ignoresSafeArea()
 
-            // Setup hint (placement / calibration) — hidden during mode select
-            if !showModeSelect {
+            if !modeSelectionActive {
                 VStack {
                     HStack {
                         modeButton
@@ -52,17 +56,6 @@ struct ContentView: View {
                 .padding(.top, 16)
                 .padding(.horizontal, 16)
                 .transition(.opacity)
-            }
-
-            // Launch / mode-select screen
-            if showModeSelect {
-                ModeSelectView(
-                    canCancel: everSelected,
-                    onSelect: { selectMode($0) },
-                    onCancel: { withAnimation(.easeOut(duration: 0.28)) { showModeSelect = false } }
-                )
-                .transition(.opacity)
-                .zIndex(10)
             }
         }
         .background(Color.black)
@@ -77,8 +70,7 @@ struct ContentView: View {
 
     private func selectMode(_ newMode: AppMode) {
         switchMode(to: newMode)
-        everSelected = true
-        withAnimation(.easeOut(duration: 0.30)) { showModeSelect = false }
+        withAnimation(.easeOut(duration: 0.25)) { modeSelectionActive = false }
     }
 
     /// Tears down any existing keyboard placement and (re)initialises the chosen
@@ -94,7 +86,7 @@ struct ContentView: View {
 
     private var modeButton: some View {
         Button {
-            withAnimation(.easeOut(duration: 0.28)) { showModeSelect = true }
+            withAnimation(.easeOut(duration: 0.22)) { modeSelectionActive = true }
         } label: {
             HStack(spacing: 6) {
                 Image(systemName: mode == .virtualPiano ? "rectangle.on.rectangle" : "pianokeys")
@@ -117,9 +109,12 @@ struct ContentView: View {
         switch mode {
         case .virtualPiano:
             switch placement.state {
-            case .scanning:     pill("Looking for a flat surface…")
-            case .readyToPlace: pill("Tap a flat surface to place the keyboard")
-            case .placed:       EmptyView()
+            case .scanning:
+                pill("Looking for a flat surface…")
+            case .readyToPlace:
+                pill("Point at the table, pinch your other hand to place")
+            case .placed:
+                EmptyView()
             }
         case .realPiano:
             switch calibration.state {
@@ -127,10 +122,10 @@ struct ContentView: View {
                 actionPill("Start calibration", "viewfinder") { calibration.startCalibration() }
             case .collecting(let n):
                 let labels = [
-                    "Tap corner 1/4 — near-left",
-                    "Tap corner 2/4 — near-right",
-                    "Tap corner 3/4 — far-right",
-                    "Tap corner 4/4 — far-left",
+                    "Point at corner 1/4 (near-left) — pinch other hand to confirm",
+                    "Point at corner 2/4 (near-right) — pinch other hand to confirm",
+                    "Point at corner 3/4 (far-right) — pinch other hand to confirm",
+                    "Point at corner 4/4 (far-left) — pinch other hand to confirm",
                 ]
                 pill(labels[min(n, 3)])
             case .done:
@@ -147,6 +142,7 @@ struct ContentView: View {
             .background(.black.opacity(0.72))
             .cornerRadius(14)
             .overlay(RoundedRectangle(cornerRadius: 14).stroke(.white.opacity(0.10), lineWidth: 1))
+            .multilineTextAlignment(.center)
             .transition(.move(edge: .bottom).combined(with: .opacity))
     }
 
@@ -162,15 +158,7 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Routing
-
-    private func handleTap(at point: CGPoint) {
-        guard !showModeSelect else { return }
-        switch mode {
-        case .virtualPiano: placement.handleTap(at: point)
-        case .realPiano:    calibration.handleTap(at: point)
-        }
-    }
+    // MARK: - AR menu routing
 
     private func handleMenuAction(_ action: MenuAction) {
         switch action {
@@ -184,130 +172,5 @@ struct ContentView: View {
         case .toggleDebug:
             showDebug.toggle()
         }
-    }
-}
-
-// MARK: - Mode-select launch screen
-
-private struct ModeSelectView: View {
-    let canCancel: Bool
-    let onSelect: (AppMode) -> Void
-    let onCancel: () -> Void
-
-    @State private var appeared = false
-
-    var body: some View {
-        ZStack {
-            // Dim + gradient backdrop over the live camera feed
-            LinearGradient(
-                colors: [.black.opacity(0.92), Color(red: 0.05, green: 0.03, blue: 0.16).opacity(0.92)],
-                startPoint: .top, endPoint: .bottom
-            )
-            .ignoresSafeArea()
-
-            VStack(spacing: 0) {
-                Spacer()
-
-                // Title
-                VStack(spacing: 8) {
-                    Image(systemName: "pianokeys.inverse")
-                        .font(.system(size: 44, weight: .regular))
-                        .foregroundStyle(.white)
-                    Text("PianoAR")
-                        .font(.system(size: 34, weight: .black, design: .rounded))
-                        .foregroundStyle(.white)
-                    Text("Choose how you want to play")
-                        .font(.system(size: 15, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.55))
-                }
-                .opacity(appeared ? 1 : 0)
-                .offset(y: appeared ? 0 : -16)
-
-                Spacer().frame(height: 44)
-
-                // Mode cards
-                HStack(spacing: 18) {
-                    card(
-                        mode: .virtualPiano,
-                        icon: "rectangle.on.rectangle.angled",
-                        title: "Virtual Piano",
-                        blurb: "Place a full 88-key keyboard on a desk or table. No real piano needed.",
-                        tint: Color(red: 0.20, green: 0.55, blue: 1.0),
-                        delay: 0.05
-                    )
-                    card(
-                        mode: .realPiano,
-                        icon: "pianokeys",
-                        title: "Real Piano",
-                        blurb: "Tap the 4 corners of your real keyboard to overlay the note guide on it.",
-                        tint: Color(red: 0.70, green: 0.35, blue: 1.0),
-                        delay: 0.13
-                    )
-                }
-                .padding(.horizontal, 28)
-
-                Spacer()
-
-                if canCancel {
-                    Button(action: onCancel) {
-                        Text("Cancel")
-                            .font(.system(size: 15, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.6))
-                            .padding(.vertical, 10).padding(.horizontal, 28)
-                    }
-                    .opacity(appeared ? 1 : 0)
-                    .padding(.bottom, 18)
-                }
-            }
-        }
-        .onAppear {
-            withAnimation(.spring(response: 0.55, dampingFraction: 0.8)) { appeared = true }
-        }
-    }
-
-    private func card(mode: AppMode, icon: String, title: String, blurb: String,
-                      tint: Color, delay: Double) -> some View {
-        Button { onSelect(mode) } label: {
-            VStack(spacing: 14) {
-                ZStack {
-                    Circle()
-                        .fill(tint.opacity(0.20))
-                        .frame(width: 84, height: 84)
-                    Image(systemName: icon)
-                        .font(.system(size: 36, weight: .medium))
-                        .foregroundStyle(tint)
-                }
-                Text(title)
-                    .font(.system(size: 19, weight: .bold))
-                    .foregroundStyle(.white)
-                Text(blurb)
-                    .font(.system(size: 12.5, weight: .regular))
-                    .foregroundStyle(.white.opacity(0.6))
-                    .multilineTextAlignment(.center)
-                    .lineLimit(4)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 26).padding(.horizontal, 16)
-            .background(
-                RoundedRectangle(cornerRadius: 22)
-                    .fill(.white.opacity(0.06))
-                    .overlay(RoundedRectangle(cornerRadius: 22)
-                        .stroke(tint.opacity(0.45), lineWidth: 1.5))
-            )
-        }
-        .buttonStyle(PressableCardStyle())
-        .opacity(appeared ? 1 : 0)
-        .offset(y: appeared ? 0 : 26)
-        .animation(.spring(response: 0.5, dampingFraction: 0.78).delay(delay), value: appeared)
-    }
-}
-
-/// Scales a card down briefly while pressed for a tactile feel.
-private struct PressableCardStyle: ButtonStyle {
-    func makeBody(configuration: Configuration) -> some View {
-        configuration.label
-            .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
-            .animation(.spring(response: 0.3, dampingFraction: 0.6), value: configuration.isPressed)
     }
 }

@@ -12,17 +12,17 @@ struct ARPassthroughView: UIViewRepresentable {
     let pressDetector: PressDetector
     let audioDetector: AudioPitchDetector
     let keyTuning:     KeyTuning
-    let onTap:         (CGPoint) -> Void
-    var onMenuAction:   ((MenuAction) -> Void)?
-    var showDebug:      Bool   = false
-    var availableSongs: [Song] = []
+    var onMenuAction:          ((MenuAction) -> Void)?
+    var showDebug:             Bool   = false
+    var availableSongs:        [Song] = []
+    var modeSelectionActive:   Bool   = false
+    var onModeSelected:        ((AppMode) -> Void)?
 
     func makeCoordinator() -> Coordinator {
         Coordinator(placement: placement, calibration: calibration,
                     handTracker: handTracker, songPlayer: songPlayer,
                     pressDetector: pressDetector, audioDetector: audioDetector,
                     keyTuning: keyTuning,
-                    onTap: onTap,
                     onMenuAction: onMenuAction)
     }
 
@@ -38,10 +38,6 @@ struct ARPassthroughView: UIViewRepresentable {
 
         placement.sceneView   = view
         calibration.sceneView = view
-
-        let tap = UITapGestureRecognizer(target: context.coordinator,
-                                         action: #selector(Coordinator.handleTap(_:)))
-        view.addGestureRecognizer(tap)
         return view
     }
 
@@ -56,14 +52,15 @@ struct ARPassthroughView: UIViewRepresentable {
         if let io = uiView.window?.windowScene?.interfaceOrientation {
             handTracker.imageOrientation = (io == .landscapeLeft) ? .down : .up
         }
-        context.coordinator.onTap         = onTap
-        context.coordinator.onMenuAction  = onMenuAction
-        context.coordinator.showDebug      = showDebug
-        context.coordinator.availableSongs = availableSongs
-        context.coordinator.songPlayer    = songPlayer
-        context.coordinator.pressDetector = pressDetector
-        context.coordinator.audioDetector = audioDetector
-        context.coordinator.keyTuning     = keyTuning
+        context.coordinator.onMenuAction        = onMenuAction
+        context.coordinator.showDebug           = showDebug
+        context.coordinator.availableSongs      = availableSongs
+        context.coordinator.modeSelectionActive = modeSelectionActive
+        context.coordinator.onModeSelected      = onModeSelected
+        context.coordinator.songPlayer          = songPlayer
+        context.coordinator.pressDetector       = pressDetector
+        context.coordinator.audioDetector       = audioDetector
+        context.coordinator.keyTuning           = keyTuning
     }
 
     // MARK: - Coordinator
@@ -76,14 +73,17 @@ struct ARPassthroughView: UIViewRepresentable {
         var pressDetector: PressDetector
         var audioDetector: AudioPitchDetector
         var keyTuning:     KeyTuning
-        var onTap:          (CGPoint) -> Void
-        var onMenuAction:   ((MenuAction) -> Void)?
-        var showDebug:      Bool   = false
-        var availableSongs: [Song] = []
+        var onMenuAction:          ((MenuAction) -> Void)?
+        var showDebug:             Bool   = false
+        var availableSongs:        [Song] = []
+        var modeSelectionActive:   Bool   = false
+        var onModeSelected:        ((AppMode) -> Void)?
 
         private var hand3D:      Hand3DOverlay?
         private var highway:     NoteHighway?
         private var menuOverlay: ARMenuOverlay?
+        private var launchSelect: LaunchSelectOverlay?
+        private var reticle:      HandPointReticle?
         private let gestureDetector = GestureDetector()
         private weak var keyboardNode: SCNNode?
 
@@ -91,7 +91,6 @@ struct ARPassthroughView: UIViewRepresentable {
              handTracker: HandTracker, songPlayer: SongPlayer,
              pressDetector: PressDetector, audioDetector: AudioPitchDetector,
              keyTuning: KeyTuning,
-             onTap: @escaping (CGPoint) -> Void,
              onMenuAction: ((MenuAction) -> Void)? = nil) {
             self.placement     = placement
             self.calibration   = calibration
@@ -100,13 +99,7 @@ struct ARPassthroughView: UIViewRepresentable {
             self.pressDetector = pressDetector
             self.audioDetector = audioDetector
             self.keyTuning     = keyTuning
-            self.onTap         = onTap
             self.onMenuAction  = onMenuAction
-        }
-
-        @objc func handleTap(_ g: UITapGestureRecognizer) {
-            guard let v = g.view as? ARSCNView else { return }
-            onTap(g.location(in: v))
         }
 
         func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
@@ -119,10 +112,50 @@ struct ARPassthroughView: UIViewRepresentable {
 
             handTracker.maybeProcess(frame)
             let hands = handTracker.snapshot()
+
+            // ── Mode-select gate ─────────────────────────────────────────────
+            // While choosing Virtual/Real, show only the tracked hand + the
+            // camera-locked picker panel. Nothing else runs until a mode is chosen.
+            if modeSelectionActive {
+                hand3D?.update(hands: hands, menu: nil, keyboardNode: nil)
+                if launchSelect == nil, let cam = sceneView.pointOfView {
+                    launchSelect = LaunchSelectOverlay(cameraNode: cam)
+                }
+                if let ls = launchSelect, let chosen = ls.update(hands: hands, time: time) {
+                    let cb = onModeSelected
+                    DispatchQueue.main.async { cb?(chosen) }
+                }
+                reticle?.update(point: nil)
+                return
+            } else if let ls = launchSelect {
+                ls.remove()
+                launchSelect = nil
+            }
+
             let audio = audioDetector.snapshot()
             let expectedKeyIndices = songPlayer.expectedKeyIndicesNow()
             // Hand model renders above UI (renderingOrder 300 > buttons 200)
             hand3D?.update(hands: hands, menu: menuOverlay, keyboardNode: keyboardNode)
+
+            // ── Hand-driven placement / calibration ───────────────────────────
+            // No screen access once the phone is in the headset shell: point at
+            // the target with one hand, pinch the other hand to confirm.
+            if placement.state == .readyToPlace || calibration.state.isCollecting {
+                if reticle == nil { reticle = HandPointReticle(scene: sceneView.scene) }
+                let pac = gestureDetector.pointAndConfirm(hands: hands, time: time)
+                if pac.confirmed { reticle?.pulse() }
+
+                if placement.state == .readyToPlace {
+                    let preview = placement.updateHandPlacement(
+                        pointTip: pac.point, confirmed: pac.confirmed, frame: frame)
+                    reticle?.update(point: preview)
+                } else {
+                    calibration.updateHandCalibration(point: pac.point, confirmed: pac.confirmed)
+                    reticle?.update(point: pac.point)
+                }
+            } else {
+                reticle?.update(point: nil)
+            }
 
             // AR menu: direct fingertip touch — no pinch required
             if let kb = keyboardNode, let menu = menuOverlay {
@@ -226,6 +259,48 @@ struct ARPassthroughView: UIViewRepresentable {
             g.width = CGFloat(a.planeExtent.width); g.height = CGFloat(a.planeExtent.height)
             c.simdPosition = a.center
         }
+    }
+}
+
+// MARK: - Hand-point reticle
+//
+// Small floating marker shown at the "pointing" fingertip during hand-driven
+// placement/calibration, so the user can see exactly where a pinch-confirm
+// (from the other hand) will place a point. Pulses on confirm for feedback.
+
+private final class HandPointReticle {
+    private let node: SCNNode
+    private let mat:  SCNMaterial
+
+    init(scene: SCNScene) {
+        let geo = SCNSphere(radius: 0.009)
+        geo.segmentCount = 14
+        mat = SCNMaterial()
+        mat.lightingModel        = .constant
+        mat.diffuse.contents     = UIColor(red: 0.30, green: 0.85, blue: 1.00, alpha: 1)
+        mat.emission.contents    = CGColor(red: 0.30, green: 0.85, blue: 1.00, alpha: 1)
+        mat.blendMode            = .alpha
+        mat.writesToDepthBuffer  = false
+        mat.readsFromDepthBuffer = false
+        geo.materials = [mat]
+
+        node = SCNNode(geometry: geo)
+        node.renderingOrder = 260
+        node.isHidden        = true
+        scene.rootNode.addChildNode(node)
+    }
+
+    func update(point: SIMD3<Float>?) {
+        guard let p = point else { node.isHidden = true; return }
+        node.isHidden       = false
+        node.simdPosition   = p
+    }
+
+    func pulse() {
+        node.removeAction(forKey: "pulse")
+        let up = SCNAction.scale(to: 2.2, duration: 0.10); up.timingMode = .easeOut
+        let dn = SCNAction.scale(to: 1.0, duration: 0.16); dn.timingMode = .easeIn
+        node.runAction(SCNAction.sequence([up, dn]), forKey: "pulse")
     }
 }
 
