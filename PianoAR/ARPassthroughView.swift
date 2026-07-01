@@ -388,7 +388,7 @@ private final class HintBarOverlay {
         if node.opacity < 0.95 { node.runAction(SCNAction.fadeIn(duration: 0.25)) }
         guard text != lastText else { return }
         lastText = text
-        let m = mat!
+        let m = mat
         DispatchQueue.main.async { m.diffuse.contents = HintBarOverlay.bake(text) }
     }
 

@@ -379,7 +379,7 @@ final class ARMenuOverlay {
             let contH = Self.texH - Self.tabBarH - topY
             let midY  = topY + contH / 2
             if CGRect(x: 28, y: topY + 12, width: 190, height: 44).contains(CGPoint(x: px, y: py)) { return .debug }
-            if CGRect(x: texW - 218, y: topY + 12, width: 190, height: 44).contains(CGPoint(x: px, y: py)) { return .changeMode }
+            if CGRect(x: Self.texW - 218, y: topY + 12, width: 190, height: 44).contains(CGPoint(x: px, y: py)) { return .changeMode }
             if CGRect(x: cx - 150, y: midY - 44, width: 300, height: 88).contains(CGPoint(x: px, y: py)) { return .play }
             if CGRect(x: cx - 110, y: midY + 62, width: 220, height: 54).contains(CGPoint(x: px, y: py)) { return .restart }
             return .none
