@@ -5,22 +5,22 @@ import simd
 
 enum MenuAction { case playStop, restart, loadAndPlay(Song?), toggleDebug, recalibrate }
 
-/// Large floating "tablet" AR panel — PianoVision / Quest-3 style.
+/// Large floating "tablet" AR panel — Quest-3 interaction model.
 ///
-/// Interaction, all single-hand, no pinch:
-///
-///   1. **Cursor** — the index fingertip is projected straight onto the panel
-///      plane (panel-local X/Y), and a glowing dot is drawn there. Targeting
-///      relies on X/Y (which Vision gives reliably), never on the finger
-///      reaching an exact depth in mid-air.
-///   2. **Click** — either **poke** (push the finger through: a clean depth
-///      crossing fires instantly) or **dwell** (hold the cursor still on a
-///      control for ~0.45s: a ring fills and fires). Poke is the fast path;
-///      dwell is the guaranteed fallback when depth is noisy.
-///   3. **Grab** — pinch (thumb + index together) on the top handle strip to
-///      hold the panel; it follows the pinch while held and drops the moment
-///      you open your fingers. Wide on/off hysteresis rides through the
-///      landmark noise that made an earlier pinch implementation flaky.
+///   1. **Cursor (line-of-sight ray)** — a ray from the camera (your eye)
+///      through the index fingertip, intersected with the panel plane. The
+///      cursor lands exactly where your finger VISUALLY covers the panel from
+///      your point of view. The previous design projected the fingertip
+///      perpendicularly onto the panel, so with the panel tilted in space a
+///      finger "over a button" on screen could be tens of cm away along the
+///      panel — targeting felt broken. Ray-casting eliminates that parallax.
+///   2. **Select = pinch** — thumb+index tap while the cursor is on a control
+///      (the Quest gesture). The cursor freezes while the pinch closes, since
+///      curling the fingers shifts the fingertip. Poke-through and a slow
+///      dwell (~0.8s) remain as fallbacks.
+///   3. **Move = pinch the title bar** — the panel then follows the PALM
+///      (stable while the pinch occludes the fingertips), yaws to face you,
+///      and releases only on a clearly-opened pinch.
 ///
 /// All UIKit drawing is strictly main-thread (DispatchQueue.main.async). The
 /// render thread only mutates SCNNode transforms and CGColor/UIImage refs, all
@@ -81,12 +81,19 @@ final class ARMenuOverlay {
     private static let initRotY: Float = -Float.pi * 0.13
 
     // ── Cursor / click thresholds ───────────────────────────────────────────
-    private static let hoverMaxZ:  Float        = 0.28
-    private static let pokeArmZ:   Float        = 0.090
-    private static let pokeFireZ:  Float        = 0.040
-    private static let dwellTime:  TimeInterval = 0.45
-    private static let debounce:   TimeInterval = 0.32
-    private static let xyMargin:   Float        = 0.030
+    // The ray-based cursor is line-of-sight, so there's no hover-depth gate —
+    // only sanity limits on the fingertip itself.
+    private static let tipMaxBehind: Float        = 0.12   // tip past the panel plane limit
+    private static let pokeArmZ:     Float        = 0.080  // physical poke: pull back …
+    private static let pokeFireZ:    Float        = 0.015  // … then push to the surface
+    private static let dwellTime:    TimeInterval = 0.80   // slow fallback; pinch is primary
+    private static let debounce:     TimeInterval = 0.30
+    private static let xyMargin:     Float        = 0.030
+    // Pinch select (Quest gesture): on/off hysteresis; the cursor freezes
+    // below freezeDist because curling fingers shifts the fingertip.
+    private static let pinchOn:     Float = 0.028
+    private static let pinchOff:    Float = 0.052
+    private static let pinchFreeze: Float = 0.060
 
     // ── Grab thresholds (pinch the handle to hold, release pinch to drop) ──
     // Hysteresis between on/off keeps a slightly noisy thumb–index distance
@@ -95,8 +102,7 @@ final class ARMenuOverlay {
     // index tips occlude each other during a pinch, which is exactly when
     // Vision loses them, so the pinch midpoint is the least reliable control
     // point at the worst possible moment. The palm stays cleanly visible.
-    private static let grabPinchOn:   Float        = 0.035
-    private static let grabPinchOff:  Float        = 0.065
+    private static let grabPinchOff:  Float        = 0.065   // open past this releases
     private static let grabLostGrace: TimeInterval = 0.40   // hand fully gone → drop
     private static let dragSmooth:    Float        = 0.45
     private static let yawSmooth:     Float        = 0.18   // face-camera easing while held
@@ -125,11 +131,12 @@ final class ARMenuOverlay {
 
     private enum Region: Equatable {
         case none
+        case handle           // title bar: pinch here to move the panel
         case tab(Bool)        // true = library, false = controls
         case song(Int)
         case play, restart, debug, recalibrate
 
-        var actionable: Bool { self != .none }
+        var actionable: Bool { self != .none && self != .handle }
     }
 
     // ── State (render thread) ───────────────────────────────────────────────
@@ -148,6 +155,9 @@ final class ARMenuOverlay {
     private var hotRegion:      Region        = .none   // targeted control (highlighted in bake)
     private var cursorLeft:     Bool?         = nil
     private var fireFlashUntil: TimeInterval  = 0
+    // Pinch edge detection per hand (true = currently closed). State persists
+    // through missing joints — occlusion during a pinch must not read as open.
+    private var pinchClosed:    [Bool: Bool]  = [:]
 
     // Grab (pinch handle to hold, release to drop)
     private var grabbed:      Bool          = false
@@ -276,14 +286,23 @@ final class ARMenuOverlay {
             panelNode.scale = SCNVector3(curScale, curScale, curScale)
         }
 
-        // ── Pinch info per hand (thumb + index) ─────────────────────────────
-        struct Pinch { let isLeft: Bool; let mid: SIMD3<Float>; let dist: Float }
+        // ── Pinch state per hand (thumb + index, hysteresis + edge) ─────────
+        // pinchBegan fires exactly once per close. Missing joints leave the
+        // state unchanged — fingertips occlude each other mid-pinch, and that
+        // must not read as "opened".
+        struct Pinch { let isLeft: Bool; let mid: SIMD3<Float>; let dist: Float
+                       let began: Bool; let closed: Bool }
         var pinches: [Pinch] = []
         for hand in hands {
             guard let t = hand.joints[.thumbTip],
                   let i = hand.joints[.indexTip] else { continue }
-            pinches.append(Pinch(isLeft: hand.isLeft, mid: (t + i) * 0.5,
-                                  dist: simd_length(t - i)))
+            let dist = simd_length(t - i)
+            let was  = pinchClosed[hand.isLeft] ?? false
+            var began = false
+            if !was, dist < Self.pinchOn  { pinchClosed[hand.isLeft] = true; began = true }
+            if  was, dist > Self.pinchOff { pinchClosed[hand.isLeft] = false }
+            pinches.append(Pinch(isLeft: hand.isLeft, mid: (t + i) * 0.5, dist: dist,
+                                 began: began, closed: pinchClosed[hand.isLeft] ?? false))
         }
 
         // ── Grab: pinch the handle to hold. While held the panel follows the
@@ -335,70 +354,56 @@ final class ARMenuOverlay {
             if dirty || needsRebake { needsRebake = false; dispatchBake() }
             return nil
         }
-        // Start a grab: a fresh pinch near the handle strip (generous zone —
-        // this is a deliberate two-finger gesture, precision isn't needed).
-        let handleLocalH = Float(Self.handleH / Self.texH) * Self.panH
-        for p in pinches where p.dist < Self.grabPinchOn {
-            let local = panelNode.simdConvertPosition(p.mid, from: nil)
-            let inHandle = abs(local.x) < Self.panW/2 + 0.05
-                        && local.y >  Self.panH/2 - handleLocalH * 1.6
-                        && local.y <  Self.panH/2 + 0.06
-                        && abs(local.z) < 0.14
-            if inHandle, let parent = panelNode.parent,
-               let hand = hands.first(where: { $0.isLeft == p.isLeft }),
-               let anchor = Self.palmAnchor(hand) {
-                grabbed      = true
-                grabSide     = p.isLeft
-                grabOffset   = panelNode.simdPosition - parent.simdConvertPosition(anchor, from: nil)
-                grabTarget   = panelNode.simdPosition
-                grabLastSeen = time
-                dirty = true
-                pulse()
-                break
+        // ── Line-of-sight cursor ─────────────────────────────────────────────
+        // Cast a ray from the camera through the index fingertip and intersect
+        // it with the panel plane (z = 0 in panel-local space). The cursor
+        // lands exactly where the finger VISUALLY covers the panel from the
+        // user's viewpoint — no parallax between what you see and what you hit.
+        struct Hit { let local: SIMD3<Float>; let tipZ: Float; let isLeft: Bool }
+        var hits: [Hit] = []
+        if let cp = cameraWorldPos {
+            let camLocal = panelNode.simdConvertPosition(cp, from: nil)
+            for hand in hands {
+                guard let tip = hand.joints[.indexTip] else { continue }
+                let tipLocal = panelNode.simdConvertPosition(tip, from: nil)
+                guard tipLocal.z > -Self.tipMaxBehind else { continue }
+                let d = tipLocal - camLocal
+                guard abs(d.z) > 1e-5 else { continue }
+                let t = -camLocal.z / d.z
+                guard t > 0 else { continue }
+                let hit = camLocal + d * t
+                guard abs(hit.x) < Self.panW/2 + Self.xyMargin,
+                      abs(hit.y) < Self.panH/2 + Self.xyMargin else { continue }
+                hits.append(Hit(local: hit, tipZ: tipLocal.z, isLeft: hand.isLeft))
             }
         }
-        if grabbed {
-            cursorNode.isHidden = true
-            cursorSmoothed = nil
-            if dirty || needsRebake { needsRebake = false; dispatchBake() }
-            return nil
-        }
+        // Prefer the hand that already owns the cursor; otherwise nearest tip.
+        let best = hits.first(where: { $0.isLeft == cursorLeft })
+                ?? hits.min(by: { abs($0.tipZ) < abs($1.tipZ) })
 
-        // ── Cursor + click ────────────────────────────────────────────────────
         var result: MenuAction? = nil
-        let pinchingSides = Set(pinches.filter { $0.dist < Self.grabPinchOff }.map { $0.isLeft })
-
-        // Pick the index fingertip closest to the panel face, within bounds.
-        // Hands mid-pinch are excluded — they're gesturing, not pointing.
-        var best: (local: SIMD3<Float>, isLeft: Bool)? = nil
-        for hand in hands {
-            if pinchingSides.contains(hand.isLeft) { continue }
-            guard let tip = hand.joints[.indexTip] else { continue }
-            let local = panelNode.simdConvertPosition(tip, from: nil)
-            guard abs(local.x) < Self.panW/2 + Self.xyMargin,
-                  abs(local.y) < Self.panH/2 + Self.xyMargin,
-                  local.z > -0.03, local.z < Self.hoverMaxZ else { continue }
-            if best == nil || abs(local.z) < abs(best!.local.z) {
-                best = (local, hand.isLeft)
-            }
-        }
 
         if let b = best {
-            // EMA in panel-local space: the visible dot stays glued to the
-            // fingertip without frame-to-frame jitter, and the SAME smoothed
-            // position drives hit-testing so what you see is what you select.
+            let pinch = pinches.first(where: { $0.isLeft == b.isLeft })
+
+            // Cursor smoothing — and a freeze while the pinch is closing,
+            // because curling fingers drags the fingertip (and therefore the
+            // ray) just as the user is trying to click what they're on.
             let sm: SIMD3<Float>
             if let prev = cursorSmoothed, cursorLeft == b.isLeft {
-                sm = prev + 0.45 * (b.local - prev)
+                if let p = pinch, p.dist < Self.pinchFreeze {
+                    sm = prev                              // frozen during the click
+                } else {
+                    sm = prev + 0.5 * (b.local - prev)
+                }
             } else {
                 sm = b.local
             }
             cursorSmoothed = sm
 
-            // Sticky targeting: raw region, but if the cursor briefly leaves
-            // into dead space (a grid gap, a border) while staying within the
-            // current target's inflated rect, keep the target — this is what
-            // lets dwell actually complete despite natural hand sway.
+            // Sticky targeting: keep the current target while the cursor is
+            // within its inflated rect, so grid gaps / borders don't cancel
+            // an in-progress selection.
             let raw = regionAt(localX: sm.x, localY: sm.y)
             var region = raw
             if raw == .none, dwellRegion != .none,
@@ -409,7 +414,7 @@ final class ARMenuOverlay {
                 }
             }
 
-            // Highlight whatever is currently targeted (rebake on change).
+            // Highlight whatever is targeted (rebake on change).
             if region != hotRegion { hotRegion = region; dirty = true }
 
             if cursorLeft != b.isLeft {
@@ -421,13 +426,30 @@ final class ARMenuOverlay {
             if region != dwellRegion { dwellRegion = region; dwellStart = time }
             if region != firedRegion { firedRegion = .none }
 
-            if sm.z > Self.pokeArmZ { pokeArmed = true }
-            let poked = pokeArmed && sm.z < Self.pokeFireZ
+            // ── Select: pinch (primary), poke-through, or slow dwell ────────
+            let pinchFire = pinch?.began ?? false
+
+            if b.tipZ > Self.pokeArmZ { pokeArmed = true }
+            let poked = pokeArmed && b.tipZ < Self.pokeFireZ
 
             let dwellProg = Float(simd_clamp((time - dwellStart) / Self.dwellTime, 0, 1))
             let dwellFire = (time - dwellStart) >= Self.dwellTime && firedRegion != region
 
-            if region.actionable, time - lastTap > Self.debounce, poked || dwellFire {
+            if region == .handle, pinchFire {
+                // Pinch on the title bar → pick the panel up.
+                if let parent = panelNode.parent,
+                   let hand = hands.first(where: { $0.isLeft == b.isLeft }),
+                   let anchor = Self.palmAnchor(hand) {
+                    grabbed      = true
+                    grabSide     = b.isLeft
+                    grabOffset   = panelNode.simdPosition - parent.simdConvertPosition(anchor, from: nil)
+                    grabTarget   = panelNode.simdPosition
+                    grabLastSeen = time
+                    dirty = true
+                    pulse()
+                }
+            } else if region.actionable, time - lastTap > Self.debounce,
+                      pinchFire || poked || dwellFire {
                 result = fire(region, dirty: &dirty)
                 lastTap        = time
                 fireFlashUntil = time + 0.18
@@ -438,8 +460,8 @@ final class ARMenuOverlay {
                 pulse()
             }
 
-            updateCursor(local: sm, progress: dwellProg,
-                         actionable: region.actionable, time: time)
+            updateCursor(local: sm, progress: region == .handle ? 0 : dwellProg,
+                         actionable: region.actionable || region == .handle, time: time)
         } else {
             cursorNode.isHidden = true
             cursorSmoothed = nil
@@ -448,6 +470,29 @@ final class ARMenuOverlay {
             pokeArmed   = false
             cursorLeft  = nil
             if hotRegion != .none { hotRegion = .none; dirty = true }
+
+            // Close-range fallback: a fresh pinch physically at the handle
+            // still grabs, even with no ray cursor (hand right at the panel).
+            let handleLocalH = Float(Self.handleH / Self.texH) * Self.panH
+            for p in pinches where p.began {
+                let local = panelNode.simdConvertPosition(p.mid, from: nil)
+                let inHandle = abs(local.x) < Self.panW/2 + 0.05
+                            && local.y >  Self.panH/2 - handleLocalH * 1.6
+                            && local.y <  Self.panH/2 + 0.06
+                            && abs(local.z) < 0.14
+                if inHandle, let parent = panelNode.parent,
+                   let hand = hands.first(where: { $0.isLeft == p.isLeft }),
+                   let anchor = Self.palmAnchor(hand) {
+                    grabbed      = true
+                    grabSide     = p.isLeft
+                    grabOffset   = panelNode.simdPosition - parent.simdConvertPosition(anchor, from: nil)
+                    grabTarget   = panelNode.simdPosition
+                    grabLastSeen = time
+                    dirty = true
+                    pulse()
+                    break
+                }
+            }
         }
 
         // Border emission reflects grab / fire-flash state (CGColor — render-safe)
@@ -510,7 +555,7 @@ final class ARMenuOverlay {
 
     private func regionAt(localX: Float, localY: Float) -> Region {
         let pt = texPoint(localX: localX, localY: localY)
-        if pt.y < Self.handleH { return .none }               // handle = grab only
+        if pt.y < Self.handleH { return .handle }             // title bar = grab only
         if Self.tabLibRect.contains(pt) { return .tab(true) }
         if Self.tabCtlRect.contains(pt) { return .tab(false) }
         switch activeTab {
@@ -533,6 +578,7 @@ final class ARMenuOverlay {
     private static func rectFor(_ region: Region) -> CGRect? {
         switch region {
         case .none:            return nil
+        case .handle:          return CGRect(x: 0, y: 0, width: texW, height: handleH)
         case .tab(let lib):    return lib ? Self.tabLibRect : Self.tabCtlRect
         case .song(let i):     return Self.libCellRect(i)
         case .debug:           return Self.dbgRect
@@ -546,7 +592,7 @@ final class ARMenuOverlay {
     /// (or nil for pure UI navigation like tab switches).
     private func fire(_ region: Region, dirty: inout Bool) -> MenuAction? {
         switch region {
-        case .none:
+        case .none, .handle:
             return nil
         case .tab(let library):
             let wanted: Tab = library ? .library : .controls
