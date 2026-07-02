@@ -1,5 +1,6 @@
 import SceneKit
 import UIKit
+import Vision
 import simd
 
 enum MenuAction { case playStop, restart, loadAndPlay(Song?), toggleDebug, recalibrate }
@@ -63,6 +64,17 @@ final class ARMenuOverlay {
                       width: cellW, height: libCellH)
     }
 
+    // Shared control rects — single source of truth for hit-testing, the
+    // baked drawing, AND the target highlight, so they can never drift apart.
+    private static var ctlTopY: CGFloat { handleH + headerH }
+    private static var ctlMidY: CGFloat { ctlTopY + (texH - tabBarH - ctlTopY) / 2 }
+    private static var dbgRect:    CGRect { CGRect(x: 28, y: ctlTopY + 12, width: 190, height: 44) }
+    private static var recalRect:  CGRect { CGRect(x: texW - 248, y: ctlTopY + 12, width: 220, height: 44) }
+    private static var playRect:   CGRect { CGRect(x: texW/2 - 150, y: ctlMidY - 44, width: 300, height: 88) }
+    private static var rstRect:    CGRect { CGRect(x: texW/2 - 110, y: ctlMidY + 62, width: 220, height: 54) }
+    private static var tabLibRect: CGRect { CGRect(x: 0,      y: texH - tabBarH, width: texW/2, height: tabBarH) }
+    private static var tabCtlRect: CGRect { CGRect(x: texW/2, y: texH - tabBarH, width: texW/2, height: tabBarH) }
+
     // ── Default placement (right of keyboard centre, lifted, tilted) ────────
     private static let initPos = SIMD3<Float>(KeyboardLayout.totalWidth * 0.30, 0.30, 0.18)
     private static let initRotX: Float = -Float.pi * 0.28
@@ -78,10 +90,23 @@ final class ARMenuOverlay {
 
     // ── Grab thresholds (pinch the handle to hold, release pinch to drop) ──
     // Hysteresis between on/off keeps a slightly noisy thumb–index distance
-    // from dropping the panel mid-move.
-    private static let grabPinchOn:  Float = 0.035
-    private static let grabPinchOff: Float = 0.065
-    private static let dragSmooth:   Float = 0.55
+    // from dropping the panel mid-move. While held, the panel follows the
+    // PALM (wrist + knuckle centroid), not the pinch midpoint — the thumb and
+    // index tips occlude each other during a pinch, which is exactly when
+    // Vision loses them, so the pinch midpoint is the least reliable control
+    // point at the worst possible moment. The palm stays cleanly visible.
+    private static let grabPinchOn:   Float        = 0.035
+    private static let grabPinchOff:  Float        = 0.065
+    private static let grabLostGrace: TimeInterval = 0.40   // hand fully gone → drop
+    private static let dragSmooth:    Float        = 0.45
+    private static let yawSmooth:     Float        = 0.18   // face-camera easing while held
+
+    // ── Sticky targeting ────────────────────────────────────────────────────
+    // Once a control is targeted, it stays targeted until the cursor clearly
+    // leaves (its rect inflated by this many texture pixels). Without this,
+    // natural hand sway across the 10 px gaps between grid cells reset the
+    // dwell timer constantly and dwell-select almost never completed.
+    private static let stickyInflate: CGFloat = 34
 
     // ── Distance-adaptive scale ─────────────────────────────────────────────
     // The panel has a fixed world size, so from farther away it shrinks to
@@ -120,14 +145,17 @@ final class ARMenuOverlay {
     private var dwellStart:     TimeInterval  = 0
     private var pokeArmed:      Bool          = false
     private var firedRegion:    Region        = .none
+    private var hotRegion:      Region        = .none   // targeted control (highlighted in bake)
     private var cursorLeft:     Bool?         = nil
     private var fireFlashUntil: TimeInterval  = 0
 
     // Grab (pinch handle to hold, release to drop)
-    private var grabbed:    Bool          = false
-    private var grabSide:   Bool?         = nil
-    private var grabOffset: SIMD3<Float>  = .zero
-    private var grabTarget: SIMD3<Float>  = .zero
+    private var grabbed:      Bool          = false
+    private var grabSide:     Bool?         = nil
+    private var grabOffset:   SIMD3<Float>  = .zero
+    private var grabTarget:   SIMD3<Float>  = .zero
+    private var grabLastSeen: TimeInterval  = 0
+    private var curYaw:       Float         = ARMenuOverlay.initRotY
 
     // Cursor smoothing (panel-local EMA so the dot sticks to the fingertip
     // without jitter)
@@ -258,41 +286,72 @@ final class ARMenuOverlay {
                                   dist: simd_length(t - i)))
         }
 
-        // ── Grab: pinch the handle to hold, panel follows the pinch, opening
-        // the fingers releases it exactly where it is. Hysteresis (on 3.5 cm /
-        // off 6.5 cm) rides through thumb–index landmark noise mid-move.
+        // ── Grab: pinch the handle to hold. While held the panel follows the
+        // PALM with an offset (stable even when the pinching fingertips
+        // occlude each other), yaws to face the camera, and releases only on
+        // a clearly-opened pinch — a lost joint for a few frames keeps
+        // holding rather than dropping mid-move.
         if grabbed {
-            if let side = grabSide,
-               let p = pinches.first(where: { $0.isLeft == side }), p.dist < Self.grabPinchOff,
-               let parent = panelNode.parent {
-                let parentLocal = parent.simdConvertPosition(p.mid, from: nil)
-                let target      = parentLocal + grabOffset
-                grabTarget      = grabTarget * Self.dragSmooth + target * (1 - Self.dragSmooth)
-                panelNode.simdPosition = grabTarget
-            } else {
-                // Pinch opened (or hand lost) → drop the panel here.
+            var shouldRelease = false
+            if let side = grabSide, let hand = hands.first(where: { $0.isLeft == side }) {
+                grabLastSeen = time
+                // Release only on positive evidence: both pinch joints seen
+                // AND clearly apart. Missing joints ≠ released.
+                if let t = hand.joints[.thumbTip], let i = hand.joints[.indexTip],
+                   simd_length(t - i) > Self.grabPinchOff {
+                    shouldRelease = true
+                } else if let anchor = Self.palmAnchor(hand), let parent = panelNode.parent {
+                    let target = parent.simdConvertPosition(anchor, from: nil) + grabOffset
+                    grabTarget = grabTarget * Self.dragSmooth + target * (1 - Self.dragSmooth)
+                    panelNode.simdPosition = grabTarget
+
+                    // Yaw toward the camera so the panel faces you wherever
+                    // you carry it (kept after release).
+                    if let cp = cameraWorldPos, let parent2 = panelNode.parent {
+                        let camLocal = parent2.simdConvertPosition(cp, from: nil)
+                        let d = camLocal - panelNode.simdPosition
+                        if simd_length(SIMD3<Float>(d.x, 0, d.z)) > 0.05 {
+                            let targetYaw = atan2(d.x, d.z)
+                            var delta = targetYaw - curYaw
+                            while delta >  .pi { delta -= 2 * .pi }
+                            while delta < -.pi { delta += 2 * .pi }
+                            curYaw += delta * Self.yawSmooth
+                            panelNode.eulerAngles = SCNVector3(Self.initRotX, curYaw, 0)
+                        }
+                    }
+                }
+            } else if time - grabLastSeen > Self.grabLostGrace {
+                shouldRelease = true   // hand fully gone for a while → drop
+            }
+
+            if shouldRelease {
                 grabbed = false; grabSide = nil
                 dirty = true
                 pulse()
             }
             cursorNode.isHidden = true
             cursorSmoothed = nil
+            if hotRegion != .none { hotRegion = .none; dirty = true }
             if dirty || needsRebake { needsRebake = false; dispatchBake() }
             return nil
         }
-        // Start a grab: a fresh pinch whose midpoint is at the handle strip.
+        // Start a grab: a fresh pinch near the handle strip (generous zone —
+        // this is a deliberate two-finger gesture, precision isn't needed).
         let handleLocalH = Float(Self.handleH / Self.texH) * Self.panH
         for p in pinches where p.dist < Self.grabPinchOn {
             let local = panelNode.simdConvertPosition(p.mid, from: nil)
-            let inHandle = abs(local.x) < Self.panW/2 + 0.04
-                        && local.y >  Self.panH/2 - handleLocalH - 0.02
-                        && local.y <  Self.panH/2 + 0.05
-                        && abs(local.z) < 0.10
-            if inHandle, let parent = panelNode.parent {
-                grabbed    = true
-                grabSide   = p.isLeft
-                grabOffset = panelNode.simdPosition - parent.simdConvertPosition(p.mid, from: nil)
-                grabTarget = panelNode.simdPosition
+            let inHandle = abs(local.x) < Self.panW/2 + 0.05
+                        && local.y >  Self.panH/2 - handleLocalH * 1.6
+                        && local.y <  Self.panH/2 + 0.06
+                        && abs(local.z) < 0.14
+            if inHandle, let parent = panelNode.parent,
+               let hand = hands.first(where: { $0.isLeft == p.isLeft }),
+               let anchor = Self.palmAnchor(hand) {
+                grabbed      = true
+                grabSide     = p.isLeft
+                grabOffset   = panelNode.simdPosition - parent.simdConvertPosition(anchor, from: nil)
+                grabTarget   = panelNode.simdPosition
+                grabLastSeen = time
                 dirty = true
                 pulse()
                 break
@@ -336,7 +395,22 @@ final class ARMenuOverlay {
             }
             cursorSmoothed = sm
 
-            let region = regionAt(localX: sm.x, localY: sm.y)
+            // Sticky targeting: raw region, but if the cursor briefly leaves
+            // into dead space (a grid gap, a border) while staying within the
+            // current target's inflated rect, keep the target — this is what
+            // lets dwell actually complete despite natural hand sway.
+            let raw = regionAt(localX: sm.x, localY: sm.y)
+            var region = raw
+            if raw == .none, dwellRegion != .none,
+               let r = Self.rectFor(dwellRegion) {
+                let pt = texPoint(localX: sm.x, localY: sm.y)
+                if r.insetBy(dx: -Self.stickyInflate, dy: -Self.stickyInflate).contains(pt) {
+                    region = dwellRegion
+                }
+            }
+
+            // Highlight whatever is currently targeted (rebake on change).
+            if region != hotRegion { hotRegion = region; dirty = true }
 
             if cursorLeft != b.isLeft {
                 cursorLeft  = b.isLeft
@@ -373,6 +447,7 @@ final class ARMenuOverlay {
             firedRegion = .none
             pokeArmed   = false
             cursorLeft  = nil
+            if hotRegion != .none { hotRegion = .none; dirty = true }
         }
 
         // Border emission reflects grab / fire-flash state (CGColor — render-safe)
@@ -386,6 +461,16 @@ final class ARMenuOverlay {
 
         if dirty || needsRebake { needsRebake = false; dispatchBake() }
         return result
+    }
+
+    /// Stable drag control point: centroid of wrist + knuckles. These joints
+    /// stay cleanly visible during a pinch, unlike the pinching fingertips.
+    private static func palmAnchor(_ hand: HandTracker.HandResult) -> SIMD3<Float>? {
+        let names: [VNHumanHandPoseObservation.JointName] =
+            [.wrist, .indexMCP, .middleMCP, .ringMCP, .littleMCP]
+        let pts = names.compactMap { hand.joints[$0] }
+        guard pts.count >= 2 else { return hand.joints[.indexTip] }
+        return pts.reduce(SIMD3<Float>(repeating: 0), +) / Float(pts.count)
     }
 
     // MARK: - Cursor visuals  (render thread)
@@ -416,33 +501,44 @@ final class ARMenuOverlay {
 
     // MARK: - Region resolution / firing
 
-    private func regionAt(localX: Float, localY: Float) -> Region {
-        let u  = CGFloat((localX + Self.panW/2) / Self.panW)
-        let v  = CGFloat(1.0 - (localY + Self.panH/2) / Self.panH)
-        let px = u * Self.texW
-        let py = v * Self.texH
+    /// Panel-local metres → texture pixels.
+    private func texPoint(localX: Float, localY: Float) -> CGPoint {
+        let u = CGFloat((localX + Self.panW/2) / Self.panW)
+        let v = CGFloat(1.0 - (localY + Self.panH/2) / Self.panH)
+        return CGPoint(x: u * Self.texW, y: v * Self.texH)
+    }
 
-        if py < Self.handleH { return .none }                 // handle = grab-pickup only
-        if py >= Self.texH - Self.tabBarH {
-            return .tab(px < Self.texW / 2)
-        }
+    private func regionAt(localX: Float, localY: Float) -> Region {
+        let pt = texPoint(localX: localX, localY: localY)
+        if pt.y < Self.handleH { return .none }               // handle = grab only
+        if Self.tabLibRect.contains(pt) { return .tab(true) }
+        if Self.tabCtlRect.contains(pt) { return .tab(false) }
         switch activeTab {
         case .library:
             let count = min(availableSongs.count, Self.libMaxVisible())
-            for i in 0..<count where Self.libCellRect(i).contains(CGPoint(x: px, y: py)) {
+            for i in 0..<count where Self.libCellRect(i).contains(pt) {
                 return .song(i)
             }
             return .none
         case .controls:
-            let cx    = Self.texW / 2
-            let topY  = Self.handleH + Self.headerH
-            let contH = Self.texH - Self.tabBarH - topY
-            let midY  = topY + contH / 2
-            if CGRect(x: 28, y: topY + 12, width: 190, height: 44).contains(CGPoint(x: px, y: py)) { return .debug }
-            if CGRect(x: Self.texW - 248, y: topY + 12, width: 220, height: 44).contains(CGPoint(x: px, y: py)) { return .recalibrate }
-            if CGRect(x: cx - 150, y: midY - 44, width: 300, height: 88).contains(CGPoint(x: px, y: py)) { return .play }
-            if CGRect(x: cx - 110, y: midY + 62, width: 220, height: 54).contains(CGPoint(x: px, y: py)) { return .restart }
+            if Self.dbgRect.contains(pt)   { return .debug }
+            if Self.recalRect.contains(pt) { return .recalibrate }
+            if Self.playRect.contains(pt)  { return .play }
+            if Self.rstRect.contains(pt)   { return .restart }
             return .none
+        }
+    }
+
+    /// The texture rect of a region (for sticky targeting and the highlight).
+    private static func rectFor(_ region: Region) -> CGRect? {
+        switch region {
+        case .none:            return nil
+        case .tab(let lib):    return lib ? Self.tabLibRect : Self.tabCtlRect
+        case .song(let i):     return Self.libCellRect(i)
+        case .debug:           return Self.dbgRect
+        case .recalibrate:     return Self.recalRect
+        case .play:            return Self.playRect
+        case .restart:         return Self.rstRect
         }
     }
 
@@ -482,7 +578,7 @@ final class ARMenuOverlay {
     private func dispatchBake() {
         let snap = PanelSnap(tab: activeTab, songs: availableSongs,
                              isPlaying: isPlaying, debugOn: debugOn,
-                             grabbing: grabbed)
+                             grabbing: grabbed, hot: hotRegion)
         let mat  = panelMat!
         DispatchQueue.main.async {
             mat.diffuse.contents = ARMenuOverlay.bake(snap)
@@ -497,6 +593,7 @@ final class ARMenuOverlay {
         let isPlaying: Bool
         let debugOn:   Bool
         let grabbing:  Bool
+        let hot:       Region
     }
 
     private static func bake(_ s: PanelSnap) -> UIImage {
@@ -527,6 +624,16 @@ final class ARMenuOverlay {
             case .library:  drawLibrary(s)
             case .controls: drawControls(s)
             }
+
+            // Target highlight: a bright ring around whatever the cursor is
+            // on, so it's always obvious what a poke/dwell would select.
+            if let r = rectFor(s.hot) {
+                UIColor(red: 0.55, green: 0.95, blue: 1.0, alpha: 0.95).setStroke()
+                let ring = UIBezierPath(roundedRect: r.insetBy(dx: -4, dy: -4),
+                                        cornerRadius: 18)
+                ring.lineWidth = 4
+                ring.stroke()
+            }
         }
     }
 
@@ -554,6 +661,17 @@ final class ARMenuOverlay {
         ]
         let tsz = title.size(withAttributes: attrs)
         title.draw(at: CGPoint(x: 24, y: (handleH - tsz.height) / 2), withAttributes: attrs)
+
+        if !s.grabbing {
+            let hint = "✌ PINCH HERE TO MOVE"
+            let hAttrs: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 14, weight: .semibold),
+                .foregroundColor: UIColor(white: 1, alpha: 0.40),
+            ]
+            let hsz = hint.size(withAttributes: hAttrs)
+            hint.draw(at: CGPoint(x: texW - hsz.width - 24, y: (handleH - hsz.height) / 2),
+                      withAttributes: hAttrs)
+        }
 
         UIColor(white: 1, alpha: 0.14).setFill()
         UIBezierPath(rect: CGRect(x: 0, y: handleH - 1, width: texW, height: 1)).fill()
@@ -633,21 +751,15 @@ final class ARMenuOverlay {
     }
 
     private static func drawControls(_ s: PanelSnap) {
-        let topY  = handleH + headerH
-        let contH = texH - tabBarH - topY
-        let cx    = texW / 2
-        let midY  = topY + contH / 2
-
         centered("CONTROLS", in: CGRect(x: 0, y: handleH, width: texW, height: headerH),
                  font: .systemFont(ofSize: 23, weight: .black),
                  color: UIColor(white: 1, alpha: 0.60))
 
-        // Debug (left) / Change Mode (right) — a matched pair of pill buttons
+        // Debug (left) / Recalibrate (right) — a matched pair of pill buttons
         let dbgBg = s.debugOn
             ? UIColor(red: 0.10, green: 0.48, blue: 0.18, alpha: 0.85)
             : UIColor(white: 1, alpha: 0.09)
         dbgBg.setFill()
-        let dbgRect = CGRect(x: 28, y: topY + 12, width: 190, height: 44)
         UIBezierPath(roundedRect: dbgRect, cornerRadius: 13).fill()
         centered(s.debugOn ? "⚙ DEBUG ON" : "⚙ DEBUG",
                  in: dbgRect,
@@ -656,14 +768,13 @@ final class ARMenuOverlay {
                                   : UIColor(white: 1, alpha: 0.60))
 
         UIColor(white: 1, alpha: 0.09).setFill()
-        let modeRect = CGRect(x: texW - 248, y: topY + 12, width: 220, height: 44)
-        UIBezierPath(roundedRect: modeRect, cornerRadius: 13).fill()
-        centered("⌖ RECALIBRATE", in: modeRect,
+        UIBezierPath(roundedRect: recalRect, cornerRadius: 13).fill()
+        centered("⌖ RECALIBRATE", in: recalRect,
                  font: .systemFont(ofSize: 17, weight: .semibold),
                  color: UIColor(white: 1, alpha: 0.60))
 
         centered(s.isPlaying ? "● PLAYING" : "— READY —",
-                 in: CGRect(x: 0, y: topY + 72, width: texW, height: 38),
+                 in: CGRect(x: 0, y: ctlTopY + 72, width: texW, height: 38),
                  font: .systemFont(ofSize: 21, weight: .black),
                  color: s.isPlaying
                     ? UIColor(red: 0.45, green: 1.00, blue: 0.55, alpha: 1)
@@ -673,7 +784,6 @@ final class ARMenuOverlay {
             ? UIColor(red: 0.82, green: 0.12, blue: 0.12, alpha: 0.95)
             : UIColor(red: 0.16, green: 0.50, blue: 0.98, alpha: 0.95)
         playBg.setFill()
-        let playRect = CGRect(x: cx - 150, y: midY - 44, width: 300, height: 88)
         UIBezierPath(roundedRect: playRect, cornerRadius: 24).fill()
         UIColor(white: 1, alpha: 0.24).setStroke()
         let pb = UIBezierPath(roundedRect: playRect.insetBy(dx: 1, dy: 1), cornerRadius: 24)
@@ -683,7 +793,6 @@ final class ARMenuOverlay {
                  in: playRect, font: .systemFont(ofSize: 36, weight: .black), color: .white)
 
         UIColor(white: 1, alpha: 0.11).setFill()
-        let rstRect = CGRect(x: cx - 110, y: midY + 62, width: 220, height: 54)
         UIBezierPath(roundedRect: rstRect, cornerRadius: 15).fill()
         centered("↺   RESTART", in: rstRect,
                  font: .systemFont(ofSize: 21, weight: .bold),
