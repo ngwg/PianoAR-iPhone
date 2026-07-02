@@ -479,12 +479,16 @@ final class ARMenuOverlay {
             // ── Select: pinch (aim-lagged, primary), poke, or slow dwell ────
             // Pinch resolves against the lagged aim; poke requires the finger
             // to be PHYSICALLY at the panel face (not merely visually over it
-            // — hands playing the piano below constantly cross the ray).
+            // — hands playing the piano below constantly cross the ray) AND
+            // the target to have been stable for a moment: a finger sweeping
+            // across the song grid toward its goal changes targets constantly,
+            // and must never fire on a card it's merely passing over.
             let pinchFire = (pinch?.began ?? false) && laggedRegion.actionable
 
+            let targetStable = (time - dwellStart) > 0.20   // dwellStart = last region change
             let tipOnFace = abs(b.tip.x) < Self.panW/2 && abs(b.tip.y) < Self.panH/2
             if b.tip.z > Self.pokeArmZ { pokeArmed = true }
-            let poked = pokeArmed && tipOnFace && b.tip.z < Self.pokeFireZ
+            let poked = pokeArmed && tipOnFace && targetStable && b.tip.z < Self.pokeFireZ
 
             let dwellProg = Float(simd_clamp((time - dwellStart) / Self.dwellTime, 0, 1))
             let dwellFire = (time - dwellStart) >= Self.dwellTime && firedRegion != region
