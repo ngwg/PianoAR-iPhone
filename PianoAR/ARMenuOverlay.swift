@@ -310,7 +310,7 @@ final class ARMenuOverlay {
         // state unchanged — fingertips occlude each other mid-pinch, and that
         // must not read as "opened".
         struct Pinch { let isLeft: Bool; let mid: SIMD3<Float>; let dist: Float
-                       let began: Bool; let closed: Bool; let isDirect: Bool }
+                       let began: Bool; let closed: Bool }
         var pinches: [Pinch] = []
         for hand in hands {
             guard let t = hand.joints[.thumbTip],
@@ -318,15 +318,10 @@ final class ARMenuOverlay {
             let dist = simd_length(t - i)
             let was  = pinchClosed[hand.isLeft] ?? false
             var began = false
-            let isDirect = !hand.estimated.contains(.thumbTip)
-                && !hand.estimated.contains(.indexTip)
-            if isDirect {
-                if !was, dist < Self.pinchOn  { pinchClosed[hand.isLeft] = true; began = true }
-                if  was, dist > Self.pinchOff { pinchClosed[hand.isLeft] = false }
-            }
+            if !was, dist < Self.pinchOn  { pinchClosed[hand.isLeft] = true; began = true }
+            if  was, dist > Self.pinchOff { pinchClosed[hand.isLeft] = false }
             pinches.append(Pinch(isLeft: hand.isLeft, mid: (t + i) * 0.5, dist: dist,
-                                 began: began, closed: pinchClosed[hand.isLeft] ?? false,
-                                 isDirect: isDirect))
+                                 began: began, closed: pinchClosed[hand.isLeft] ?? false))
         }
 
         // ── Grab: pinch the handle to hold. While held the panel follows the
@@ -340,9 +335,7 @@ final class ARMenuOverlay {
                 grabLastSeen = time
                 // Release only on positive evidence: both pinch joints seen
                 // AND clearly apart. Missing joints ≠ released.
-                if !hand.estimated.contains(.thumbTip),
-                   !hand.estimated.contains(.indexTip),
-                   let t = hand.joints[.thumbTip], let i = hand.joints[.indexTip],
+                if let t = hand.joints[.thumbTip], let i = hand.joints[.indexTip],
                    simd_length(t - i) > Self.grabPinchOff {
                     shouldRelease = true
                 } else if let anchor = Self.palmAnchor(hand), let parent = panelNode.parent {
@@ -385,8 +378,7 @@ final class ARMenuOverlay {
         // it with the panel plane (z = 0 in panel-local space). The cursor
         // lands exactly where the finger VISUALLY covers the panel from the
         // user's viewpoint — no parallax between what you see and what you hit.
-        struct Hit { let local: SIMD3<Float>; let tip: SIMD3<Float>; let isLeft: Bool
-                     let isDirect: Bool }
+        struct Hit { let local: SIMD3<Float>; let tip: SIMD3<Float>; let isLeft: Bool }
         var hits: [Hit] = []
         if let cp = cameraWorldPos {
             let camLocal = panelNode.simdConvertPosition(cp, from: nil)
@@ -401,8 +393,7 @@ final class ARMenuOverlay {
                 let hit = camLocal + d * t
                 guard abs(hit.x) < Self.panW/2 + Self.xyMargin,
                       abs(hit.y) < Self.panH/2 + Self.xyMargin else { continue }
-                hits.append(Hit(local: hit, tip: tipLocal, isLeft: hand.isLeft,
-                                isDirect: !hand.estimated.contains(.indexTip)))
+                hits.append(Hit(local: hit, tip: tipLocal, isLeft: hand.isLeft))
             }
         }
         // Prefer the hand that already owns the cursor; otherwise nearest tip.
@@ -414,18 +405,13 @@ final class ARMenuOverlay {
         if let b = best {
             let pinch = pinches.first(where: { $0.isLeft == b.isLeft })
 
-            // Predicted joints keep the cursor visually continuous, but must
-            // never complete a dwell, arm a poke, or begin a grab. Direct
-            // tracking has to remain stable for the normal dwell interval
-            // again after an occlusion.
-            if !b.isDirect {
-                dwellStart = time
-                pokeArmed = false
-                pendingGrabSide = nil
+            // Cursor smoothing (EMA in panel-local space).
+            let sm: SIMD3<Float>
+            if let prev = cursorSmoothed, cursorLeft == b.isLeft {
+                sm = prev + 0.5 * (b.local - prev)
+            } else {
+                sm = b.local
             }
-
-            // Raw cursor — no smoothing, the dot tracks the fingertip 1:1.
-            let sm = b.local
             cursorSmoothed = sm
 
             // Aim history: closing a pinch physically yanks the fingertip —
@@ -497,19 +483,16 @@ final class ARMenuOverlay {
             // the target to have been stable for a moment: a finger sweeping
             // across the song grid toward its goal changes targets constantly,
             // and must never fire on a card it's merely passing over.
-            let pinchFire = b.isDirect && pinch?.isDirect == true
-                && (pinch?.began ?? false)
-                && laggedRegion.actionable
+            let pinchFire = (pinch?.began ?? false) && laggedRegion.actionable
 
             let targetStable = (time - dwellStart) > 0.20   // dwellStart = last region change
             let tipOnFace = abs(b.tip.x) < Self.panW/2 && abs(b.tip.y) < Self.panH/2
             if b.tip.z > Self.pokeArmZ { pokeArmed = true }
-            let poked = b.isDirect && pokeArmed && tipOnFace && targetStable
-                && b.tip.z < Self.pokeFireZ
+            let poked = pokeArmed && tipOnFace && targetStable && b.tip.z < Self.pokeFireZ
 
             let dwellProg = Float(simd_clamp((time - dwellStart) / Self.dwellTime, 0, 1))
-            let dwellFire = b.isDirect && (time - dwellStart) >= Self.dwellTime
-                && firedRegion != region && region.actionable
+            let dwellFire = (time - dwellStart) >= Self.dwellTime && firedRegion != region
+                            && region.actionable
 
             if !grabbed, time - lastTap > Self.debounce {
                 var firedOn: Region? = nil

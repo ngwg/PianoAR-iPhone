@@ -410,24 +410,19 @@ private final class Hand3DOverlay {
         cyl.forEach { $0.forEach { $0.isHidden = true } }
 
         for hand in hands {
-            let h = hand.id
-            guard sph.indices.contains(h) else { continue }
+            let h = hand.isLeft ? 0 : 1
+            guard h < sph.count else { continue }
 
-            // Raw rendering — every joint draws exactly where the tracker put
-            // it this frame. Any render-side easing is stacked latency.
             for (i, name) in HandTracker.allJoints.enumerated() {
-                guard let target = hand.joints[name] else { continue }
-                sph[h][i].simdPosition = target
-                sph[h][i].opacity = CGFloat(hand.visibility)
+                guard let p = hand.joints[name] else { continue }
+                sph[h][i].simdPosition = p
                 sph[h][i].isHidden     = false
             }
 
             for (i, (fi, ti)) in HandTracker.boneConnections.enumerated() {
-                guard !sph[h][fi].isHidden, !sph[h][ti].isHidden else { continue }
-                let a = sph[h][fi].simdPosition
-                let b = sph[h][ti].simdPosition
+                guard let a = hand.joints[HandTracker.allJoints[fi]],
+                      let b = hand.joints[HandTracker.allJoints[ti]] else { continue }
                 placeCylinder(cyl[h][i], from: a, to: b)
-                cyl[h][i].opacity = CGFloat(hand.visibility)
             }
 
             // Touch cursor: colour the index-tip sphere based on menu proximity

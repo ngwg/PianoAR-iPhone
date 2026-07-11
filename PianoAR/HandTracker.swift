@@ -7,17 +7,20 @@ import simd
 final class HandTracker: ObservableObject {
     @Published var detectedHandCount: Int = 0
 
+    /// Orientation to feed Vision so hands appear upright in the ML input.
+    /// Set on the main thread from the live interface orientation. The app is
+    /// locked to landscape, so only `.up` (landscapeRight) and `.down`
+    /// (landscapeLeft) ever occur. Wrong orientation degrades detection and —
+    /// worse — flips left/right chirality, so this must track the real mounting.
+    var imageOrientation: CGImagePropertyOrientation = .up
+
     struct HandResult {
-        /// Stable 0/1 spatial track ID. Vision result order and chirality may
-        /// change frame-to-frame; this ID does not.
-        let id: Int
         let isLeft: Bool
         var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>]
-        /// Joints reconstructed from anatomy/time or lacking direct LiDAR.
-        /// Rendering may use them, but press and gesture actions must not.
+        // Joints that were occluded and reconstructed (guessed) rather than
+        // directly detected. Used for the hand model + UI cursor, but press
+        // detection ignores these so a guessed fingertip can't fire a note.
         var estimated: Set<VNHumanHandPoseObservation.JointName> = []
-        var visibility: Float = 1
-        let sampleTime: TimeInterval
     }
 
     static let allJoints: [VNHumanHandPoseObservation.JointName] = [
@@ -25,8 +28,8 @@ final class HandTracker: ObservableObject {
         .thumbCMC, .thumbMP, .thumbIP, .thumbTip,
         .indexMCP, .indexPIP, .indexDIP, .indexTip,
         .middleMCP, .middlePIP, .middleDIP, .middleTip,
-        .ringMCP, .ringPIP, .ringDIP, .ringTip,
-        .littleMCP, .littlePIP, .littleDIP, .littleTip,
+        .ringMCP,  .ringPIP,  .ringDIP,  .ringTip,
+        .littleMCP,.littlePIP,.littleDIP,.littleTip,
     ]
 
     static let boneConnections: [(Int, Int)] = [
@@ -40,378 +43,328 @@ final class HandTracker: ObservableObject {
 
     static let isPalmBone: Set<Int> = [4, 8, 12, 16, 20, 21, 22]
 
-    // MARK: - Cross-thread state
-
     private var _hands: [HandResult] = []
-    private let resultLock = NSLock()
-
-    private let processingLock = NSLock()
+    private let lock         = NSLock()
     private var isProcessing = false
-    private var lastScheduledTime: TimeInterval = 0
-    private var _imageOrientation: CGImagePropertyOrientation = .up
+    // No frame-count gate — process as fast as Vision allows; isProcessing prevents queuing.
+    private let visionQueue  = DispatchQueue(label: "com.piano.vision", qos: .userInteractive)
+    private var smoothed:     [String: SIMD3<Float>]        = [:]
+    private var smoothedAge:  [String: TimeInterval]        = [:]
+    private var lastDepthByKey: [String: Float]             = [:]
+    // Per-hand canonical skeleton: each joint's position in the palm-local frame,
+    // learned whenever that joint is visible. Drives occlusion reconstruction.
+    private var localPose:    [String: [Int: SIMD3<Float>]] = [:]
+    private static let smoothedStaleTimeout: TimeInterval   = 0.5
 
-    /// Orientation to feed Vision so hands appear upright in its ML input.
-    /// This is read from both the render and Vision queues, so access is locked.
-    var imageOrientation: CGImagePropertyOrientation {
-        get {
-            processingLock.lock(); defer { processingLock.unlock() }
-            return _imageOrientation
-        }
-        set {
-            processingLock.lock(); _imageOrientation = newValue; processingLock.unlock()
-        }
-    }
-
-    private let visionQueue = DispatchQueue(label: "com.piano.vision",
-                                             qos: .userInteractive)
-    private let stabilizer = HandPoseStabilizer()
-
-    private lazy var handPoseRequest: VNDetectHumanHandPoseRequest = {
-        let request = VNDetectHumanHandPoseRequest()
-        request.maximumHandCount = 2
-        return request
-    }()
-
-    // Reusable downscale buffer, confined to visionQueue.
-    private var scaledBuf: CVPixelBuffer?
+    // Reusable downscale buffer — allocated once, reused every frame to avoid heap churn.
+    private var scaledBuf:  CVPixelBuffer?
     private var scaledSize: CGSize = .zero
+    // GPU-backed CIContext for fast rescaling. Only ever touched on visionQueue (serial).
     private lazy var ciCtx = CIContext(options: [
         .useSoftwareRenderer: false,
         .workingColorSpace: NSNull(),
     ])
 
-    private struct PixelJoint {
-        let px: Float
-        let py: Float
-        let visionConfidence: Float
-        let depth: DepthSample?
-    }
-
-    private struct DepthSample {
-        let depth: Float
-        let confidence: Float
-    }
-
     // MARK: - Public
 
     func maybeProcess(_ frame: ARFrame) {
-        let now = CACurrentMediaTime()
-        // Zero artificial throttle: process every frame Vision can keep up
-        // with (isProcessing already prevents queue buildup). Back off only
-        // under real thermal pressure.
-        let interval: TimeInterval
-        switch ProcessInfo.processInfo.thermalState {
-        case .serious:  interval = 1.0 / 20.0
-        case .critical: interval = 1.0 / 15.0
-        default:        interval = 0
-        }
-
-        processingLock.lock()
-        guard !isProcessing, now - lastScheduledTime >= interval else {
-            processingLock.unlock()
-            return
-        }
+        guard !isProcessing else { return }
         isProcessing = true
-        lastScheduledTime = now
-        let orientation = _imageOrientation
-        processingLock.unlock()
 
         let pixelBuffer = frame.capturedImage
-        let camera = frame.camera
-        // Raw depth first: smoothedSceneDepth is temporally filtered by ARKit
-        // and lags fast vertical finger motion — exactly what press detection
-        // and the hand model must not do.
-        let depthData = frame.sceneDepth ?? frame.smoothedSceneDepth
+        let camera      = frame.camera
+        let depthMap    = frame.smoothedSceneDepth?.depthMap ?? frame.sceneDepth?.depthMap
+        let orient      = imageOrientation
 
         visionQueue.async { [weak self] in
-            self?.run(pixelBuffer: pixelBuffer, camera: camera,
-                      depthData: depthData, orientation: orientation)
+            self?.run(pixelBuffer: pixelBuffer, camera: camera, depthMap: depthMap,
+                      orientation: orient)
         }
     }
 
     func snapshot() -> [HandResult] {
-        resultLock.lock(); defer { resultLock.unlock() }
+        lock.lock(); defer { lock.unlock() }
         return _hands
     }
 
     // MARK: - Vision + LiDAR
 
-    private func run(pixelBuffer: CVPixelBuffer,
-                     camera: ARCamera,
-                     depthData: ARDepthData?,
+    private func run(pixelBuffer: CVPixelBuffer, camera: ARCamera, depthMap: CVPixelBuffer?,
                      orientation: CGImagePropertyOrientation) {
-        defer {
-            processingLock.lock(); isProcessing = false; processingLock.unlock()
-        }
+        defer { isProcessing = false }
 
-        let now = CACurrentMediaTime()
+        // Downscale to ≤640 px on the long side before Vision.
+        // At 1920×1440 input that's ~3× linear = ~9× fewer pixels → dramatically faster ML.
+        // Vision's normalized [0,1] output is resolution-independent, so depth/3D math
+        // below still uses the original camera.imageResolution.
         let visionInput = downscaled(pixelBuffer, maxSide: 640)
-        let handler = VNImageRequestHandler(cvPixelBuffer: visionInput,
-                                            orientation: orientation,
-                                            options: [:])
 
-        do {
-            try handler.perform([handPoseRequest])
-        } catch {
-            publish(stabilizer.update(observations: [], at: now), detectedCount: 0)
-            return
-        }
+        let request = VNDetectHumanHandPoseRequest()
+        request.maximumHandCount = 2
+
+        let handler = VNImageRequestHandler(cvPixelBuffer: visionInput,
+                                            orientation: orientation, options: [:])
+        guard (try? handler.perform([request])) != nil,
+              let observations = request.results, !observations.isEmpty
+        else { commit([], count: 0); return }
 
         let imgW = Float(camera.imageResolution.width)
         let imgH = Float(camera.imageResolution.height)
-        var measurements: [HandPoseObservation] = []
+        var results: [HandResult] = []
 
-        for observation in handPoseRequest.results ?? [] {
-            var pixels: [Int: PixelJoint] = [:]
+        for obs in observations {
+            let side = obs.chirality == .left ? "L" : "R"
+            var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>] = [:]
 
-            for (index, name) in Self.allJoints.enumerated() {
-                guard let point = try? observation.recognizedPoint(name),
-                      point.confidence > 0.30 else { continue }
+            for name in HandTracker.allJoints {
+                guard let pt = try? obs.recognizedPoint(name),
+                      pt.confidence > 0.30 else { continue }
 
-                // Vision normalized (oriented, y-up) -> native captured-image
-                // pixel (y-down). Landscape .up/.down keep width and height.
-                let px: Float
-                let py: Float
+                // Vision normalized (oriented, y-up bottom-left) → native captured-image
+                // pixel (y-down top-left). The native buffer is landscape; only .up
+                // (landscapeRight) and .down (landscapeLeft) occur, and both keep the
+                // landscape dimensions, so width/height never swap.
+                let nx: Float, ny: Float
                 if orientation == .down {
-                    px = (1.0 - Float(point.location.x)) * imgW
-                    py = Float(point.location.y) * imgH
+                    nx = (1.0 - Float(pt.location.x)) * imgW
+                    ny =        Float(pt.location.y)  * imgH
                 } else {
-                    px = Float(point.location.x) * imgW
-                    py = (1.0 - Float(point.location.y)) * imgH
+                    nx =        Float(pt.location.x)  * imgW
+                    ny = (1.0 - Float(pt.location.y)) * imgH
                 }
 
-                pixels[index] = PixelJoint(
-                    px: px, py: py,
-                    visionConfidence: point.confidence,
-                    depth: depthData.flatMap {
-                        sampleDepth(from: $0, px: px, py: py,
-                                    imgW: imgW, imgH: imgH)
-                    }
-                )
+                let key    = "\(side)_\(name.rawValue)"
+                let now    = CACurrentMediaTime()
+                let recent = (smoothedAge[key].map { now - $0 < Self.smoothedStaleTimeout }) ?? false
+
+                // Nearest-biased LiDAR depth: a head-mounted camera looks DOWN at the
+                // keys, so the finger is always the closest surface along its pixel ray.
+                // A per-joint outlier clamp stops a single bad LiDAR reading (a depth-map
+                // hole that falls through to the background) from teleporting the joint.
+                var depth = depthMap.flatMap {
+                    sampleDepthNear(from: $0, px: nx, py: ny, imgW: imgW, imgH: imgH)
+                } ?? (lastDepthByKey[key] ?? 0.4)
+                if recent, let ld = lastDepthByKey[key] {
+                    depth = simd_clamp(depth, ld - 0.05, ld + 0.05)
+                }
+                lastDepthByKey[key] = depth
+
+                let world = cameraPixelToWorld(px: nx, py: ny, depth: depth, camera: camera)
+
+                // Adaptive EMA: fast-follow when the hand moves, heavy-smooth when still.
+                // Eliminates lag on fast gestures while suppressing jitter at rest.
+                let s: SIMD3<Float>
+                if recent, let prev = smoothed[key] {
+                    let dist  = simd_length(world - prev)
+                    // Heavier floor than before (α 0.10 vs 0.20): sub-5 mm/frame
+                    // deltas are almost entirely sensor noise, so smooth them
+                    // hard; real motion still ramps to α 0.9 by ~4.5 cm/frame.
+                    let alpha = simd_clamp(dist / 0.05, 0.10, 0.90)
+                    s = prev + alpha * (world - prev)
+                } else {
+                    // Stale or first appearance — jump directly to avoid "snap" from old position.
+                    s = world
+                }
+                smoothed[key]    = s
+                smoothedAge[key] = now
+                joints[name]     = s
             }
 
-            guard !pixels.isEmpty else { continue }
-
-            // A LiDAR hole at one landmark borrows the same hand's median depth
-            // instead of jumping to an arbitrary 0.4m. It remains estimated.
-            let depths = pixels.values.compactMap { $0.depth?.depth }.sorted()
-            let fallbackDepth = depths.isEmpty ? 0.45 : depths[depths.count / 2]
-            var joints: [Int: HandJointObservation] = [:]
-
-            for (index, pixel) in pixels {
-                let depth = pixel.depth?.depth ?? fallbackDepth
-                let depthConfidence = pixel.depth?.confidence ?? (depths.isEmpty ? 0.25 : 0.48)
-                let world = cameraPixelToWorld(px: pixel.px, py: pixel.py,
-                                               depth: depth, camera: camera)
-                joints[index] = HandJointObservation(
-                    position: world,
-                    confidence: pixel.visionConfidence * depthConfidence,
-                    isDepthMeasured: pixel.depth != nil
-                )
+            if !joints.isEmpty {
+                let estimated = completeHand(side: side, joints: &joints)
+                results.append(HandResult(isLeft: obs.chirality == .left,
+                                          joints: joints, estimated: estimated))
             }
-
-            measurements.append(HandPoseObservation(
-                isLeft: observation.chirality == .left,
-                joints: joints
-            ))
         }
 
-        measurements = deduplicated(measurements)
-        let stabilized = stabilizer.update(observations: measurements, at: now)
-        publish(stabilized, detectedCount: measurements.count)
+        // Chirality-flap dedupe: with one physical hand in frame, Vision
+        // sometimes reports it TWICE (as left and right on top of each other),
+        // which drew two skeletons on one hand. Two opposite-handed detections
+        // whose centroids are within ~11 cm are the same hand — keep the one
+        // with more genuinely-detected joints.
+        if results.count == 2, results[0].isLeft != results[1].isLeft,
+           simd_length(Self.centroid(results[0]) - Self.centroid(results[1])) < 0.11 {
+            let q0 = results[0].joints.count - results[0].estimated.count
+            let q1 = results[1].joints.count - results[1].estimated.count
+            results = [q0 >= q1 ? results[0] : results[1]]
+        }
+
+        commit(results, count: observations.count)
     }
 
-    /// Removes only true stacked duplicate observations. The old centroid-only
-    /// 11cm rule could merge two real piano hands; this requires opposite
-    /// chirality plus at least five corresponding joints nearly on top of one
-    /// another.
-    private func deduplicated(_ hands: [HandPoseObservation]) -> [HandPoseObservation] {
-        guard hands.count == 2, hands[0].isLeft != hands[1].isLeft,
-              simd_length(hands[0].centroid - hands[1].centroid) < 0.030 else {
-            return hands
-        }
-
-        let common = Set(hands[0].joints.keys).intersection(hands[1].joints.keys)
-        guard common.count >= 5 else { return hands }
-        let meanDistance = common.reduce(Float(0)) { total, index in
-            guard let a = hands[0].joints[index]?.position,
-                  let b = hands[1].joints[index]?.position else { return total }
-            return total + simd_length(a - b)
-        } / Float(common.count)
-        guard meanDistance < 0.015 else { return hands }
-
-        func quality(_ hand: HandPoseObservation) -> Float {
-            hand.joints.values.reduce(Float(0)) { total, joint in
-                total + joint.confidence + (joint.isDepthMeasured ? 0.20 : 0)
-            }
-        }
-        return [quality(hands[0]) >= quality(hands[1]) ? hands[0] : hands[1]]
+    private static func centroid(_ h: HandResult) -> SIMD3<Float> {
+        var s = SIMD3<Float>(repeating: 0)
+        for (_, p) in h.joints { s += p }
+        return h.joints.isEmpty ? s : s / Float(h.joints.count)
     }
 
-    private func publish(_ poses: [StabilizedHandPose], detectedCount: Int) {
-        let hands = poses.map { pose -> HandResult in
-            var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>] = [:]
-            var estimated = Set<VNHumanHandPoseObservation.JointName>()
+    // MARK: - Occlusion reconstruction
 
-            for (index, position) in pose.joints
-            where Self.allJoints.indices.contains(index) {
-                joints[Self.allJoints[index]] = position
-            }
-            for index in pose.estimated where Self.allJoints.indices.contains(index) {
-                estimated.insert(Self.allJoints[index])
-            }
+    /// Fills in joints Vision couldn't see this frame, using a palm-local model of
+    /// the hand learned from frames where they *were* visible. The palm (wrist +
+    /// knuckles) is close to rigid, so a joint's position relative to a palm frame
+    /// is stable; transforming that learned local position into the current palm
+    /// orientation gives a natural guess for an occluded finger that still rotates
+    /// correctly as the hand turns. Returns the set of joints that were guessed.
+    @discardableResult
+    private func completeHand(side: String,
+                              joints: inout [VNHumanHandPoseObservation.JointName: SIMD3<Float>])
+        -> Set<VNHumanHandPoseObservation.JointName> {
 
-            return HandResult(id: pose.trackID, isLeft: pose.isLeft,
-                              joints: joints, estimated: estimated,
-                              visibility: pose.visibility,
-                              sampleTime: pose.sampleTime)
+        var pos: [Int: SIMD3<Float>] = [:]
+        for (i, name) in HandTracker.allJoints.enumerated() {
+            if let p = joints[name] { pos[i] = p }
+        }
+        let detected = Set(pos.keys)
+
+        guard let frame = palmFrame(pos) else { return [] }
+        let rInv = frame.r.transpose   // orthonormal → inverse is transpose
+
+        // Learn / refresh local coords for every visible joint.
+        var store = localPose[side] ?? [:]
+        for (i, p) in pos { store[i] = rInv * (p - frame.origin) }
+        localPose[side] = store
+
+        var estimated = Set<VNHumanHandPoseObservation.JointName>()
+
+        // Reconstruct any joint we have a learned pose for but didn't see this frame.
+        for i in 0..<HandTracker.allJoints.count where !detected.contains(i) {
+            guard let local = store[i] else { continue }
+            let world = frame.origin + frame.r * local
+            pos[i] = world
+            joints[HandTracker.allJoints[i]] = world
+            estimated.insert(HandTracker.allJoints[i])
         }
 
-        resultLock.lock(); _hands = hands; resultLock.unlock()
-        DispatchQueue.main.async { [weak self] in
-            self?.detectedHandCount = detectedCount
+        // Fingertip refinement: when a tip is occluded but its two parent joints are
+        // *actually* detected, extrapolate along the live finger so the tip follows
+        // the current curl instead of the stale palm-relative guess.
+        for tip in [4, 8, 12, 16, 20] where !detected.contains(tip) {
+            guard detected.contains(tip - 1), detected.contains(tip - 2),
+                  let a = pos[tip - 1], let b = pos[tip - 2] else { continue }
+            let world = a + (a - b) * 0.7
+            pos[tip] = world
+            joints[HandTracker.allJoints[tip]] = world
+            estimated.insert(HandTracker.allJoints[tip])
         }
+
+        return estimated
     }
 
-    // MARK: - Confidence-aware LiDAR sampling
+    /// Builds an orthonormal palm frame (origin at the wrist) from whatever palm
+    /// joints are visible. Needs the wrist + at least two knuckles.
+    private func palmFrame(_ pos: [Int: SIMD3<Float>])
+        -> (origin: SIMD3<Float>, r: simd_float3x3)? {
 
-    /// Samples a 5x5 neighborhood, rejects low-confidence LiDAR pixels, and
-    /// selects the nearest *dense* depth cluster rather than a single minimum.
-    /// This keeps the finger (normally the nearest surface) while rejecting
-    /// isolated near speckles.
-    private func sampleDepth(from data: ARDepthData,
-                             px: Float, py: Float,
-                             imgW: Float, imgH: Float) -> DepthSample? {
-        let depthMap = data.depthMap
-        let confidenceMap = data.confidenceMap
-        let depthWidth = CVPixelBufferGetWidth(depthMap)
-        let depthHeight = CVPixelBufferGetHeight(depthMap)
-        let centerX = Int((px / imgW * Float(depthWidth)).rounded())
-        let centerY = Int((py / imgH * Float(depthHeight)).rounded())
-        let depthStride = CVPixelBufferGetBytesPerRow(depthMap) / MemoryLayout<Float32>.size
+        guard let wrist = pos[0] else { return nil }
+        let mcps = [pos[5], pos[9], pos[13], pos[17]].compactMap { $0 }
+        guard mcps.count >= 2 else { return nil }
 
-        CVPixelBufferLockBaseAddress(depthMap, .readOnly)
-        if let confidenceMap {
-            CVPixelBufferLockBaseAddress(confidenceMap, .readOnly)
+        let centroid = mcps.reduce(SIMD3<Float>(repeating: 0), +) / Float(mcps.count)
+        var forward  = centroid - wrist
+        guard simd_length(forward) > 1e-4 else { return nil }
+        forward = simd_normalize(forward)
+
+        // "Across" the palm: index knuckle → little knuckle if both present.
+        let across0 = (pos[5] != nil && pos[17] != nil)
+            ? pos[17]! - pos[5]!
+            : mcps.last! - mcps.first!
+        var across = across0 - forward * simd_dot(across0, forward)   // orthogonalize
+        guard simd_length(across) > 1e-4 else { return nil }
+        across = simd_normalize(across)
+
+        let up      = simd_normalize(simd_cross(forward, across))     // palm normal
+        let across2 = simd_cross(up, forward)                          // re-orthonormalize
+        return (wrist, simd_float3x3(columns: (across2, up, forward)))
+    }
+
+    // MARK: - Downscaling
+
+    private func downscaled(_ src: CVPixelBuffer, maxSide: Int) -> CVPixelBuffer {
+        let w = CVPixelBufferGetWidth(src)
+        let h = CVPixelBufferGetHeight(src)
+        guard max(w, h) > maxSide else { return src }
+
+        let scale = CGFloat(maxSide) / CGFloat(max(w, h))
+        let dw    = max(1, Int(CGFloat(w) * scale))
+        let dh    = max(1, Int(CGFloat(h) * scale))
+        let sz    = CGSize(width: dw, height: dh)
+
+        if scaledBuf == nil || scaledSize != sz {
+            let attrs: [CFString: Any] = [
+                kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any],
+                kCVPixelBufferMetalCompatibilityKey:  true,
+            ]
+            scaledBuf  = nil
+            CVPixelBufferCreate(kCFAllocatorDefault, dw, dh,
+                                kCVPixelFormatType_32BGRA,
+                                attrs as CFDictionary, &scaledBuf)
+            scaledSize = sz
         }
-        defer {
-            if let confidenceMap {
-                CVPixelBufferUnlockBaseAddress(confidenceMap, .readOnly)
-            }
-            CVPixelBufferUnlockBaseAddress(depthMap, .readOnly)
-        }
+        guard let dst = scaledBuf else { return src }
 
-        guard let depthBase = CVPixelBufferGetBaseAddress(depthMap) else { return nil }
-        let depthValues = depthBase.assumingMemoryBound(to: Float32.self)
+        let ci     = CIImage(cvPixelBuffer: src)
+        let scaled = ci.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        ciCtx.render(scaled, to: dst,
+                     bounds: CGRect(origin: .zero, size: sz),
+                     colorSpace: nil)
+        return dst
+    }
 
-        let confidenceWidth = confidenceMap.map { CVPixelBufferGetWidth($0) } ?? 0
-        let confidenceHeight = confidenceMap.map { CVPixelBufferGetHeight($0) } ?? 0
-        let confidenceStride = confidenceMap.map { CVPixelBufferGetBytesPerRow($0) } ?? 0
-        let confidenceValues: UnsafeMutablePointer<UInt8>? = {
-            guard let confidenceMap,
-                  let base = CVPixelBufferGetBaseAddress(confidenceMap) else { return nil }
-            return base.assumingMemoryBound(to: UInt8.self)
-        }()
+    // MARK: - Helpers
 
-        var samples: [DepthSample] = []
+    /// Sample LiDAR depth over a 5×5 neighbourhood and return a *near-biased* reading.
+    ///
+    /// A 3×3 median blends the finger with the key/desk a centimetre behind it, so a
+    /// hovering fingertip reads too far and its world Z drifts toward the surface —
+    /// exactly the jitter that wrecks both the hand model and press detection. Since
+    /// the head-mounted camera looks down at the keys, the finger is the nearest
+    /// surface along its ray, so we bias toward the near end. We take the 2nd-smallest
+    /// valid sample rather than the absolute minimum, which rejects a single spurious
+    /// near pixel while staying firmly on the finger. The wider 5×5 window tolerates a
+    /// pixel or two of joint-localization error.
+    private func sampleDepthNear(from map: CVPixelBuffer,
+                                 px: Float, py: Float,
+                                 imgW: Float, imgH: Float) -> Float? {
+        let dW     = CVPixelBufferGetWidth(map)
+        let dH     = CVPixelBufferGetHeight(map)
+        let cxD    = Int((px / imgW * Float(dW)).rounded())
+        let cyD    = Int((py / imgH * Float(dH)).rounded())
+        let stride = CVPixelBufferGetBytesPerRow(map) / 4
+
+        CVPixelBufferLockBaseAddress(map, .readOnly)
+        defer { CVPixelBufferUnlockBaseAddress(map, .readOnly) }
+        guard let base = CVPixelBufferGetBaseAddress(map) else { return nil }
+        let data = base.assumingMemoryBound(to: Float32.self)
+
+        var samples: [Float] = []
         samples.reserveCapacity(25)
-
         for dy in -2...2 {
             for dx in -2...2 {
-                let column = max(0, min(depthWidth - 1, centerX + dx))
-                let row = max(0, min(depthHeight - 1, centerY + dy))
-                let value = depthValues[row * depthStride + column]
-                guard value > 0.05, value < 5.0, value.isFinite else { continue }
-
-                let confidence: Float
-                if let confidenceValues, confidenceWidth > 0, confidenceHeight > 0 {
-                    let confidenceColumn = min(confidenceWidth - 1,
-                        max(0, column * confidenceWidth / max(1, depthWidth)))
-                    let confidenceRow = min(confidenceHeight - 1,
-                        max(0, row * confidenceHeight / max(1, depthHeight)))
-                    let level = confidenceValues[confidenceRow * confidenceStride
-                                                 + confidenceColumn]
-                    guard level >= 1 else { continue }
-                    confidence = level >= 2 ? 1.0 : 0.72
-                } else {
-                    confidence = 0.68
-                }
-                samples.append(DepthSample(depth: value, confidence: confidence))
+                let col = max(0, min(dW - 1, cxD + dx))
+                let row = max(0, min(dH - 1, cyD + dy))
+                let v   = data[row * stride + col]
+                if v > 0.05 && v < 5.0 && v.isFinite { samples.append(v) }
             }
         }
-
         guard !samples.isEmpty else { return nil }
-        let sorted = samples.sorted { $0.depth < $1.depth }
-
-        // Find the nearest cluster with at least two corroborating pixels in a
-        // 12mm band. If there is none, use the overall median rather than a
-        // lone near outlier.
-        for start in sorted.indices {
-            let cluster = sorted[start...].prefix {
-                $0.depth - sorted[start].depth <= 0.012
-            }
-            if cluster.count >= 2 {
-                let values = Array(cluster)
-                let middle = values[values.count / 2]
-                let averageConfidence = values.reduce(Float(0)) { $0 + $1.confidence }
-                    / Float(values.count)
-                return DepthSample(depth: middle.depth,
-                                   confidence: averageConfidence)
-            }
-        }
-        return sorted[sorted.count / 2]
+        let sorted = samples.sorted()
+        return sorted[min(1, sorted.count - 1)]   // 2nd-nearest: near-biased, noise-robust
     }
 
-    // MARK: - Image and camera helpers
-
-    private func downscaled(_ source: CVPixelBuffer,
-                            maxSide: Int) -> CVPixelBuffer {
-        let width = CVPixelBufferGetWidth(source)
-        let height = CVPixelBufferGetHeight(source)
-        guard max(width, height) > maxSide else { return source }
-
-        let scale = CGFloat(maxSide) / CGFloat(max(width, height))
-        let targetWidth = max(1, Int(CGFloat(width) * scale))
-        let targetHeight = max(1, Int(CGFloat(height) * scale))
-        let size = CGSize(width: targetWidth, height: targetHeight)
-
-        if scaledBuf == nil || scaledSize != size {
-            let attributes: [CFString: Any] = [
-                kCVPixelBufferIOSurfacePropertiesKey: [:] as [CFString: Any],
-                kCVPixelBufferMetalCompatibilityKey: true,
-            ]
-            scaledBuf = nil
-            CVPixelBufferCreate(kCFAllocatorDefault,
-                                targetWidth, targetHeight,
-                                kCVPixelFormatType_32BGRA,
-                                attributes as CFDictionary,
-                                &scaledBuf)
-            scaledSize = size
-        }
-        guard let destination = scaledBuf else { return source }
-
-        let image = CIImage(cvPixelBuffer: source)
-        let scaled = image.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        ciCtx.render(scaled, to: destination,
-                     bounds: CGRect(origin: .zero, size: size),
-                     colorSpace: nil)
-        return destination
-    }
-
-    // ARKit camera looks along -Z. Captured image is x-right, y-down.
+    // ARKit camera: right-hand coords, looks along -Z, Y up. Image: x-right, y-down.
     private func cameraPixelToWorld(px: Float, py: Float,
-                                    depth: Float,
-                                    camera: ARCamera) -> SIMD3<Float> {
-        let fx = camera.intrinsics[0][0]
-        let fy = camera.intrinsics[1][1]
-        let cx = camera.intrinsics[2][0]
-        let cy = camera.intrinsics[2][1]
-        let world = camera.transform * SIMD4<Float>(
-            (px - cx) / fx * depth,
-            -(py - cy) / fy * depth,
-            -depth,
-            1
-        )
-        return SIMD3<Float>(world.x, world.y, world.z)
+                                     depth: Float, camera: ARCamera) -> SIMD3<Float> {
+        let fx = camera.intrinsics[0][0];  let fy = camera.intrinsics[1][1]
+        let cx = camera.intrinsics[2][0];  let cy = camera.intrinsics[2][1]
+        let w  = camera.transform * SIMD4<Float>( (px-cx)/fx*depth,
+                                                 -(py-cy)/fy*depth,
+                                                  -depth, 1)
+        return SIMD3<Float>(w.x, w.y, w.z)
+    }
+
+    private func commit(_ hands: [HandResult], count: Int) {
+        lock.lock(); _hands = hands; lock.unlock()
+        DispatchQueue.main.async { self.detectedHandCount = count }
     }
 }
