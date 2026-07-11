@@ -48,6 +48,9 @@ final class PressDetector: ObservableObject {
     private let debounceInterval:   TimeInterval = 0.18
     private let keyLockoutInterval: TimeInterval = 0.24
     private let flashRetain:        TimeInterval = 2.0
+    // Keep a trajectory through one or two estimated/missing Vision samples,
+    // but never append or fire from those samples.
+    private let occlusionTrackGrace: TimeInterval = 0.12
 
     // ── Guided (audio-primary) ────────────────────────────────────────────
     private let guidedAttackWindow:  TimeInterval = 0.22
@@ -73,6 +76,8 @@ final class PressDetector: ObservableObject {
         var lastPressTime:  TimeInterval = 0
         var lastKeyIndex:   Int? = nil
         var lastValleyTime: TimeInterval = -999
+        var lastDirectTime: TimeInterval = -999
+        var lastSampleTime: TimeInterval = -999
     }
     private struct FingertipLocal {
         let fingerID: String
@@ -115,13 +120,12 @@ final class PressDetector: ObservableObject {
             for hand in hands {
                 let side = hand.isLeft ? "L" : "R"
                 for (joint, fingerName) in Self.tips {
-                    let fid = "\(side)_\(fingerName)"
+                    let fid = "H\(hand.id)_\(fingerName)"
                     guard let wp = hand.joints[joint] else { continue }
 
                     // Occlusion-reconstructed (guessed) fingertips must never fire —
                     // there's no real observation behind them.
                     if hand.estimated.contains(joint) {
-                        fingers[fid] = FingerTrack()
                         continue
                     }
                     seen.insert(fid)
@@ -131,12 +135,14 @@ final class PressDetector: ObservableObject {
 
                     // Dedupe: HandTracker's snapshot repeats between Vision updates
                     // (Vision is throttled well below the 60fps render loop) — only
-                    // grow the regression buffer on genuinely new samples so the fit
-                    // isn't biased toward "flat" by repeated identical values.
-                    let isNew = track.samples.last.map { abs($0.y - lp.y) > 0.00002 } ?? true
+                    // grow the regression buffer once per stabilized Vision sample so
+                    // the fit isn't biased toward "flat" by 60Hz snapshot repeats.
+                    track.lastDirectTime = time
+                    let isNew = track.lastSampleTime != hand.sampleTime
                     if isNew {
-                        track.samples.append((lp.y, time))
+                        track.samples.append((lp.y, hand.sampleTime))
                         if track.samples.count > historySize { track.samples.removeFirst() }
+                        track.lastSampleTime = hand.sampleTime
                     }
 
                     let vel = regressionSlope(track.samples)
@@ -194,12 +200,17 @@ final class PressDetector: ObservableObject {
                     }
 
                     fingers[fid] = track
-                    debugLines.append(String(format: "%@ dip%+.0fmm v%+.2f %@ [%@]",
-                                            fid, dip * 1000, vel, track.phase.rawValue,
+                    debugLines.append(String(format: "%@(%@) dip%+.0fmm v%+.2f %@ [%@]",
+                                            fid, side, dip * 1000, vel, track.phase.rawValue,
                                             key?.noteName ?? "-"))
                 }
             }
-            for fid in fingers.keys where !seen.contains(fid) { fingers[fid] = FingerTrack() }
+            let missing = fingers.keys.filter { !seen.contains($0) }
+            for fid in missing {
+                guard let track = fingers[fid],
+                      time - track.lastDirectTime > occlusionTrackGrace else { continue }
+                fingers[fid] = FingerTrack()
+            }
         }
 
         let guided = !expectedKeyIndices.isEmpty
@@ -323,12 +334,12 @@ final class PressDetector: ObservableObject {
         var out: [FingertipLocal] = []
         let leftEdge = -KeyboardLayout.totalWidth / 2
         for hand in hands {
-            let side = hand.isLeft ? "L" : "R"
             for (joint, name) in Self.tips {
-                guard let wp = hand.joints[joint] else { continue }
+                guard !hand.estimated.contains(joint),
+                      let wp = hand.joints[joint] else { continue }
                 let lp = kb.simdConvertPosition(wp, from: nil)
                 out.append(FingertipLocal(
-                    fingerID: "\(side)_\(name)",
+                    fingerID: "H\(hand.id)_\(name)",
                     localX:   lp.x - leftEdge,
                     localY:   lp.y,
                     localZ:   lp.z
@@ -344,7 +355,8 @@ final class PressDetector: ObservableObject {
         let halfZ = KeyboardLayout.whiteKeyDepth * 0.5 + kbAreaZExtra
         for hand in hands {
             for (joint, _) in Self.tips {
-                guard let wp = hand.joints[joint] else { continue }
+                guard !hand.estimated.contains(joint),
+                      let wp = hand.joints[joint] else { continue }
                 let lp = kb.simdConvertPosition(wp, from: nil)
                 if lp.y > kbAreaYMin && lp.y < kbAreaYMax
                     && abs(lp.x) < halfW && abs(lp.z) < halfZ {

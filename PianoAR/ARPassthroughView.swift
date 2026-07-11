@@ -348,6 +348,10 @@ private final class Hand3DOverlay {
     // Nodes: [hand 0=left, 1=right][joint/bone index]
     private var sph:    [[SCNNode]] = []
     private var cyl:    [[SCNNode]] = []
+    // Render-rate presentation positions. Vision updates at 10-20Hz depending
+    // on thermals; easing toward each new tracked target at 60Hz removes the
+    // visible staircase without feeding delayed points back into detection.
+    private var displayPositions: [[SIMD3<Float>?]] = []
     // Separate tracked index-tip sphere materials for cursor glow changes
     private var idxTipMat: [SCNMaterial] = []
 
@@ -396,6 +400,8 @@ private final class Hand3DOverlay {
 
             sph.append(sNodes)
             cyl.append(cNodes)
+            displayPositions.append(Array(repeating: nil,
+                                          count: HandTracker.allJoints.count))
             idxTipMat.append(idxMat ?? Self.makeMat(skin: true, isTip: true))
         }
     }
@@ -408,21 +414,38 @@ private final class Hand3DOverlay {
                 keyboardNode: SCNNode?) {
         sph.forEach { $0.forEach { $0.isHidden = true } }
         cyl.forEach { $0.forEach { $0.isHidden = true } }
+        var activeTracks = Set<Int>()
 
         for hand in hands {
-            let h = hand.isLeft ? 0 : 1
-            guard h < sph.count else { continue }
+            let h = hand.id
+            guard sph.indices.contains(h) else { continue }
+            activeTracks.insert(h)
 
             for (i, name) in HandTracker.allJoints.enumerated() {
-                guard let p = hand.joints[name] else { continue }
-                sph[h][i].simdPosition = p
+                guard let target = hand.joints[name] else {
+                    displayPositions[h][i] = nil
+                    continue
+                }
+                let presented: SIMD3<Float>
+                if let previous = displayPositions[h][i],
+                   simd_length(target - previous) < 0.12 {
+                    let blend: Float = hand.estimated.contains(name) ? 0.38 : 0.58
+                    presented = previous + (target - previous) * blend
+                } else {
+                    presented = target
+                }
+                displayPositions[h][i] = presented
+                sph[h][i].simdPosition = presented
+                sph[h][i].opacity = CGFloat(hand.visibility)
                 sph[h][i].isHidden     = false
             }
 
             for (i, (fi, ti)) in HandTracker.boneConnections.enumerated() {
-                guard let a = hand.joints[HandTracker.allJoints[fi]],
-                      let b = hand.joints[HandTracker.allJoints[ti]] else { continue }
+                guard !sph[h][fi].isHidden, !sph[h][ti].isHidden else { continue }
+                let a = sph[h][fi].simdPosition
+                let b = sph[h][ti].simdPosition
                 placeCylinder(cyl[h][i], from: a, to: b)
+                cyl[h][i].opacity = CGFloat(hand.visibility)
             }
 
             // Touch cursor: colour the index-tip sphere based on menu proximity
@@ -445,6 +468,11 @@ private final class Hand3DOverlay {
                 }
                 idxTipMat[h].emission.contents = cursorColor
             }
+        }
+
+        for h in displayPositions.indices where !activeTracks.contains(h) {
+            displayPositions[h] = Array(repeating: nil,
+                                        count: HandTracker.allJoints.count)
         }
     }
 

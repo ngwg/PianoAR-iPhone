@@ -21,6 +21,9 @@ targets:
   PianoAR:
     type: application
     platform: iOS
+    scheme:
+      testTargets:
+        - PianoARTests
     sources:
       - path: PianoAR
     info:
@@ -44,3 +47,15 @@ targets:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.copakerzyr.pianoar
         ENABLE_PREVIEWS: YES
+
+  PianoARTests:
+    type: bundle.unit-test
+    platform: iOS
+    sources:
+      - path: PianoARTests
+    dependencies:
+      - target: PianoAR
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.copakerzyr.pianoar.tests
+        GENERATE_INFOPLIST_FILE: YES
