@@ -357,16 +357,31 @@ final class NoteHighway {
 
         // ── Key highlights ──
         highlights.forEach { $0?.isHidden = true }
-        for note in player.notes {
-            let delta = Float(note.startBeat) - beat
-            let end   = Float(note.startBeat + note.durationBeats) - beat
-            guard delta <= 0.35 && end > -0.10 else { continue }
-            guard let key = midiToKey[note.midiNote ?? -1],
-                  key.index < 88,
-                  let hl  = highlights[key.index]
-            else { continue }
-            hl.geometry?.materials = [note.isLeft ? Self.matHighlightLeft : Self.matHighlightRight]
-            hl.isHidden = false
+        let expectedNow = player.expectedGroupDisplay()
+        if !expectedNow.isEmpty {
+            // Guided mode: light EXACTLY the keys to press right now (minus
+            // chord members already accepted). The old time-window rule kept
+            // long previous notes lit — chord songs hold 2-6 beat left-hand
+            // notes, so already-played keys glowed alongside the next ones
+            // and it was impossible to tell what to press.
+            for (keyIndex, isLeft) in expectedNow {
+                guard keyIndex >= 0, keyIndex < 88, let hl = highlights[keyIndex] else { continue }
+                hl.geometry?.materials = [isLeft ? Self.matHighlightLeft : Self.matHighlightRight]
+                hl.isHidden = false
+            }
+        } else {
+            // Free-play fallback: time-window highlighting.
+            for note in player.notes {
+                let delta = Float(note.startBeat) - beat
+                let end   = Float(note.startBeat + note.durationBeats) - beat
+                guard delta <= 0.35 && end > -0.10 else { continue }
+                guard let key = midiToKey[note.midiNote ?? -1],
+                      key.index < 88,
+                      let hl  = highlights[key.index]
+                else { continue }
+                hl.geometry?.materials = [note.isLeft ? Self.matHighlightLeft : Self.matHighlightRight]
+                hl.isHidden = false
+            }
         }
 
         // ── Press-detection flashes ──

@@ -93,6 +93,17 @@ final class SongPlayer: ObservableObject {
         expectedKeyIndicesNow().sorted().first
     }
 
+    /// What should be pressed RIGHT NOW (guided mode), minus chord members
+    /// already accepted — with per-note hand for highlight colouring. Called
+    /// from the render thread by NoteHighway.
+    func expectedGroupDisplay() -> [(keyIndex: Int, isLeft: Bool)] {
+        guard guidedMode, isPlaying, expectedIndex < notes.count else { return [] }
+        return currentExpectedGroup().compactMap { item in
+            guard let k = item.keyIndex, !acceptedGroupKeyIndices.contains(k) else { return nil }
+            return (k, item.note.isLeft)
+        }
+    }
+
     func registerPress(keyIndex: Int, noteName: String) -> PracticePressResult {
         guard isPlaying else { return .ignored }
         guard guidedMode else {

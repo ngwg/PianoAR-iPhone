@@ -50,8 +50,11 @@ final class PressDetector: ObservableObject {
     private let flashRetain:        TimeInterval = 2.0
 
     // ── Guided (audio-primary) ────────────────────────────────────────────
-    private let guidedAttackWindow:  TimeInterval = 0.22
-    private let guidedMinAttackConf: Float = 0.28
+    // Slightly wider/looser than before: soft presses were being missed, and
+    // the vision-valley fallback + hard hand-presence gate now carry the
+    // false-positive protection instead of a high onset bar.
+    private let guidedAttackWindow:  TimeInterval = 0.28
+    private let guidedMinAttackConf: Float = 0.24
     private let pitchSemitoneWindow: Int   = 3
     private let kbAreaYMin:          Float = -0.06
     private let kbAreaYMax:          Float =  0.10
@@ -203,7 +206,7 @@ final class PressDetector: ObservableObject {
         }
 
         let guided = !expectedKeyIndices.isEmpty
-        let finalPresses: [PressEvent]
+        var finalPresses: [PressEvent]
 
         if guided, let kb = keyboardNode {
             let recentValley = fingers.values.contains { time - $0.lastValleyTime < visionCorroborateWindow }
@@ -213,6 +216,28 @@ final class PressDetector: ObservableObject {
                 snapshot: audioSnapshot, time: time,
                 recentValley: recentValley
             )
+
+            // Vision fallback for MISSED audio: a genuine press-shaped valley
+            // whose resolved key is on (or right next to — vision X is good to
+            // about one key) an expected key counts even when the mic missed
+            // the onset (soft press, noisy room, quilted upright, …).
+            if finalPresses.isEmpty, !visionCandidates.isEmpty {
+                var used = Set<Int>()
+                finalPresses = visionCandidates.compactMap { cand in
+                    guard let nearest = expectedKeyIndices
+                            .filter({ !used.contains($0) })
+                            .min(by: { abs($0 - cand.keyIndex) < abs($1 - cand.keyIndex) }),
+                          abs(nearest - cand.keyIndex) <= 2 else { return nil }
+                    used.insert(nearest)
+                    lastKeyPressTime[nearest] = time
+                    return PressEvent(keyIndex: nearest,
+                                      noteName: KeyboardLayout.keys[nearest].noteName,
+                                      confidence: min(1.0, cand.confidence * 0.85),
+                                      fingerID: cand.fingerID,
+                                      timestamp: time)
+                }
+            }
+
             if let atk = audioSnapshot?.attack {
                 debugLines.append(String(format: "onset conf %.2f score %.2f", atk.confidence, atk.onsetScore))
             }
@@ -281,14 +306,20 @@ final class PressDetector: ObservableObject {
               attack.timestamp > lastGuidedAttackTime
         else { return [] }
 
+        // HARD gate: a sound with no hand at the keyboard is never a press.
+        // Previously presence was only a confidence bonus, so any loud-enough
+        // noise (talking, a bump, TV) fired the expected key by itself —
+        // the "detects random keys without me pressing" failure mode.
         let fingerPresent = recentValley || anyFingerInKeyboardArea(hands: hands, keyboardNode: kb)
+        guard fingerPresent else { return [] }
+
         let pitchScore = bestPitchScore(expectedKeyIndices: expectedKeyIndices, snapshot: snap)
 
-        // Confidence: onset (0…0.50) + pitch (0…0.30) + presence (0…0.20, more
-        // if a real vision valley corroborated it, less for loose presence only)
-        var confidence  = attack.confidence * 0.50
+        // Confidence: onset (0…0.45) + pitch (0…0.30) + vision valley (0.25
+        // when a press-shaped finger dip corroborates, 0.10 for presence only)
+        var confidence  = attack.confidence * 0.45
         confidence     += pitchScore * 0.30
-        confidence     += recentValley ? 0.20 : (fingerPresent ? 0.10 : 0.0)
+        confidence     += recentValley ? 0.25 : 0.10
 
         let pitchContradict = !snap.activeNotes.isEmpty && pitchScore < 0.07
         guard confidence >= 0.30, !pitchContradict else { return [] }
