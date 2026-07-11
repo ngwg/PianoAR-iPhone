@@ -426,11 +426,15 @@ private final class Hand3DOverlay {
                     displayPositions[h][i] = nil
                     continue
                 }
+                // Directly-tracked joints render exactly where the tracker put
+                // them — the stabilizer already smooths, and easing again here
+                // stacked a second lag on top ("there is a delay"). Only
+                // reconstructed joints keep light easing to hide their jumps.
                 let presented: SIMD3<Float>
-                if let previous = displayPositions[h][i],
+                if hand.estimated.contains(name),
+                   let previous = displayPositions[h][i],
                    simd_length(target - previous) < 0.12 {
-                    let blend: Float = hand.estimated.contains(name) ? 0.38 : 0.58
-                    presented = previous + (target - previous) * blend
+                    presented = previous + (target - previous) * 0.55
                 } else {
                     presented = target
                 }

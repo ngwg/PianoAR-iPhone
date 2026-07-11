@@ -96,11 +96,14 @@ final class HandTracker: ObservableObject {
 
     func maybeProcess(_ frame: ARFrame) {
         let now = CACurrentMediaTime()
+        // Latency matters more than thermal headroom here — 20Hz sampling was
+        // immediately felt as input lag. Run at full Vision rate normally and
+        // only back off under real thermal pressure.
         let interval: TimeInterval
         switch ProcessInfo.processInfo.thermalState {
-        case .serious:  interval = 1.0 / 15.0
-        case .critical: interval = 1.0 / 10.0
-        default:        interval = 1.0 / 20.0
+        case .serious:  interval = 1.0 / 20.0
+        case .critical: interval = 1.0 / 15.0
+        default:        interval = 1.0 / 30.0
         }
 
         processingLock.lock()
