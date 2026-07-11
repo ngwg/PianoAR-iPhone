@@ -348,10 +348,6 @@ private final class Hand3DOverlay {
     // Nodes: [hand 0=left, 1=right][joint/bone index]
     private var sph:    [[SCNNode]] = []
     private var cyl:    [[SCNNode]] = []
-    // Render-rate presentation positions. Vision updates at 10-20Hz depending
-    // on thermals; easing toward each new tracked target at 60Hz removes the
-    // visible staircase without feeding delayed points back into detection.
-    private var displayPositions: [[SIMD3<Float>?]] = []
     // Separate tracked index-tip sphere materials for cursor glow changes
     private var idxTipMat: [SCNMaterial] = []
 
@@ -400,8 +396,6 @@ private final class Hand3DOverlay {
 
             sph.append(sNodes)
             cyl.append(cNodes)
-            displayPositions.append(Array(repeating: nil,
-                                          count: HandTracker.allJoints.count))
             idxTipMat.append(idxMat ?? Self.makeMat(skin: true, isTip: true))
         }
     }
@@ -414,32 +408,16 @@ private final class Hand3DOverlay {
                 keyboardNode: SCNNode?) {
         sph.forEach { $0.forEach { $0.isHidden = true } }
         cyl.forEach { $0.forEach { $0.isHidden = true } }
-        var activeTracks = Set<Int>()
 
         for hand in hands {
             let h = hand.id
             guard sph.indices.contains(h) else { continue }
-            activeTracks.insert(h)
 
+            // Raw rendering — every joint draws exactly where the tracker put
+            // it this frame. Any render-side easing is stacked latency.
             for (i, name) in HandTracker.allJoints.enumerated() {
-                guard let target = hand.joints[name] else {
-                    displayPositions[h][i] = nil
-                    continue
-                }
-                // Directly-tracked joints render exactly where the tracker put
-                // them — the stabilizer already smooths, and easing again here
-                // stacked a second lag on top ("there is a delay"). Only
-                // reconstructed joints keep light easing to hide their jumps.
-                let presented: SIMD3<Float>
-                if hand.estimated.contains(name),
-                   let previous = displayPositions[h][i],
-                   simd_length(target - previous) < 0.12 {
-                    presented = previous + (target - previous) * 0.55
-                } else {
-                    presented = target
-                }
-                displayPositions[h][i] = presented
-                sph[h][i].simdPosition = presented
+                guard let target = hand.joints[name] else { continue }
+                sph[h][i].simdPosition = target
                 sph[h][i].opacity = CGFloat(hand.visibility)
                 sph[h][i].isHidden     = false
             }
@@ -472,11 +450,6 @@ private final class Hand3DOverlay {
                 }
                 idxTipMat[h].emission.contents = cursorColor
             }
-        }
-
-        for h in displayPositions.indices where !activeTracks.contains(h) {
-            displayPositions[h] = Array(repeating: nil,
-                                        count: HandTracker.allJoints.count)
         }
     }
 

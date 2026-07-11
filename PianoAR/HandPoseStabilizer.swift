@@ -352,26 +352,21 @@ final class HandPoseStabilizer {
         var residual = measurement.position - predicted
         var residualLength = simd_length(residual)
         let speed = simd_length(predictedVelocity)
-        // Generous clamp: it exists to stop teleports from a bad LiDAR pixel,
-        // not to slow real motion — a playing hand easily moves 3-5cm between
-        // Vision samples and must be followed within a single update.
+        // NO smoothing on direct measurements — they pass through raw. The
+        // only intervention left is this clamp, which is outlier rejection
+        // (a bad LiDAR pixel teleporting a joint half a metre), not motion
+        // filtering: real playing motion stays far inside the limit.
         let residualLimit = min(0.18, max(0.05, 0.05 + speed * dtFloat * 2.5))
         if residualLength > residualLimit, residualLength > 1e-5 {
             residual *= residualLimit / residualLength
             residualLength = residualLimit
         }
 
-        let normalizedConfidence = simd_clamp((measurement.confidence - 0.30) / 0.70,
-                                              0, 1)
-        // Fast ramp: anything beyond ~2.5cm of residual snaps nearly all the
-        // way to the measurement (alpha 0.95). Smoothing only really applies
-        // to sub-centimetre jitter at rest.
+        // Velocity estimate is kept only for gap prediction while occluded.
         let motion = simd_clamp(residualLength / 0.025, 0, 1)
-        let alpha = simd_clamp(0.10 + 0.80 * motion + 0.08 * normalizedConfidence,
-                               0.14, 0.95)
         let beta = 0.05 + 0.18 * motion
 
-        let position = predicted + residual * alpha
+        let position = predicted + residual
         var velocity = predictedVelocity * 0.72 + residual * (beta / dtFloat)
         let velocityLength = simd_length(velocity)
         if velocityLength > Self.maxJointSpeed {

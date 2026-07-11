@@ -96,14 +96,14 @@ final class HandTracker: ObservableObject {
 
     func maybeProcess(_ frame: ARFrame) {
         let now = CACurrentMediaTime()
-        // Latency matters more than thermal headroom here — 20Hz sampling was
-        // immediately felt as input lag. Run at full Vision rate normally and
-        // only back off under real thermal pressure.
+        // Zero artificial throttle: process every frame Vision can keep up
+        // with (isProcessing already prevents queue buildup). Back off only
+        // under real thermal pressure.
         let interval: TimeInterval
         switch ProcessInfo.processInfo.thermalState {
         case .serious:  interval = 1.0 / 20.0
         case .critical: interval = 1.0 / 15.0
-        default:        interval = 1.0 / 30.0
+        default:        interval = 0
         }
 
         processingLock.lock()
@@ -118,7 +118,10 @@ final class HandTracker: ObservableObject {
 
         let pixelBuffer = frame.capturedImage
         let camera = frame.camera
-        let depthData = frame.smoothedSceneDepth ?? frame.sceneDepth
+        // Raw depth first: smoothedSceneDepth is temporally filtered by ARKit
+        // and lags fast vertical finger motion — exactly what press detection
+        // and the hand model must not do.
+        let depthData = frame.sceneDepth ?? frame.smoothedSceneDepth
 
         visionQueue.async { [weak self] in
             self?.run(pixelBuffer: pixelBuffer, camera: camera,

@@ -424,13 +424,8 @@ final class ARMenuOverlay {
                 pendingGrabSide = nil
             }
 
-            // Cursor smoothing (EMA in panel-local space).
-            let sm: SIMD3<Float>
-            if let prev = cursorSmoothed, cursorLeft == b.isLeft {
-                sm = prev + 0.5 * (b.local - prev)
-            } else {
-                sm = b.local
-            }
+            // Raw cursor — no smoothing, the dot tracks the fingertip 1:1.
+            let sm = b.local
             cursorSmoothed = sm
 
             // Aim history: closing a pinch physically yanks the fingertip —
