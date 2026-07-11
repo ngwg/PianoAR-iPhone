@@ -1,4 +1,5 @@
 import SwiftUI
+import UIKit
 
 /// Pure SwiftUI shell over the AR view. Real-piano mode only: on launch the
 /// app goes straight into 4-corner calibration — tap the screen at each corner
@@ -32,11 +33,17 @@ struct ContentView: View {
         .ignoresSafeArea()
         .background(Color.black)
         .onAppear {
+            // The phone lives inside a headset shell — never let the screen
+            // dim or lock mid-practice.
+            UIApplication.shared.isIdleTimerDisabled = true
             if songPlayer.song == nil { songPlayer.load(BuiltInSongs.first) }
             if calibration.state == .idle { calibration.startCalibration() }
             audioDetector.start()
         }
-        .onDisappear { audioDetector.stop() }
+        .onDisappear {
+            UIApplication.shared.isIdleTimerDisabled = false
+            audioDetector.stop()
+        }
     }
 
     // MARK: - AR menu routing

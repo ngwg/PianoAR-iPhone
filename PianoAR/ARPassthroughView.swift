@@ -23,26 +23,22 @@ struct ARPassthroughView: UIViewRepresentable {
                     onMenuAction: onMenuAction)
     }
 
-    func makeUIView(context: Context) -> ARSCNView {
-        let view = ARSCNView(frame: .zero)
-        view.session           = session.session
-        view.delegate          = context.coordinator
-        view.automaticallyUpdatesLighting = true
-        view.rendersContinuously          = true
-        view.preferredFramesPerSecond     = 60
-        view.contentMode                  = .scaleAspectFill
-        view.debugOptions                 = []
-
-        calibration.sceneView = view
+    func makeUIView(context: Context) -> StereoARContainer {
+        let container = StereoARContainer(session: session.session)
+        // Only the LEFT view drives the app: delegate callbacks, anchors, and
+        // raycasts all go through it. The right view just renders the same
+        // shared scene + camera feed for the other lens.
+        container.left.delegate = context.coordinator
+        calibration.sceneView = container.left
 
         let tap = UITapGestureRecognizer(target: context.coordinator,
                                          action: #selector(Coordinator.handleTap(_:)))
-        view.addGestureRecognizer(tap)
-        return view
+        container.addGestureRecognizer(tap)
+        return container
     }
 
-    func updateUIView(_ uiView: ARSCNView, context: Context) {
-        calibration.sceneView = uiView
+    func updateUIView(_ uiView: StereoARContainer, context: Context) {
+        calibration.sceneView = uiView.left
 
         // Feed Vision the correct image orientation for the actual mounting.
         // ARKit's capturedImage is upright for landscapeRight (.up); landscapeLeft
@@ -94,8 +90,13 @@ struct ARPassthroughView: UIViewRepresentable {
         }
 
         @objc func handleTap(_ g: UITapGestureRecognizer) {
-            guard let v = g.view as? ARSCNView else { return }
-            calibration.handleTap(at: g.location(in: v))
+            guard let container = g.view as? StereoARContainer else { return }
+            // Both eyes show the same image, so a tap on the right half maps
+            // to the same point in the left (driving) view's coordinates.
+            var p = g.location(in: container)
+            let eyeW = container.left.bounds.width
+            if p.x > eyeW { p.x -= container.bounds.width - eyeW }
+            calibration.handleTap(at: p)
         }
 
         func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
@@ -233,6 +234,54 @@ struct ARPassthroughView: UIViewRepresentable {
             g.width = CGFloat(a.planeExtent.width); g.height = CGFloat(a.planeExtent.height)
             c.simdPosition = a.center
         }
+    }
+}
+
+// MARK: - Stereo container (phone-in-headset rendering)
+//
+// The Denver VR-20 (Cardboard-style shell) shows each eye one half of the
+// screen through its own lens. A single full-screen view therefore splits
+// wrongly across the lenses. This container renders the SAME ARSession and
+// the SAME SCNScene into two side-by-side ARSCNViews — each eye gets the
+// complete picture. The phone camera is mono, so both eyes intentionally get
+// an identical image (standard for phone passthrough headsets): through the
+// lenses it reads as one large screen floating in front of you.
+//
+// Only `left` has the scene-renderer delegate and receives raycasts; `right`
+// is a pure second presentation of the shared scene graph (each ARSCNView
+// maintains its own camera node, both driven from the same session pose).
+
+final class StereoARContainer: UIView {
+    let left:  ARSCNView
+    let right: ARSCNView
+    private static let gap: CGFloat = 4   // thin divider between the lenses
+
+    init(session: ARSession) {
+        left  = ARSCNView(frame: .zero)
+        right = ARSCNView(frame: .zero)
+        super.init(frame: .zero)
+        backgroundColor = .black
+
+        for view in [left, right] {
+            view.session                      = session
+            view.automaticallyUpdatesLighting = true
+            view.rendersContinuously          = true
+            view.preferredFramesPerSecond     = 60
+            view.contentMode                  = .scaleAspectFill
+            view.debugOptions                 = []
+            view.isUserInteractionEnabled     = false   // container's tap handles input
+            addSubview(view)
+        }
+        right.scene = left.scene   // one shared scene graph → identical AR content
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    override func layoutSubviews() {
+        super.layoutSubviews()
+        let eyeW = (bounds.width - Self.gap) / 2
+        left.frame  = CGRect(x: 0, y: 0, width: eyeW, height: bounds.height)
+        right.frame = CGRect(x: eyeW + Self.gap, y: 0, width: eyeW, height: bounds.height)
     }
 }
 
