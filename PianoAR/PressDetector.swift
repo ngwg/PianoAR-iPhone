@@ -49,20 +49,16 @@ final class PressDetector: ObservableObject {
     private let keyLockoutInterval: TimeInterval = 0.24
     private let flashRetain:        TimeInterval = 2.0
 
-    // ── Guided (audio-primary) ────────────────────────────────────────────
-    // Slightly wider/looser than before: soft presses were being missed, and
-    // the vision-valley fallback + hard hand-presence gate now carry the
-    // false-positive protection instead of a high onset bar.
+    // ── Guided (per-key evidence) ────────────────────────────────────────
     private let guidedAttackWindow:  TimeInterval = 0.28
     private let guidedMinAttackConf: Float = 0.24
     private let pitchSemitoneWindow: Int   = 3
-    private let kbAreaYMin:          Float = -0.06
-    private let kbAreaYMax:          Float =  0.10
-    private let kbAreaZExtra:        Float =  0.040
-    // Window around an audio onset in which a vision-side valley counts as
-    // strong corroboration — much stronger evidence than "some finger is
-    // somewhere over the whole keyboard".
-    private let visionCorroborateWindow: TimeInterval = 0.15
+    // Audio path: a fingertip must be physically ON the key it accepts —
+    // within this many white-key widths of the key centre, inside the key
+    // bed's depth, and at surface height.
+    private let onKeyXTolKeys:  Float = 1.5
+    private let onKeyZExtra:    Float = 0.025
+    private let onKeyYTol:      Float = 0.050
 
     // ── State ─────────────────────────────────────────────────────────────
 
@@ -209,34 +205,41 @@ final class PressDetector: ObservableObject {
         var finalPresses: [PressEvent]
 
         if guided, let kb = keyboardNode {
-            let recentValley = fingers.values.contains { time - $0.lastValleyTime < visionCorroborateWindow }
-            finalPresses = guidedPressEvents(
-                hands: hands, keyboardNode: kb,
-                expectedKeyIndices: expectedKeyIndices,
-                snapshot: audioSnapshot, time: time,
-                recentValley: recentValley
-            )
+            // Per-key evidence: every expected key must earn its OWN
+            // acceptance. Previously one audio onset + a hand hovering
+            // anywhere over the keyboard accepted the WHOLE expected group —
+            // that's both "detects keys I never touched" and "pressing the
+            // right-hand note auto-completed the left hand's chord note".
+            var events:  [PressEvent] = []
+            var claimed = Set<Int>()
 
-            // Vision fallback for MISSED audio: a genuine press-shaped valley
-            // whose resolved key is on (or right next to — vision X is good to
-            // about one key) an expected key counts even when the mic missed
-            // the onset (soft press, noisy room, quilted upright, …).
-            if finalPresses.isEmpty, !visionCandidates.isEmpty {
-                var used = Set<Int>()
-                finalPresses = visionCandidates.compactMap { cand in
-                    guard let nearest = expectedKeyIndices
-                            .filter({ !used.contains($0) })
-                            .min(by: { abs($0 - cand.keyIndex) < abs($1 - cand.keyIndex) }),
-                          abs(nearest - cand.keyIndex) <= 2 else { return nil }
-                    used.insert(nearest)
-                    lastKeyPressTime[nearest] = time
-                    return PressEvent(keyIndex: nearest,
-                                      noteName: KeyboardLayout.keys[nearest].noteName,
-                                      confidence: min(1.0, cand.confidence * 0.85),
-                                      fingerID: cand.fingerID,
-                                      timestamp: time)
-                }
+            // A) Vision: a press-shaped valley resolved on (or within 2 keys
+            //    of — vision X is good to about one key) an expected key
+            //    accepts exactly that key.
+            for cand in visionCandidates {
+                guard let nearest = expectedKeyIndices
+                        .filter({ !claimed.contains($0) })
+                        .min(by: { abs($0 - cand.keyIndex) < abs($1 - cand.keyIndex) }),
+                      abs(nearest - cand.keyIndex) <= 2 else { continue }
+                claimed.insert(nearest)
+                lastKeyPressTime[nearest] = time
+                events.append(PressEvent(
+                    keyIndex: nearest,
+                    noteName: KeyboardLayout.keys[nearest].noteName,
+                    confidence: min(1.0, cand.confidence * 0.85
+                                         + audioBoost(audioSnapshot, time: time)),
+                    fingerID: cand.fingerID,
+                    timestamp: time))
             }
+
+            // B) Audio: an onset accepts a remaining expected key only if a
+            //    directly-tracked fingertip is physically ON that key.
+            events += guidedAudioEvents(
+                hands: hands, keyboardNode: kb,
+                expectedKeyIndices: expectedKeyIndices.subtracting(claimed),
+                snapshot: audioSnapshot, time: time)
+
+            finalPresses = events
 
             if let atk = audioSnapshot?.attack {
                 debugLines.append(String(format: "onset conf %.2f score %.2f", atk.confidence, atk.onsetScore))
@@ -275,80 +278,79 @@ final class PressDetector: ObservableObject {
         lastGuidedAttackTime = -999
     }
 
-    // MARK: - Guided press detection (audio-primary)
+    // MARK: - Guided press detection (per-key evidence)
     //
-    // In guided mode the song tells us exactly which key(s) to play — we don't
-    // need to identify a key from fingertip X position. Instead:
-    //
-    //   1. Audio onset = "something was played" (timing signal, primary).
-    //   2. A vision-side valley within `visionCorroborateWindow` of the onset =
-    //      strong corroboration (this finger genuinely just struck something),
-    //      falling back to a loose keyboard-area presence check if no valley
-    //      fired (a very light touch might not reach `pressDip`, but the hand
-    //      being at the keyboard at all is still useful signal).
-    //   3. Pitch FFT hints optionally add confidence (not required — mic at
-    //      ~50cm is noisy for bass notes and we don't want false rejections).
-    //
-    // We still explicitly avoid identifying the key from vision X position:
-    // Vision + LiDAR gives ≥1cm world-space error on 23.5mm keys, unreliable
-    // at that resolution.
+    // Every expected key must earn its OWN acceptance:
+    //   A) a press-shaped vision valley resolved on/next to it (matched by the
+    //      caller from visionCandidates), or
+    //   B) an audio onset while a directly-tracked fingertip is physically ON
+    //      that key (within onKeyXTolKeys white-key widths of its centre, at
+    //      surface height, inside the key bed).
+    // One onset may accept several chord members at once — but only members
+    // that each have their own fingertip on them, which is exactly the
+    // "pressed both hands together" case. Sound plus a hand merely hovering
+    // somewhere over the keyboard accepts nothing, and a right-hand press can
+    // no longer auto-complete the left hand's half of a chord.
 
-    private func guidedPressEvents(hands: [HandTracker.HandResult],
+    private func guidedAudioEvents(hands: [HandTracker.HandResult],
                                    keyboardNode kb: SCNNode,
                                    expectedKeyIndices: Set<Int>,
                                    snapshot: PitchSnapshot?,
-                                   time: TimeInterval,
-                                   recentValley: Bool) -> [PressEvent] {
-        guard let snap   = snapshot,
+                                   time: TimeInterval) -> [PressEvent] {
+        guard !expectedKeyIndices.isEmpty,
+              let snap   = snapshot,
               let attack = snap.attack,
               attack.confidence >= guidedMinAttackConf,
               abs(time - attack.timestamp) <= guidedAttackWindow,
               attack.timestamp > lastGuidedAttackTime
         else { return [] }
 
-        // HARD gate: a sound with no hand at the keyboard is never a press.
-        // Previously presence was only a confidence bonus, so any loud-enough
-        // noise (talking, a bump, TV) fired the expected key by itself —
-        // the "detects random keys without me pressing" failure mode.
-        let fingerPresent = recentValley || anyFingerInKeyboardArea(hands: hands, keyboardNode: kb)
-        guard fingerPresent else { return [] }
-
         let pitchScore = bestPitchScore(expectedKeyIndices: expectedKeyIndices, snapshot: snap)
-
-        // Confidence: onset (0…0.45) + pitch (0…0.30) + vision valley (0.25
-        // when a press-shaped finger dip corroborates, 0.10 for presence only)
-        var confidence  = attack.confidence * 0.45
-        confidence     += pitchScore * 0.30
-        confidence     += recentValley ? 0.25 : 0.10
-
         let pitchContradict = !snap.activeNotes.isEmpty && pitchScore < 0.07
-        guard confidence >= 0.30, !pitchContradict else { return [] }
+        guard !pitchContradict else { return [] }
 
-        lastGuidedAttackTime = attack.timestamp
-
+        // Direct (non-reconstructed) fingertips only.
         let tips = collectFingertips(hands: hands, keyboardNode: kb)
         var usedFingers = Set<String>()
+        var events: [PressEvent] = []
 
-        return expectedKeyIndices.sorted().compactMap { keyIndex -> PressEvent? in
-            guard keyIndex >= 0, keyIndex < KeyboardLayout.keys.count else { return nil }
+        let xTol = KeyboardLayout.whiteKeyWidth * onKeyXTolKeys
+        let zMax = KeyboardLayout.whiteKeyDepth / 2 + onKeyZExtra
+
+        for keyIndex in expectedKeyIndices.sorted() {
+            guard keyIndex >= 0, keyIndex < KeyboardLayout.keys.count else { continue }
             let key = KeyboardLayout.keys[keyIndex]
+            let surfaceY = key.isBlack
+                ? KeyboardLayout.whiteKeyHeight + KeyboardLayout.blackKeyExtraHeight
+                : KeyboardLayout.whiteKeyHeight
+
+            guard let tip = tips
+                .filter({ !usedFingers.contains($0.fingerID)
+                          && abs($0.localX - key.xCenter) <= xTol
+                          && abs($0.localZ) <= zMax
+                          && abs($0.localY - surfaceY) <= onKeyYTol })
+                .min(by: { abs($0.localX - key.xCenter) < abs($1.localX - key.xCenter) })
+            else { continue }
+
+            usedFingers.insert(tip.fingerID)
             lastKeyPressTime[keyIndex] = time
-
-            let best = tips
-                .filter { !usedFingers.contains($0.fingerID) }
-                .min { abs($0.localX - key.xCenter) < abs($1.localX - key.xCenter) }
-            if let f = best { usedFingers.insert(f.fingerID) }
-
-            return PressEvent(
+            events.append(PressEvent(
                 keyIndex: keyIndex, noteName: key.noteName,
-                confidence: min(1.0, confidence), fingerID: best?.fingerID ?? "audio",
-                timestamp: time
-            )
+                confidence: min(1.0, attack.confidence * 0.50 + pitchScore * 0.30 + 0.15),
+                fingerID: tip.fingerID,
+                timestamp: time))
         }
+
+        // Consume the onset only when it actually accepted something, so a
+        // slightly-early sound doesn't burn before the finger settles.
+        if !events.isEmpty { lastGuidedAttackTime = attack.timestamp }
+        return events
     }
 
     // MARK: - Helpers
 
+    /// Directly-observed fingertips only — an occlusion-reconstructed
+    /// (guessed) fingertip must never satisfy the on-key requirement.
     private func collectFingertips(hands: [HandTracker.HandResult],
                                    keyboardNode kb: SCNNode) -> [FingertipLocal] {
         var out: [FingertipLocal] = []
@@ -356,7 +358,8 @@ final class PressDetector: ObservableObject {
         for hand in hands {
             let side = hand.isLeft ? "L" : "R"
             for (joint, name) in Self.tips {
-                guard let wp = hand.joints[joint] else { continue }
+                guard !hand.estimated.contains(joint),
+                      let wp = hand.joints[joint] else { continue }
                 let lp = kb.simdConvertPosition(wp, from: nil)
                 out.append(FingertipLocal(
                     fingerID: "\(side)_\(name)",
@@ -367,23 +370,6 @@ final class PressDetector: ObservableObject {
             }
         }
         return out
-    }
-
-    private func anyFingerInKeyboardArea(hands: [HandTracker.HandResult],
-                                         keyboardNode kb: SCNNode) -> Bool {
-        let halfW = KeyboardLayout.totalWidth  * 0.55
-        let halfZ = KeyboardLayout.whiteKeyDepth * 0.5 + kbAreaZExtra
-        for hand in hands {
-            for (joint, _) in Self.tips {
-                guard let wp = hand.joints[joint] else { continue }
-                let lp = kb.simdConvertPosition(wp, from: nil)
-                if lp.y > kbAreaYMin && lp.y < kbAreaYMax
-                    && abs(lp.x) < halfW && abs(lp.z) < halfZ {
-                    return true
-                }
-            }
-        }
-        return false
     }
 
     private func bestPitchScore(expectedKeyIndices: Set<Int>, snapshot: PitchSnapshot) -> Float {
