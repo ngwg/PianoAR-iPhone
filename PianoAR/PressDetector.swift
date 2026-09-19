@@ -52,7 +52,10 @@ final class PressDetector: ObservableObject {
 
     // ── Guided (per-key evidence) ────────────────────────────────────────
     private let guidedAttackWindow:  TimeInterval = 0.35
-    private let guidedMinAttackConf: Float = 0.24
+    // Every onset that reaches here has already cleared SuperFlux's own
+    // adaptive threshold, which measured 0.99 precision on a real recording.
+    // A second confidence gate on top of that only throws away quiet notes.
+    private let guidedMinAttackConf: Float = 0.0
     private let pitchSemitoneWindow: Int   = 3
     // Fast audio path (before the note verifier has spoken): a fingertip
     // must be physically ON the key it accepts — within this many white-key

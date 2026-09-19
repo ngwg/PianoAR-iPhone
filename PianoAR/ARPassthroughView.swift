@@ -107,6 +107,7 @@ struct ARPassthroughView: UIViewRepresentable {
         private var fps: Double = 60
         private var loggedSerial = -1
         private var lastTuningSave: TimeInterval = 0
+        private var wasRecording = false
 
         init(calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
@@ -155,10 +156,18 @@ struct ARPassthroughView: UIViewRepresentable {
             if time - lastTuningSave > 4 { lastTuningSave = time; PianoTuning.shared.saveIfNeeded() }
             let pending   = songPlayer.pendingKeyIndicesNow()
             let groupKeys = songPlayer.groupKeyIndicesNow()
+            // Re-announce the expected notes whenever recording starts, not
+            // only when the group changes: the first recording came back with
+            // no "expect" lines at all, because the one that mattered had been
+            // emitted before the recorder was switched on.
+            let rec = cfg.recorder?.isRecording ?? false
+            if rec != wasRecording { wasRecording = rec; if rec { loggedSerial = -1 } }
             if songPlayer.groupSerial != loggedSerial {
                 loggedSerial = songPlayer.groupSerial
                 cfg.recorder?.log("expect", [
                     "serial": songPlayer.groupSerial,
+                    "playing": songPlayer.isPlaying,
+                    "wait": songPlayer.waitMode,
                     "keys": groupKeys.sorted(),
                     "names": groupKeys.sorted().map { KeyboardLayout.keys[$0].noteName },
                     "pending": pending.sorted(),

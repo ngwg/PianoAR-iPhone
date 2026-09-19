@@ -103,6 +103,10 @@ final class AudioPitchDetector: ObservableObject {
     // once the attack is ~1.5 hops into the frame.
     private var onsetLagSamples: Int { hop * 3 / 2 }
 
+    /// SuperFlux onset detection — see OnsetDetector for why the old band
+    /// flux had to go (it found 31 % of real notes at 2.2 false onsets/s).
+    private var onset: OnsetDetector?
+
     private var sampleRate: Double = 48_000
     private var binRes: Float = 48_000 / 2048
     private var keyBins: [Int] = []
@@ -144,17 +148,6 @@ final class AudioPitchDetector: ObservableObject {
         var stagesDone: Set<Int> = []
     }
 
-    /// One analysis frame of the onset-detection function, kept so the peak
-    /// can be picked one hop late (see analyze).
-    private struct OnsetFrame {
-        let rms: Float
-        let score: Float
-        let low: Float
-        let mid: Float
-        let high: Float
-        let sample: Int
-        let timestamp: TimeInterval
-    }
     private var pending: [PendingVerification] = []
     /// Keys the song expects together right now (set by the render loop):
     /// the verifier ignores partials shared between them.
@@ -198,8 +191,6 @@ final class AudioPitchDetector: ObservableObject {
     private var lastAttackTime: TimeInterval = 0
     private var lastAttackScore: Float = 0
     private var fluxDipped = true
-    private var prevFrame: OnsetFrame?
-    private var prevPrevScore: Float = 0
     private var hasPreviousSpectrum = false
 
     private let engine = AVAudioEngine()
@@ -338,6 +329,7 @@ final class AudioPitchDetector: ObservableObject {
             sampleRate = fmt.sampleRate
             binRes = Float(fmt.sampleRate) / Float(fftN)
             keyBins = Self.keyFreqs.map { Int(($0 / binRes).rounded()) }
+            onset = OnsetDetector(fftBins: fftN / 2, sampleRate: Float(fmt.sampleRate))
             resetAudioState()
 
             // iOS may hand the tap far larger buffers than requested (often
@@ -455,44 +447,31 @@ final class AudioPitchDetector: ObservableObject {
         let low = bandStats(fromHz: 24, toHz: 360, weight: 0.95)
         let mid = bandStats(fromHz: 360, toHz: 1_900, weight: 1.05)
         let high = bandStats(fromHz: 1_900, toHz: 10_500, weight: 1.75)
+        // Band flux is kept only for the debug readout now; it no longer
+        // gates anything (see OnsetDetector).
         let onsetScore = low.flux + mid.flux + high.flux
         computeKeyEnergies()
 
-        // Peak-picking, one hop (11 ms) late. An onset is the LOCAL MAXIMUM
-        // of the flux curve, not simply the first frame over the threshold.
-        // Without this, one key stroke fires two or three attacks (the hammer
-        // transient, then the body of the note), and every extra attack is
-        // another chance for the next expected note to be accepted off the
-        // sound of the note just played.
-        let frameNow = OnsetFrame(rms: rms, score: onsetScore,
-                                  low: low.flux, mid: mid.flux, high: high.flux,
-                                  sample: written - onsetLagSamples,
-                                  timestamp: frameEndTime - Double(onsetLagSamples) / sampleRate)
         var attack: AudioAttack? = nil
-        if let peak = prevFrame, peak.score >= prevPrevScore, peak.score > onsetScore,
-           let a = makeAttack(frame: peak) {
+        if let peak = onset?.push(spectrum: spectrum, rms: rms,
+                                  sample: written - onsetLagSamples,
+                                  time: frameEndTime - Double(onsetLagSamples) / sampleRate),
+           let a = makeAttack(peak: peak) {
             attack = a
             lastHints = pitchHints(for: a)
             recentAttacks.append(a)
             recorder?.log("attack", ["id": a.id, "onset": a.timestamp,
-                                     "conf": a.confidence, "score": a.onsetScore])
+                                     "conf": a.confidence, "score": a.onsetScore,
+                                     "thr": peak.threshold])
             pending.append(PendingVerification(attackID: a.id,
                                                onsetSample: peak.sample,
                                                timestamp: a.timestamp,
                                                chord: expectedKeys.get()))
         }
-        prevPrevScore = prevFrame?.score ?? 0
-        prevFrame = frameNow
-        // A note has to decay well away from its own attack before the next
-        // onset counts.
-        if onsetScore < lastAttackScore * 0.4 { fluxDipped = true }
 
         publishUI(attack: attack, rms: rms, onsetScore: onsetScore,
                   lowScore: low.flux, midScore: mid.flux, highScore: high.flux,
                   timestamp: frameEndTime)
-
-        let overGate = onsetScore >= max(minFluxScore, ambientFlux * ambientFluxRatio)
-        updateAmbient(rms: rms, onsetScore: onsetScore, isAttack: attack != nil || overGate)
         prevSpectrum = spectrum
         hasPreviousSpectrum = true
     }
@@ -632,38 +611,26 @@ final class AudioPitchDetector: ObservableObject {
         return (positiveDelta / reference * weight, currentEnergy)
     }
 
-    private func makeAttack(frame f: OnsetFrame) -> AudioAttack? {
-        let rmsGate = max(minRMS, ambientRMS * ambientRMSRatio)
-        let fluxGate = max(minFluxScore, ambientFlux * ambientFluxRatio)
-        let enoughTrebleOrMid = f.high >= fluxGate * 0.14
-            || f.mid >= fluxGate * 0.22
-            || (f.low >= fluxGate * 0.80 && f.rms >= rmsGate * 1.15)
-        // Refractory: after an attack the flux has to fall right back down
-        // before another one counts, because a decaying note is not a new
-        // note. A clearly harder strike may still interrupt (repeated notes).
-        let settled = fluxDipped || f.score >= lastAttackScore * 1.25
-        let cooledDown = f.timestamp - lastAttackTime >= minAttackInterval && settled
-
-        guard hasPreviousSpectrum, f.rms >= rmsGate, f.score >= fluxGate,
-              enoughTrebleOrMid, cooledDown else {
-            return nil
-        }
-
-        lastAttackTime = f.timestamp
-        lastAttackScore = f.score
-        fluxDipped = false
-        let confidence = min(1.0, max(0.05, f.score / max(fluxGate * 2.8, 1e-6)))
+    /// The peak-picker has already decided; this only stamps an identity on
+    /// it. All the rejection now lives in OnsetDetector, where it is measured.
+    private func makeAttack(peak: OnsetDetector.Peak) -> AudioAttack? {
+        guard hasPreviousSpectrum else { return nil }
+        lastAttackTime = peak.time
+        lastAttackScore = peak.odf
+        // How far clear of its own adaptive threshold the peak stood.
+        let confidence = min(1.0, max(0.05, (peak.odf - peak.threshold)
+                                             / max(peak.threshold, 0.5)))
         let id = nextAttackID
         nextAttackID += 1
         return AudioAttack(
             id: id,
             confidence: confidence,
-            onsetScore: f.score,
-            lowBandScore: f.low,
-            midBandScore: f.mid,
-            highBandScore: f.high,
+            onsetScore: peak.odf,
+            lowBandScore: 0,
+            midBandScore: 0,
+            highBandScore: peak.threshold,
             pitchHintKeyIndex: strongestPitchHintIndex(),
-            timestamp: f.timestamp
+            timestamp: peak.time
         )
     }
 
@@ -762,13 +729,13 @@ final class AudioPitchDetector: ObservableObject {
 
         var debug: [String] = []
         if let attack {
-            debug.append(String(format: "ATTACK #%ld conf %.2f score %.2f",
-                                attack.id, attack.confidence, attack.onsetScore))
+            debug.append(String(format: "ATTACK #%ld conf %.2f odf %.2f thr %.2f",
+                                attack.id, attack.confidence, attack.onsetScore,
+                                attack.highBandScore))
         } else {
-            debug.append(String(format: "score %.2f gate %.2f", onsetScore, max(minFluxScore, ambientFlux * ambientFluxRatio)))
+            debug.append(String(format: "flux %.2f (debug only)", onsetScore))
         }
-        debug.append(String(format: "rms %.4f amb %.4f", rms, ambientRMS))
-        debug.append(String(format: "bands L %.2f M %.2f H %.2f", lowScore, midScore, highScore))
+        debug.append(String(format: "rms %.4f bands %d", rms, onset?.bandCount ?? 0))
         if let v = verifications.last {
             let names = v.heardKeys().map { KeyboardLayout.keys[$0].noteName }
             debug.append("heard " + (names.isEmpty ? "-" : names.joined(separator: " ")))
@@ -800,8 +767,7 @@ final class AudioPitchDetector: ObservableObject {
         lastAttackTime = 0
         lastAttackScore = 0
         fluxDipped = true
-        prevFrame = nil
-        prevPrevScore = 0
+        onset?.reset()
         hasPreviousSpectrum = false
     }
 }
