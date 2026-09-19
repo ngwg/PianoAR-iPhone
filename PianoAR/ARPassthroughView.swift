@@ -11,25 +11,28 @@ struct ARPassthroughView: UIViewRepresentable {
     let pressDetector: PressDetector
     let audioDetector: AudioPitchDetector
     let keyTuning:     KeyTuning
+    var comfort:        ComfortSnapshot
     var onMenuAction:   ((MenuAction) -> Void)?
     var showDebug:      Bool   = false
+    var showKeyLabels:  Bool   = true
+    var keyboardNudge:  SIMD2<Float> = .zero      // keyboard-local x, z (m)
     var availableSongs: [Song] = []
 
     func makeCoordinator() -> Coordinator {
         Coordinator(calibration: calibration,
                     handTracker: handTracker, songPlayer: songPlayer,
                     pressDetector: pressDetector, audioDetector: audioDetector,
-                    keyTuning: keyTuning,
-                    onMenuAction: onMenuAction)
+                    keyTuning: keyTuning)
     }
 
     func makeUIView(context: Context) -> StereoARContainer {
         let container = StereoARContainer(session: session.session)
         // Only the LEFT view drives the app: delegate callbacks, anchors, and
-        // raycasts all go through it. The right view just renders the same
-        // shared scene + camera feed for the other lens.
+        // raycasts all go through it.
         container.left.delegate = context.coordinator
+        context.coordinator.warp = container.warp
         calibration.sceneView = container.left
+        container.apply(comfort)
 
         let tap = UITapGestureRecognizer(target: context.coordinator,
                                          action: #selector(Coordinator.handleTap(_:)))
@@ -47,97 +50,137 @@ struct ARPassthroughView: UIViewRepresentable {
         if let io = uiView.window?.windowScene?.interfaceOrientation {
             handTracker.imageOrientation = (io == .landscapeLeft) ? .down : .up
         }
-        context.coordinator.onMenuAction   = onMenuAction
-        context.coordinator.showDebug      = showDebug
-        context.coordinator.availableSongs = availableSongs
-        context.coordinator.songPlayer     = songPlayer
-        context.coordinator.pressDetector  = pressDetector
-        context.coordinator.audioDetector  = audioDetector
-        context.coordinator.keyTuning      = keyTuning
+        if uiView.comfort != comfort { uiView.apply(comfort) }
+
+        context.coordinator.onMenuAction = onMenuAction
+        context.coordinator.config.set(Coordinator.Config(
+            showDebug: showDebug,
+            showKeyLabels: showKeyLabels,
+            comfort: comfort,
+            nudge: keyboardNudge,
+            songs: availableSongs
+        ))
     }
 
     // MARK: - Coordinator
 
     final class Coordinator: NSObject, ARSCNViewDelegate {
+        /// Everything SwiftUI hands the render thread, swapped atomically.
+        struct Config {
+            var showDebug = false
+            var showKeyLabels = true
+            var comfort = ComfortSnapshot.default
+            var nudge = SIMD2<Float>(0, 0)
+            var songs: [Song] = []
+        }
+
         let calibration:   CalibrationManager
         let handTracker:   HandTracker
-        var songPlayer:    SongPlayer
-        var pressDetector: PressDetector
-        var audioDetector: AudioPitchDetector
-        var keyTuning:     KeyTuning
-        var onMenuAction:   ((MenuAction) -> Void)?
-        var showDebug:      Bool   = false
-        var availableSongs: [Song] = []
+        let songPlayer:    SongPlayer
+        let pressDetector: PressDetector
+        let audioDetector: AudioPitchDetector
+        let keyTuning:     KeyTuning
+        let config = Locked(Config())
+        var onMenuAction: ((MenuAction) -> Void)?
+        weak var warp: MotionWarp?
 
         private var hand3D:      Hand3DOverlay?
         private var highway:     NoteHighway?
         private var menuOverlay: ARMenuOverlay?
+        private var hud:         PracticeHUDOverlay?
+        private var debugPanel:  DebugPanelOverlay?
         private var hintBar:     HintBarOverlay?
+        /// The keyboard content node: key tops sit at y = whiteKeyHeight in
+        /// its local space, exactly on the real key tops (see nodeFor).
         private weak var keyboardNode: SCNNode?
+        /// Unscaled parent of the keyboard content + UI panels (nudge target).
+        private weak var keyboardFrame: SCNNode?
+        private let planeNodes = NSHashTable<SCNNode>.weakObjects()
+        private var lastFrameTime: TimeInterval = 0
+        private var fps: Double = 60
 
         init(calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
              pressDetector: PressDetector, audioDetector: AudioPitchDetector,
-             keyTuning: KeyTuning,
-             onMenuAction: ((MenuAction) -> Void)? = nil) {
+             keyTuning: KeyTuning) {
             self.calibration   = calibration
             self.handTracker   = handTracker
             self.songPlayer    = songPlayer
             self.pressDetector = pressDetector
             self.audioDetector = audioDetector
             self.keyTuning     = keyTuning
-            self.onMenuAction  = onMenuAction
         }
 
         @objc func handleTap(_ g: UITapGestureRecognizer) {
             guard let container = g.view as? StereoARContainer else { return }
-            // Both eyes show the same image, so a tap on the right half maps
-            // to the same point in the left (driving) view's coordinates.
-            var p = g.location(in: container)
-            let eyeW = container.left.bounds.width
-            if p.x > eyeW { p.x -= container.bounds.width - eyeW }
-            calibration.handleTap(at: p)
+            // Both eyes show the same image; a tap on either maps to the same
+            // point of the driving (left) view.
+            calibration.handleTap(at: container.leftViewPoint(for: g.location(in: container)))
         }
+
+        // MARK: Per-frame loop (SceneKit render thread)
 
         func renderer(_ renderer: SCNSceneRenderer, updateAtTime time: TimeInterval) {
             guard let sceneView = renderer as? ARSCNView,
                   let frame    = sceneView.session.currentFrame else { return }
-
-            if hand3D == nil {
-                hand3D = Hand3DOverlay(scene: sceneView.scene)
+            // The frame this pass draws — MotionWarp re-aims it until the next.
+            warp?.noteRendered(frame: frame)
+            let cfg = config.get()
+            if lastFrameTime > 0, time > lastFrameTime {
+                fps += (1 / (time - lastFrameTime) - fps) * 0.05
             }
+            lastFrameTime = time
+
+            if hand3D == nil { hand3D = Hand3DOverlay(scene: sceneView.scene) }
 
             handTracker.maybeProcess(frame)
             let hands = handTracker.snapshot()
             let audio = audioDetector.snapshot()
-            let expectedKeyIndices = songPlayer.expectedKeyIndicesNow()
-            // Hand model renders above UI (renderingOrder 300 > buttons 200)
-            hand3D?.update(hands: hands, menu: menuOverlay, keyboardNode: keyboardNode)
+            let camT  = frame.camera.transform.columns.3
+            let camPos = SIMD3<Float>(camT.x, camT.y, camT.z)
 
-            // Try to find the keyboard automatically while waiting for the
-            // first corner tap (manual taps always take precedence).
+            songPlayer.tick()
+            let pending   = songPlayer.pendingKeyIndicesNow()
+            let groupKeys = songPlayer.groupKeyIndicesNow()
+            audioDetector.setExpectedKeys(groupKeys)
+
+            hand3D?.update(hands: hands, style: cfg.comfort.handStyle,
+                           menu: menuOverlay, keyboardNode: keyboardNode)
+
+            // ── Calibration: auto-detect, fingertip calibration, planes ──────
             calibration.attemptAutoDetect(frame: frame,
                                           orientation: handTracker.imageOrientation,
                                           time: time)
+            calibration.attemptHandCalibration(hands: hands, cameraPosition: camPos, time: time)
+            let calibrating = calibration.state.isCollecting
+            for node in planeNodes.allObjects { node.isHidden = !calibrating }
 
-            // ── Setup hint bar (camera-locked AR text) ─────────────────────────
             if hintBar == nil, let cam = sceneView.pointOfView {
                 hintBar = HintBarOverlay(cameraNode: cam)
             }
             hintBar?.update(text: currentHintText())
 
-            // AR menu: direct fingertip touch — no pinch required
+            // Fine placement nudge from the SETUP tab.
+            keyboardFrame?.simdPosition = SIMD3<Float>(cfg.nudge.x, -KeyboardLayout.whiteKeyHeight,
+                                                       cfg.nudge.y)
+
+            // ── AR menu ──────────────────────────────────────────────────────
             if let kb = keyboardNode, let menu = menuOverlay {
-                let camT = frame.camera.transform.columns.3
-                if let action = menu.update(
-                    hands: hands,
-                    keyboardNode: kb,
-                    time: time,
-                    isPlaying: songPlayer.isPlaying,
-                    debugOn: showDebug,
-                    availableSongs: availableSongs,
-                    cameraWorldPos: SIMD3<Float>(camT.x, camT.y, camT.z)
-                ) {
+                let hud = songPlayer.hudSnapshot()
+                let state = MenuState(
+                    isPlaying: hud.isPlaying,
+                    isComplete: hud.isComplete,
+                    debugOn: cfg.showDebug,
+                    songTitles: cfg.songs.map { $0.title ?? "Untitled" },
+                    currentTitle: songPlayer.song?.title ?? "",
+                    tempoPercent: hud.tempoPercent,
+                    hand: hud.hand,
+                    waitMode: hud.waitMode,
+                    comfort: cfg.comfort,
+                    keyLabels: cfg.showKeyLabels)
+                if let action = menu.update(hands: hands, keyboardNode: kb, time: time,
+                                            state: state, availableSongs: cfg.songs,
+                                            cameraWorldPos: camPos) {
                     let cb = onMenuAction
                     DispatchQueue.main.async { cb?(action) }
                 }
@@ -147,7 +190,9 @@ struct ARPassthroughView: UIViewRepresentable {
             let presses = pressDetector.update(
                 hands: hands, keyboardNode: keyboardNode, time: time,
                 audioSnapshot: audio,
-                expectedKeyIndices: expectedKeyIndices,
+                expectedKeyIndices: pending,
+                groupKeyIndices: groupKeys,
+                groupSerial: songPlayer.groupSerial,
                 keyTuning: keyTuning
             )
             for p in presses {
@@ -157,34 +202,95 @@ struct ARPassthroughView: UIViewRepresentable {
                 case .wrong(let playedKeyIndex, _, _, _):
                     highway?.registerMiss(keyIndex: playedKeyIndex)
                 case .ignored:
-                    highway?.registerPress(keyIndex: p.keyIndex)
+                    // Free play: still show what was detected.
+                    if !songPlayer.isPlaying { highway?.registerPress(keyIndex: p.keyIndex) }
                 }
             }
 
+            highway?.showKeyLabels = cfg.showKeyLabels
             highway?.update(player: songPlayer)
+            hud?.update(hud: songPlayer.hudSnapshot(), time: time)
+            debugPanel?.update(visible: cfg.showDebug,
+                               lines: cfg.showDebug ? debugLines(frame: frame, hands: hands) : [],
+                               time: time)
+        }
+
+        private func debugLines(frame: ARFrame, hands: [HandTracker.HandResult]) -> [String] {
+            let tracking: String
+            switch frame.camera.trackingState {
+            case .normal: tracking = "normal"
+            case .notAvailable: tracking = "not available"
+            case .limited: tracking = "limited"
+            }
+            let thermal: String
+            switch ProcessInfo.processInfo.thermalState {
+            case .nominal: thermal = "cool"
+            case .fair: thermal = "warm"
+            case .serious: thermal = "HOT"
+            case .critical: thermal = "CRITICAL"
+            @unknown default: thermal = "?"
+            }
+            let depth = frame.smoothedSceneDepth != nil || frame.sceneDepth != nil
+            var lines = [
+                "— SYSTEM",
+                String(format: "%.0f fps · tracking %@ · %@", fps, tracking, thermal),
+                "hands \(hands.count) · LiDAR depth \(depth ? "yes" : "no")",
+                "— PRESS DETECTION",
+            ]
+            lines += pressDetector.debugSnapshot().prefix(14)
+            lines.append("— AUDIO")
+            lines += audioDetector.debugSnapshot().prefix(6)
+            return lines
         }
 
         // MARK: Anchor → node
 
         func renderer(_ renderer: SCNSceneRenderer, nodeFor anchor: ARAnchor) -> SCNNode? {
             if anchor.name == "keyboard_calibrated" {
-                let n = KeyboardNode.makeOverlay()
+                let root = SCNNode()
+
+                // Corner taps / auto-detect raycast onto the real KEY TOPS, so
+                // the anchor origin sits at key-top height. KeyboardLayout's
+                // frame puts key tops at y = whiteKeyHeight, so everything sits
+                // that much lower. (It used to float ~1.5 cm above the keys; seen
+                // from the head at a steep angle that parallax slid the cues
+                // sideways — up to nearly a key near the ends — and made them
+                // swim relative to the real keys with every head movement.)
+                let frameNode = SCNNode()
+                frameNode.simdPosition = SIMD3<Float>(0, -KeyboardLayout.whiteKeyHeight, 0)
+                root.addChildNode(frameNode)
+
+                // Keys + waterfall follow the measured keyboard size...
+                let content = KeyboardNode.makeOverlay()
                 if let d = calibration.calibrationData {
-                    n.scale = SCNVector3(d.widthScale, 1, d.depthScale)
+                    content.scale = SCNVector3(d.widthScale, 1, d.depthScale)
                 }
                 let hw = NoteHighway()
-                n.addChildNode(hw.rootNode)
-                highway = hw
+                content.addChildNode(hw.rootNode)
+                frameNode.addChildNode(content)
+
+                // ...UI panels are never stretched by that scale.
                 let menu = ARMenuOverlay()
-                n.addChildNode(menu.rootNode)
-                menuOverlay = menu
-                keyboardNode = n
+                frameNode.addChildNode(menu.rootNode)
+                let hudNode = PracticeHUDOverlay()
+                frameNode.addChildNode(hudNode.rootNode)
+                let dbg = DebugPanelOverlay()
+                frameNode.addChildNode(dbg.rootNode)
+
+                highway       = hw
+                menuOverlay   = menu
+                hud           = hudNode
+                debugPanel    = dbg
+                keyboardNode  = content
+                keyboardFrame = frameNode
                 pressDetector.reset()
-                return n
+                return root
             }
             if let name = anchor.name, name.hasPrefix("corner_") { return cornerMarker() }
             if let plane = anchor as? ARPlaneAnchor {
-                return planeNode(for: plane)
+                let node = planeNode(for: plane)
+                planeNodes.add(node)
+                return node
             }
             return nil
         }
@@ -198,10 +304,16 @@ struct ARPassthroughView: UIViewRepresentable {
         private func currentHintText() -> String {
             switch calibration.state {
             case .idle:
-                return "Tap the screen at each corner of your piano"
+                return "Look at your piano keys"
             case .collecting(let n):
+                if n == 0 {
+                    if let p = calibration.handCalibrationProgress {
+                        return "Hold still… \(Int(p * 100))%"
+                    }
+                    return "Scanning for the keys… or rest both index fingers on the lowest and highest key"
+                }
                 let labels = [
-                    "Auto-scanning for your keyboard… or tap corner 1/4 (near-left)",
+                    "",
                     "Tap corner 2/4 — near-right (high notes, front)",
                     "Tap corner 3/4 — far-right (high notes, back)",
                     "Tap corner 4/4 — far-left (low notes, back)",
@@ -213,91 +325,56 @@ struct ARPassthroughView: UIViewRepresentable {
         }
 
         private func cornerMarker() -> SCNNode {
-            let s = SCNSphere(radius: 0.012); let m = SCNMaterial()
-            m.diffuse.contents = UIColor.orange; m.emission.contents = UIColor.orange.withAlphaComponent(0.6)
-            s.materials = [m]; return SCNNode(geometry: s)
+            let s = SCNSphere(radius: 0.008)
+            let m = SCNMaterial()
+            m.lightingModel = .constant
+            m.diffuse.contents = UIColor.orange
+            m.emission.contents = UIColor.orange.withAlphaComponent(0.6)
+            s.materials = [m]
+            return SCNNode(geometry: s)
         }
 
+        /// Faint scan feedback while calibrating only — hidden afterwards so
+        /// no flickering cyan sheets resize over the piano during practice.
         private func planeNode(for a: ARPlaneAnchor) -> SCNNode {
             let root = SCNNode()
             let geo  = SCNPlane(width: CGFloat(a.planeExtent.width), height: CGFloat(a.planeExtent.height))
-            let mat  = SCNMaterial(); mat.diffuse.contents = UIColor.cyan.withAlphaComponent(0.22); mat.isDoubleSided = true
+            let mat  = SCNMaterial()
+            mat.lightingModel = .constant
+            mat.diffuse.contents = UIColor.cyan.withAlphaComponent(0.14)
+            mat.isDoubleSided = true
+            mat.writesToDepthBuffer = false
             geo.materials = [mat]
-            let child = SCNNode(geometry: geo); child.name = "planeGeom"
-            child.eulerAngles.x = -.pi / 2; child.simdPosition = a.center
-            root.addChildNode(child); return root
+            let child = SCNNode(geometry: geo)
+            child.name = "planeGeom"
+            child.eulerAngles.x = -.pi / 2
+            child.simdPosition = a.center
+            root.addChildNode(child)
+            return root
         }
 
         private func updatePlane(_ node: SCNNode, for a: ARPlaneAnchor) {
             guard let c = node.childNode(withName: "planeGeom", recursively: false),
                   let g = c.geometry as? SCNPlane else { return }
-            g.width = CGFloat(a.planeExtent.width); g.height = CGFloat(a.planeExtent.height)
+            g.width = CGFloat(a.planeExtent.width)
+            g.height = CGFloat(a.planeExtent.height)
             c.simdPosition = a.center
         }
     }
 }
 
-// MARK: - Stereo container (phone-in-headset rendering)
-//
-// The Denver VR-20 (Cardboard-style shell) shows each eye one half of the
-// screen through its own lens. A single full-screen view therefore splits
-// wrongly across the lenses. This container renders the SAME ARSession and
-// the SAME SCNScene into two side-by-side ARSCNViews — each eye gets the
-// complete picture. The phone camera is mono, so both eyes intentionally get
-// an identical image (standard for phone passthrough headsets): through the
-// lenses it reads as one large screen floating in front of you.
-//
-// Only `left` has the scene-renderer delegate and receives raycasts; `right`
-// is a pure second presentation of the shared scene graph (each ARSCNView
-// maintains its own camera node, both driven from the same session pose).
-
-final class StereoARContainer: UIView {
-    let left:  ARSCNView
-    let right: ARSCNView
-    private static let gap: CGFloat = 4   // thin divider between the lenses
-
-    init(session: ARSession) {
-        left  = ARSCNView(frame: .zero)
-        right = ARSCNView(frame: .zero)
-        super.init(frame: .zero)
-        backgroundColor = .black
-
-        for view in [left, right] {
-            view.session                      = session
-            view.automaticallyUpdatesLighting = true
-            view.rendersContinuously          = true
-            view.preferredFramesPerSecond     = 60
-            view.contentMode                  = .scaleAspectFill
-            view.debugOptions                 = []
-            view.isUserInteractionEnabled     = false   // container's tap handles input
-            addSubview(view)
-        }
-        right.scene = left.scene   // one shared scene graph → identical AR content
-    }
-
-    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
-
-    override func layoutSubviews() {
-        super.layoutSubviews()
-        let eyeW = (bounds.width - Self.gap) / 2
-        left.frame  = CGRect(x: 0, y: 0, width: eyeW, height: bounds.height)
-        right.frame = CGRect(x: eyeW + Self.gap, y: 0, width: eyeW, height: bounds.height)
-    }
-}
-
 // MARK: - Camera-locked hint bar
 //
-// Small always-in-view text pill for setup guidance (surface scanning, corner
-// calibration instructions). Parented to the camera node so it stays in view,
-// so this is the last piece of UI in the app that's fully in AR — nothing is
-// drawn in 2-D SwiftUI over the video feed.
+// Small always-in-view text pill for setup guidance. Kept narrow (~25° wide)
+// and only shown while calibrating: head-locked UI is a comfort cost, so it
+// is the only head-locked element in the app.
 
 private final class HintBarOverlay {
-    private static let w: Float = 0.34
-    private static let h: Float = 0.052
-    private static let texW: CGFloat = 760
-    private static let texH: CGFloat = 116
-    private static let camOffset = SCNVector3(0, -0.15, -0.55)
+    private static let w: Float = 0.26
+    private static let h: Float = 0.040
+    private static let texW: CGFloat = 780
+    private static let texH: CGFloat = 120
+    private static let camOffset = SCNVector3(0, -0.12, -0.60)
 
     private let node: SCNNode
     private let mat:  SCNMaterial
@@ -307,7 +384,7 @@ private final class HintBarOverlay {
         let geo = SCNPlane(width: CGFloat(Self.w), height: CGFloat(Self.h))
         mat = SCNMaterial()
         mat.lightingModel        = .constant
-        mat.diffuse.contents     = UIColor(red: 0.04, green: 0.03, blue: 0.10, alpha: 0.85)
+        mat.diffuse.contents     = UIColor.clear
         mat.blendMode            = .alpha
         mat.isDoubleSided        = true
         mat.writesToDepthBuffer  = false
@@ -323,27 +400,25 @@ private final class HintBarOverlay {
 
     func update(text: String) {
         guard !text.isEmpty else {
-            if node.opacity > 0.01 { node.runAction(SCNAction.fadeOut(duration: 0.20)) }
+            if !lastText.isEmpty { node.runAction(SCNAction.fadeOut(duration: 0.20), forKey: "fade") }
             lastText = ""
             return
         }
-        if node.opacity < 0.95 { node.runAction(SCNAction.fadeIn(duration: 0.25)) }
+        if lastText.isEmpty { node.runAction(SCNAction.fadeIn(duration: 0.25), forKey: "fade") }
         guard text != lastText else { return }
         lastText = text
         let m = mat
         DispatchQueue.main.async { m.diffuse.contents = HintBarOverlay.bake(text) }
     }
 
-    func remove() { node.removeFromParentNode() }
-
     private static func bake(_ text: String) -> UIImage {
         let sz = CGSize(width: texW, height: texH)
         return UIGraphicsImageRenderer(size: sz).image { _ in
             let rect = CGRect(origin: .zero, size: sz).insetBy(dx: 4, dy: 4)
-            UIColor(red: 0.04, green: 0.03, blue: 0.10, alpha: 0.88).setFill()
-            UIBezierPath(roundedRect: rect, cornerRadius: 28).fill()
+            UIColor(red: 0.04, green: 0.03, blue: 0.10, alpha: 0.86).setFill()
+            UIBezierPath(roundedRect: rect, cornerRadius: 30).fill()
             UIColor(white: 1, alpha: 0.16).setStroke()
-            let b = UIBezierPath(roundedRect: rect.insetBy(dx: 1, dy: 1), cornerRadius: 28)
+            let b = UIBezierPath(roundedRect: rect.insetBy(dx: 1, dy: 1), cornerRadius: 30)
             b.lineWidth = 1.5
             b.stroke()
 
@@ -355,172 +430,158 @@ private final class HintBarOverlay {
                 .foregroundColor: UIColor.white,
                 .paragraphStyle: para,
             ]
-            (text as NSString).draw(in: rect.insetBy(dx: 24, dy: 14), withAttributes: attrs)
+            (text as NSString).draw(in: rect.insetBy(dx: 24, dy: 12), withAttributes: attrs)
         }
     }
 }
 
 // MARK: - 3-D hand overlay
 //
-// Renders a realistic skin-toned hand skeleton in world space.
-// renderingOrder = 300 ensures the hand always appears in front of the AR
-// menu buttons (200) and note-highway geometry (50–100), so the player's
-// virtual hand visually "goes over" all UI elements.
+// Your real hands are already in the passthrough image, so by default only
+// small fingertip dots are drawn (enough to see that tracking is locked on,
+// without a jittery skeleton sitting on top of your fingers). The full
+// skeleton is one tap away in COMFORT › HAND DISPLAY. renderingOrder 300 keeps
+// the hand in front of the menu (200) and the note waterfall (40–100).
 //
-// The index-fingertip node doubles as a touch cursor: it glows blue when
-// near an AR menu button and green when within trigger distance.
+// The index fingertip doubles as a touch cursor: it glows blue near the AR
+// menu and green within trigger distance.
 
 private final class Hand3DOverlay {
-
-    // Joint sphere radii (mm → m), indexed by HandTracker.allJoints order
+    // Joint sphere radii, indexed by HandTracker.allJoints order
     // [0]=wrist, [1-4]=thumb, [5-8]=index, [9-12]=middle, [13-16]=ring, [17-20]=little
     private static let sphereR: [Float] = [
-        0.018,                              // wrist
-        0.010, 0.009, 0.008, 0.007,        // thumb CMC MP IP TIP
-        0.011, 0.009, 0.008, 0.007,        // index MCP PIP DIP TIP
-        0.011, 0.009, 0.008, 0.007,        // middle
-        0.010, 0.009, 0.008, 0.007,        // ring
-        0.009, 0.008, 0.007, 0.006,        // little
+        0.018,
+        0.010, 0.009, 0.008, 0.007,
+        0.011, 0.009, 0.008, 0.007,
+        0.011, 0.009, 0.008, 0.007,
+        0.010, 0.009, 0.008, 0.007,
+        0.009, 0.008, 0.007, 0.006,
     ]
+    private static let tipJoints: Set<Int> = [4, 8, 12, 16, 20]
     private static let cylR: Float = 0.0055
-
-    // Index joint in allJoints that is the index fingertip (used as touch cursor)
     private static let indexTipJoint = 8
-    private static let thumbTipJoint = 4
 
-    // Skin-tone palette (CGColor — thread-safe for render-thread emission changes)
-    private static let cgSkin  = CGColor(red: 0.88, green: 0.71, blue: 0.55, alpha: 1)
-    private static let cgCursorHover   = CGColor(red: 0.15, green: 0.55, blue: 1.00, alpha: 1)
-    private static let cgCursorTouch   = CGColor(red: 0.08, green: 0.96, blue: 0.40, alpha: 1)
+    private static let cgCursorTouch    = CGColor(red: 0.08, green: 0.96, blue: 0.40, alpha: 1)
     private static let cgCursorInactive = CGColor(red: 0.70, green: 0.55, blue: 0.42, alpha: 1)
 
-    // Nodes: [hand 0=left, 1=right][joint/bone index]
-    private var sph:    [[SCNNode]] = []
-    private var cyl:    [[SCNNode]] = []
-    // Separate tracked index-tip sphere materials for cursor glow changes
+    private var sph: [[SCNNode]] = []    // [hand 0=left, 1=right][joint]
+    private var cyl: [[SCNNode]] = []    // [hand][bone]
     private var idxTipMat: [SCNMaterial] = []
+    private var lastStyle: HandStyle?
 
     init(scene: SCNScene) {
-        let skinMat  = Self.makeMat(skin: true,  isTip: false)
-        let tipMat   = Self.makeMat(skin: true,  isTip: true)
-        let boneMat  = Self.makeMat(skin: false, isTip: false)
+        let skinMat = Self.makeMat(skin: true,  isTip: false)
+        let tipMat  = Self.makeMat(skin: true,  isTip: true)
+        let boneMat = Self.makeMat(skin: false, isTip: false)
 
         for _ in 0..<2 {
             var sNodes: [SCNNode] = []
             var cNodes: [SCNNode] = []
             var idxMat: SCNMaterial?
-
             for i in 0..<HandTracker.allJoints.count {
-                let r   = CGFloat(Self.sphereR[i])
-                let geo = SCNSphere(radius: r)
+                let geo = SCNSphere(radius: CGFloat(Self.sphereR[i]))
                 geo.segmentCount = 10
-                let isTip = (i == Self.indexTipJoint || i == Self.thumbTipJoint ||
-                              i == 12 || i == 16 || i == 20)
                 let mat: SCNMaterial
                 if i == Self.indexTipJoint {
-                    // Dedicated mutable material for cursor glow
-                    mat = Self.makeMat(skin: true, isTip: true)
+                    mat = Self.makeMat(skin: true, isTip: true)   // own material: cursor glow
                     idxMat = mat
                 } else {
-                    mat = isTip ? tipMat : skinMat
+                    mat = Self.tipJoints.contains(i) ? tipMat : skinMat
                 }
                 geo.materials = [mat]
                 let n = SCNNode(geometry: geo)
-                n.isHidden       = true
+                n.isHidden = true
                 n.renderingOrder = 300
                 scene.rootNode.addChildNode(n)
                 sNodes.append(n)
             }
-
             for _ in 0..<HandTracker.boneConnections.count {
                 let geo = SCNCylinder(radius: CGFloat(Self.cylR), height: 1.0)
                 geo.radialSegmentCount = 8
-                geo.materials    = [boneMat]
+                geo.materials = [boneMat]
                 let n = SCNNode(geometry: geo)
-                n.isHidden       = true
+                n.isHidden = true
                 n.renderingOrder = 300
                 scene.rootNode.addChildNode(n)
                 cNodes.append(n)
             }
-
             sph.append(sNodes)
             cyl.append(cNodes)
             idxTipMat.append(idxMat ?? Self.makeMat(skin: true, isTip: true))
         }
     }
 
-    /// Call from render thread. `menu` and `keyboardNode` are optional:
-    /// if provided, the index-fingertip cursor node changes colour based on
-    /// its proximity to AR menu buttons.
-    func update(hands: [HandTracker.HandResult],
-                menu: ARMenuOverlay?,
-                keyboardNode: SCNNode?) {
+    /// Render thread.
+    func update(hands: [HandTracker.HandResult], style: HandStyle,
+                menu: ARMenuOverlay?, keyboardNode: SCNNode?) {
         sph.forEach { $0.forEach { $0.isHidden = true } }
         cyl.forEach { $0.forEach { $0.isHidden = true } }
+        guard style != .hidden else { return }
+
+        if style != lastStyle {
+            lastStyle = style
+            // Fingertip dots are a touch smaller so they sit on the nail.
+            let tipScale: Float = style == .fingertips ? 0.8 : 1.0
+            for hand in sph {
+                for i in Self.tipJoints { hand[i].scale = SCNVector3(tipScale, tipScale, tipScale) }
+            }
+        }
 
         for hand in hands {
             let h = hand.isLeft ? 0 : 1
             guard h < sph.count else { continue }
 
             for (i, name) in HandTracker.allJoints.enumerated() {
-                guard let p = hand.joints[name] else { continue }
+                guard style == .skeleton || Self.tipJoints.contains(i),
+                      let p = hand.joints[name] else { continue }
                 sph[h][i].simdPosition = p
                 sph[h][i].isHidden     = false
             }
 
-            for (i, (fi, ti)) in HandTracker.boneConnections.enumerated() {
-                guard let a = hand.joints[HandTracker.allJoints[fi]],
-                      let b = hand.joints[HandTracker.allJoints[ti]] else { continue }
-                placeCylinder(cyl[h][i], from: a, to: b)
+            if style == .skeleton {
+                for (i, (fi, ti)) in HandTracker.boneConnections.enumerated() {
+                    guard let a = hand.joints[HandTracker.allJoints[fi]],
+                          let b = hand.joints[HandTracker.allJoints[ti]] else { continue }
+                    placeCylinder(cyl[h][i], from: a, to: b)
+                }
             }
 
-            // Touch cursor: colour the index-tip sphere based on menu proximity
+            // Touch cursor colour from proximity to the AR menu.
             if let idxWorld = hand.joints[HandTracker.allJoints[Self.indexTipJoint]],
                let m = menu, let kb = keyboardNode {
                 let prox = m.maxProximity(worldPos: idxWorld, keyboardNode: kb)
-                // Proximity: 0=none, <0.4=approach, 0.4-0.9=hover, >0.9=near-touch
-                let cursorColor: CGColor
+                let color: CGColor
                 if prox > 0.88 {
-                    cursorColor = Self.cgCursorTouch   // green — about to trigger
+                    color = Self.cgCursorTouch
                 } else if prox > 0.20 {
-                    // Lerp blue intensity with proximity
-                    let t = (prox - 0.20) / 0.68
-                    cursorColor = CGColor(red: 0.15 + CGFloat(t) * 0.0,
-                                         green: 0.55 - CGFloat(t) * 0.25,
-                                         blue: 1.00,
-                                         alpha: 1)
+                    let t = CGFloat((prox - 0.20) / 0.68)
+                    color = CGColor(red: 0.15, green: 0.55 - t * 0.25, blue: 1.0, alpha: 1)
                 } else {
-                    cursorColor = Self.cgCursorInactive
+                    color = Self.cgCursorInactive
                 }
-                idxTipMat[h].emission.contents = cursorColor
+                idxTipMat[h].emission.contents = color
             }
         }
     }
 
-    // ── Material factories ────────────────────────────────────────────────
-
     private static func makeMat(skin: Bool, isTip: Bool) -> SCNMaterial {
         let m = SCNMaterial()
-        m.lightingModel        = .constant
+        m.lightingModel = .constant
         if skin {
-            // Warm skin tone — alpha blend so it looks solid, not additive
-            m.diffuse.contents   = UIColor(red: 0.86, green: 0.69, blue: 0.53, alpha: isTip ? 1.0 : 0.88)
-            m.emission.contents  = isTip
-                ? CGColor(red: 0.70, green: 0.55, blue: 0.42, alpha: 1)  // initial cursor colour
-                : CGColor(red: 0.20, green: 0.13, blue: 0.07, alpha: 1)  // subtle warm self-emission
+            m.diffuse.contents  = UIColor(red: 0.86, green: 0.69, blue: 0.53, alpha: isTip ? 1.0 : 0.88)
+            m.emission.contents = isTip
+                ? CGColor(red: 0.70, green: 0.55, blue: 0.42, alpha: 1)
+                : CGColor(red: 0.20, green: 0.13, blue: 0.07, alpha: 1)
         } else {
-            // Bone cylinders: slightly darker skin
-            m.diffuse.contents   = UIColor(red: 0.78, green: 0.62, blue: 0.47, alpha: 0.82)
-            m.emission.contents  = CGColor(red: 0.15, green: 0.09, blue: 0.04, alpha: 1)
+            m.diffuse.contents  = UIColor(red: 0.78, green: 0.62, blue: 0.47, alpha: 0.82)
+            m.emission.contents = CGColor(red: 0.15, green: 0.09, blue: 0.04, alpha: 1)
         }
         m.blendMode            = .alpha
         m.writesToDepthBuffer  = false
-        m.readsFromDepthBuffer = false   // always render, never hidden by virtual geometry
+        m.readsFromDepthBuffer = false   // always drawn, never hidden by virtual geometry
         m.isDoubleSided        = true
         return m
     }
-
-    // ── Cylinder placement (render thread) ───────────────────────────────
 
     private func placeCylinder(_ node: SCNNode, from a: SIMD3<Float>, to b: SIMD3<Float>) {
         let diff = b - a
@@ -535,7 +596,7 @@ private final class Hand3DOverlay {
         else                   { q = simd_quatf(from: up, to: dir) }
         node.simdPosition    = (a + b) * 0.5
         node.simdOrientation = q
-        node.scale           = SCNVector3(1, Float(len), 1)
+        node.scale           = SCNVector3(1, len, 1)
         node.isHidden        = false
     }
 }

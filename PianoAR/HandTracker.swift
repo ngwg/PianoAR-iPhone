@@ -5,7 +5,14 @@ import ImageIO
 import simd
 
 final class HandTracker: ObservableObject {
-    @Published var detectedHandCount: Int = 0
+    /// Raw Vision observation count of the latest processed frame (debug).
+    /// Deliberately not @Published: it changes every Vision frame and would
+    /// re-render the SwiftUI tree ~30×/s.
+    private(set) var detectedHandCount: Int {
+        get { lock.lock(); defer { lock.unlock() }; return _count }
+        set { lock.lock(); _count = newValue; lock.unlock() }
+    }
+    private var _count = 0
 
     /// Orientation to feed Vision so hands appear upright in the ML input.
     /// Set on the main thread from the live interface orientation. The app is
@@ -179,17 +186,40 @@ final class HandTracker: ObservableObject {
 
         // Chirality-flap dedupe: with one physical hand in frame, Vision
         // sometimes reports it TWICE (as left and right on top of each other),
-        // which drew two skeletons on one hand. Two opposite-handed detections
-        // whose centroids are within ~11 cm are the same hand — keep the one
-        // with more genuinely-detected joints.
+        // which drew two skeletons on one hand. Keep the one with more
+        // genuinely-detected joints. (The old "centroids within 11 cm" rule
+        // also merged two REAL hands playing side by side near middle C —
+        // one hand vanished and its half of every chord went undetected.)
         if results.count == 2, results[0].isLeft != results[1].isLeft,
-           simd_length(Self.centroid(results[0]) - Self.centroid(results[1])) < 0.11 {
+           Self.isSameHand(results[0], results[1]) {
             let q0 = results[0].joints.count - results[0].estimated.count
             let q1 = results[1].joints.count - results[1].estimated.count
             results = [q0 >= q1 ? results[0] : results[1]]
         }
 
         commit(results, count: observations.count)
+    }
+
+    /// Two detections are one physical hand when their matching joints
+    /// coincide (a straight duplicate), or when their wrists AND centroids
+    /// coincide (a mirrored duplicate — thumb/little swapped). Two real hands
+    /// side by side have wrists ≥ ~8 cm apart and distinct joints.
+    private static func isSameHand(_ a: HandResult, _ b: HandResult) -> Bool {
+        var dists: [Float] = []
+        for (name, pa) in a.joints where !a.estimated.contains(name) {
+            if let pb = b.joints[name], !b.estimated.contains(name) {
+                dists.append(simd_length(pa - pb))
+            }
+        }
+        if dists.count >= 4 {
+            dists.sort()
+            if dists[dists.count / 2] < 0.035 { return true }
+        }
+        let centroidGap = simd_length(centroid(a) - centroid(b))
+        if let wa = a.joints[.wrist], let wb = b.joints[.wrist] {
+            return centroidGap < 0.06 && simd_length(wa - wb) < 0.05
+        }
+        return centroidGap < 0.04
     }
 
     private static func centroid(_ h: HandResult) -> SIMD3<Float> {
@@ -364,7 +394,6 @@ final class HandTracker: ObservableObject {
     }
 
     private func commit(_ hands: [HandResult], count: Int) {
-        lock.lock(); _hands = hands; lock.unlock()
-        DispatchQueue.main.async { self.detectedHandCount = count }
+        lock.lock(); _hands = hands; _count = count; lock.unlock()
     }
 }

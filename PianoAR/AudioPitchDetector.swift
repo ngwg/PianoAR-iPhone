@@ -12,47 +12,92 @@ struct DetectedNote {
 }
 
 struct AudioAttack {
+    let id: Int              // monotonically increasing per detector run
     let confidence: Float
     let onsetScore: Float
     let lowBandScore: Float
     let midBandScore: Float
     let highBandScore: Float
     let pitchHintKeyIndex: Int?
-    let timestamp: TimeInterval
+    let timestamp: TimeInterval   // capture time of the onset (CACurrentMediaTime clock)
+}
+
+/// Per-key evidence that each key was freshly struck at one attack — see
+/// NoteVerifier. Filled in stages as post-onset audio arrives: middle and
+/// treble keys ~0.1 s after the onset, bass keys ~0.19 s, and a second,
+/// later look at middle/treble for rolled chords ~0.15 s.
+struct StrikeVerification {
+    let attackID: Int
+    let timestamp: TimeInterval          // onset time, same as the attack's
+    var rise: [Float] = .init(repeating: 0, count: 88)            // 0...1
+    var status: [NoteStatus] = .init(repeating: .absent, count: 88)
+    var evaluated: [Bool] = .init(repeating: false, count: 88)
+    var complete = false
+
+    func heardKeys() -> [Int] {
+        status.indices.filter { status[$0] == .present }
+    }
+
+    mutating func merge(key: Int, rise r: Float, status s: NoteStatus) {
+        rise[key] = max(rise[key], r)
+        status[key] = max(status[key], s)
+        evaluated[key] = true
+    }
 }
 
 struct PitchSnapshot {
-    let activeNotes: [DetectedNote]  // Debug pitch hints only; vision owns note identity.
-    let attack: AudioAttack?
+    let activeNotes: [DetectedNote]           // debug pitch hints for the latest attack
+    let attack: AudioAttack?                  // most recent attack — sticky until replaced
+    let recentAttacks: [AudioAttack]          // oldest first, last ~1.5 s
+    let verifications: [StrikeVerification]   // oldest first, last ~2 s
     let timestamp: TimeInterval
+
+    static let empty = PitchSnapshot(activeNotes: [], attack: nil, recentAttacks: [],
+                                     verifications: [], timestamp: 0)
+
+    func verification(for attackID: Int) -> StrikeVerification? {
+        verifications.last { $0.attackID == attackID }
+    }
 }
 
-/// Microphone-side piano attack detector.
+/// Microphone-side piano attack detector + expected-note verifier.
 ///
-/// The mic path intentionally avoids being the source of truth for note names.
-/// Acoustic piano transcription from a phone mic is a hard problem; in this app
-/// calibrated key geometry + fingertip position should identify the key, while
-/// audio answers "did a piano-like attack happen right now?"
+/// Audio answers two questions: "did a piano-like attack happen, and when?"
+/// (spectral-flux onset detection on a short window) and, per attack, "which
+/// keys got freshly struck?" (NoteVerifier, long window). The press detector
+/// only ever asks the second question about the keys the song expects next.
 final class AudioPitchDetector: ObservableObject {
-    @Published var lastDetected: String = ""
-    @Published var fingerDebugLines: [String] = []
-    @Published private(set) var microphoneState: String = "mic off"
+    // Debug readout for the in-headset panel. Lock-protected instead of
+    // @Published: publishing from the audio thread ~12×/s re-rendered the
+    // whole SwiftUI tree for text nobody could see.
+    private let debugStore = Locked<[String]>([])
+    private let micState = Locked<String>("mic off")
+
+    /// Safe from any thread.
+    func debugSnapshot() -> [String] { [micState.get()] + debugStore.get() }
 
     // Short-window STFT for onset timing. 2048 @ 48 kHz is ~43 ms, hop 512 is
-    // ~11 ms, which is much better for treble attacks than the old 8192 window.
+    // ~11 ms.
     private let fftN = 2048
     private let hop = 512
     private let log2n: vDSP_Length = 11
 
-    private let minRMS: Float = 0.0015           // raised: ignore very quiet ambient taps
-    private let ambientRMSRatio: Float = 3.0      // raised: need 3× ambient to confirm onset
-    private let minFluxScore: Float = 0.24        // raised: stricter spectral change gate
-    private let ambientFluxRatio: Float = 3.0     // raised: matches ambientRMSRatio
+    private let minRMS: Float = 0.0015
+    private let ambientRMSRatio: Float = 3.0
+    private let minFluxScore: Float = 0.24
+    private let ambientFluxRatio: Float = 3.0
     private let minAttackInterval: TimeInterval = 0.13
     private let maxPitchHints = 3
 
+    // Where the onset sits relative to the newest sample when flux fires: the
+    // Hann window barely weights its newest quarter, so detection happens
+    // once the attack is ~1.5 hops into the frame.
+    private var onsetLagSamples: Int { hop * 3 / 2 }
+
+    private var sampleRate: Double = 48_000
     private var binRes: Float = 48_000 / 2048
     private var keyBins: [Int] = []
+    private var inputLatency: TimeInterval = 0
 
     private static let keyFreqs: [Float] = (0..<88).map {
         440.0 * powf(2.0, Float(21 + $0 - 69) / 12.0)
@@ -67,12 +112,43 @@ final class AudioPitchDetector: ObservableObject {
     private var spectrum: [Float]
     private var prevSpectrum: [Float]
 
+    // Long ring buffer: holds enough history for the verifier's pre-onset
+    // window plus its post-onset window (0.68 s @ 48 kHz).
+    private static let ringN = 32_768
     private var ring: [Float]
-    private var ringW = 0
-    private var hopAcc = 0
+    private var written: Int = 0          // total samples ever written
+    private var hopFill = 0
+
+    // Expected-note verification
+    private let verifier4k = NoteVerifier(fftN: 4096)   // 85 ms: middle + treble
+    private let verifier8k = NoteVerifier(fftN: 8192)   // 171 ms: bass semitones need the resolution
+    private struct PendingVerification {
+        let attackID: Int
+        let onsetSample: Int
+        let timestamp: TimeInterval
+        var stagesDone: Set<Int> = []
+    }
+    private var pending: [PendingVerification] = []
+    /// Keys the song expects together right now (set by the render loop):
+    /// the verifier ignores partials shared between them.
+    private let expectedKeys = Locked<Set<Int>>([])
+
+    func setExpectedKeys(_ keys: Set<Int>) { expectedKeys.set(keys) }
+
+    /// Verification stages: (post-onset delay in s, verifier, low-register keys?).
+    /// Two looks at middle/treble cover chords that are rolled or slightly
+    /// spread; the bass waits for the long window.
+    private static let bassSplitKey = 27   // C3 (~131 Hz) and above use the 4k window
+    private var stages: [(delay: Double, verifier: NoteVerifier, bass: Bool)] {
+        [(0.010, verifier4k, false), (0.010, verifier8k, true), (0.060, verifier4k, false)]
+    }
+    private var verifications: [StrikeVerification] = []
+    private var recentAttacks: [AudioAttack] = []
+    private var nextAttackID = 1
 
     // Debug pitch hints.
     private var keyEnergy: [Float] = .init(repeating: 0, count: 88)
+    private var lastHints: [DetectedNote] = []
 
     // Adaptive attack gates. Start low so the first few real attacks are not missed
     // while the ambient estimate converges upward from actual environment noise.
@@ -88,7 +164,7 @@ final class AudioPitchDetector: ObservableObject {
     private var interruptionObserver: NSObjectProtocol?
 
     private let lock = NSLock()
-    private var _snap = PitchSnapshot(activeNotes: [], attack: nil, timestamp: 0)
+    private var _snap = PitchSnapshot.empty
     private var lastUI: TimeInterval = 0
 
     init() {
@@ -103,7 +179,7 @@ final class AudioPitchDetector: ObservableObject {
         power = .init(repeating: 0, count: fftN / 2)
         spectrum = .init(repeating: 0, count: fftN / 2)
         prevSpectrum = .init(repeating: 0, count: fftN / 2)
-        ring = .init(repeating: 0, count: fftN)
+        ring = .init(repeating: 0, count: Self.ringN)
     }
 
     deinit {
@@ -132,7 +208,10 @@ final class AudioPitchDetector: ObservableObject {
                       let type = AVAudioSession.InterruptionType(rawValue: typeValue)
                 else { return }
                 if type == .ended {
-                    self.stateQueue.async { self.configureAndStart() }
+                    self.stateQueue.async {
+                        self.running = false   // the engine was stopped by the interruption
+                        self.configureAndStart()
+                    }
                 }
             }
         }
@@ -143,7 +222,7 @@ final class AudioPitchDetector: ObservableObject {
             stateQueue.async { [weak self] in self?.configureAndStart() }
         case .denied:
             publishState("mic denied")
-            publishSnapshot(hints: [], attack: nil, timestamp: CACurrentMediaTime())
+            clearSnapshot()
         case .undetermined:
             publishState("mic permission")
             session.requestRecordPermission { [weak self] granted in
@@ -152,12 +231,12 @@ final class AudioPitchDetector: ObservableObject {
                     self.stateQueue.async { self.configureAndStart() }
                 } else {
                     self.publishState("mic denied")
-                    self.publishSnapshot(hints: [], attack: nil, timestamp: CACurrentMediaTime())
+                    self.clearSnapshot()
                 }
             }
         @unknown default:
             publishState("mic unavailable")
-            publishSnapshot(hints: [], attack: nil, timestamp: CACurrentMediaTime())
+            clearSnapshot()
         }
     }
 
@@ -171,7 +250,7 @@ final class AudioPitchDetector: ObservableObject {
             self.engine.stop()
             self.running = false
             self.resetAudioState()
-            self.publishSnapshot(hints: [], attack: nil, timestamp: CACurrentMediaTime())
+            self.clearSnapshot()
             self.publishState("mic off")
         }
     }
@@ -195,6 +274,7 @@ final class AudioPitchDetector: ObservableObject {
             try session.setPreferredSampleRate(48_000)
             try session.setPreferredIOBufferDuration(Double(hop) / 48_000.0)
             try session.setActive(true)
+            inputLatency = session.inputLatency
 
             if tapInstalled {
                 engine.inputNode.removeTap(onBus: 0)
@@ -208,16 +288,20 @@ final class AudioPitchDetector: ObservableObject {
                 return
             }
 
+            sampleRate = fmt.sampleRate
             binRes = Float(fmt.sampleRate) / Float(fftN)
             keyBins = Self.keyFreqs.map { Int(($0 / binRes).rounded()) }
             resetAudioState()
 
+            // iOS may hand the tap far larger buffers than requested (often
+            // ~100 ms); ingest() walks every buffer in hop-sized steps, so
+            // onset timing doesn't depend on the delivered size.
             input.installTap(
                 onBus: 0,
                 bufferSize: AVAudioFrameCount(hop),
                 format: fmt
-            ) { [weak self] buf, _ in
-                self?.ingest(buf)
+            ) { [weak self] buf, when in
+                self?.ingest(buf, when: when)
             }
             tapInstalled = true
 
@@ -232,43 +316,54 @@ final class AudioPitchDetector: ObservableObject {
             }
             running = false
             publishState("mic error")
-            publishSnapshot(hints: [], attack: nil, timestamp: CACurrentMediaTime())
+            clearSnapshot()
         }
     }
 
-    // MARK: - Audio ingest
+    // MARK: - Audio ingest (audio thread)
 
-    private func ingest(_ buf: AVAudioPCMBuffer) {
+    private func ingest(_ buf: AVAudioPCMBuffer, when: AVAudioTime) {
         guard let ch = buf.floatChannelData else { return }
         let n = Int(buf.frameLength)
         guard n > 0 else { return }
 
-        let s = ch[0]
-        for i in 0..<n {
-            ring[ringW] = s[i]
-            ringW = (ringW + 1) % fftN
+        // Capture time of this buffer's first sample, on the same clock as
+        // CACurrentMediaTime() / the SceneKit render loop.
+        let bufferStart: TimeInterval
+        if when.isHostTimeValid {
+            bufferStart = AVAudioTime.seconds(forHostTime: when.hostTime) - inputLatency
+        } else {
+            bufferStart = CACurrentMediaTime() - Double(n) / sampleRate
         }
 
-        hopAcc += n
-        if hopAcc >= hop {
-            hopAcc = 0
-            analyze()
+        let s = ch[0]
+        let mask = Self.ringN - 1
+        var i = 0
+        while i < n {
+            let take = min(hop - hopFill, n - i)
+            for j in 0..<take { ring[(written + j) & mask] = s[i + j] }
+            written += take
+            i += take
+            hopFill += take
+            if hopFill == hop {
+                hopFill = 0
+                analyze(frameEndTime: bufferStart + Double(i) / sampleRate)
+            }
         }
+        runDueVerifications()
+        publishSnapshot(timestamp: bufferStart + Double(n) / sampleRate)
     }
 
-    // MARK: - Analysis
+    // MARK: - Onset analysis (one call per hop)
 
-    private func analyze() {
-        for i in 0..<fftN {
-            frame[i] = ring[(ringW + i) % fftN]
-        }
+    private func analyze(frameEndTime: TimeInterval) {
+        let start = written - fftN
+        guard start >= 0 else { return }
+        let mask = Self.ringN - 1
+        for k in 0..<fftN { frame[k] = ring[(start + k) & mask] }
 
         let rms = rootMeanSquare(frame)
-        let now = CACurrentMediaTime()
-
-        for i in 0..<fftN {
-            frame[i] *= window[i]
-        }
+        for k in 0..<fftN { frame[k] *= window[k] }
         performFFT()
         computeSpectrumMagnitude()
 
@@ -283,27 +378,71 @@ final class AudioPitchDetector: ObservableObject {
             lowScore: low.flux,
             midScore: mid.flux,
             highScore: high.flux,
-            timestamp: now
+            timestamp: frameEndTime - Double(onsetLagSamples) / sampleRate
         )
 
-        let hints = pitchHints(for: attack)
+        if let attack {
+            lastHints = pitchHints(for: attack)
+            recentAttacks.append(attack)
+            pending.append(PendingVerification(attackID: attack.id,
+                                               onsetSample: written - onsetLagSamples,
+                                               timestamp: attack.timestamp))
+        }
 
-        publishSnapshot(hints: hints, attack: attack, timestamp: now)
-        publishUI(
-            hints: hints,
-            attack: attack,
-            rms: rms,
-            onsetScore: onsetScore,
-            lowScore: low.flux,
-            midScore: mid.flux,
-            highScore: high.flux,
-            timestamp: now
-        )
+        publishUI(attack: attack, rms: rms, onsetScore: onsetScore,
+                  lowScore: low.flux, midScore: mid.flux, highScore: high.flux,
+                  timestamp: frameEndTime)
 
         updateAmbient(rms: rms, onsetScore: onsetScore, isAttack: attack != nil)
         prevSpectrum = spectrum
         hasPreviousSpectrum = true
     }
+
+    // MARK: - Expected-note verification
+
+    /// Runs every verification stage whose post-onset window has fully
+    /// arrived, merging results into that attack's StrikeVerification.
+    private func runDueVerifications() {
+        guard !pending.isEmpty else { return }
+        let mask = Self.ringN - 1
+        let preGap = hop                  // keep the attack itself out of "before"
+        let chord = expectedKeys.get()
+        let stageList = stages
+        var remaining: [PendingVerification] = []
+
+        for var p in pending {
+            for (si, stage) in stageList.enumerated() where !p.stagesDone.contains(si) {
+                let vN = stage.verifier.fftN
+                let preStart  = p.onsetSample - preGap - vN
+                let postStart = p.onsetSample + Int(stage.delay * sampleRate)
+                guard written >= postStart + vN else { continue }      // not recorded yet
+                p.stagesDone.insert(si)
+                // Not enough history, or already overwritten: skip the stage.
+                guard preStart >= 0, written - preStart <= Self.ringN else { continue }
+
+                var pre  = [Float](repeating: 0, count: vN)
+                var post = [Float](repeating: 0, count: vN)
+                for k in 0..<vN {
+                    pre[k]  = ring[(preStart + k) & mask]
+                    post[k] = ring[(postStart + k) & mask]
+                }
+                let keys = stage.bass ? Array(0..<Self.bassSplitKey) : Array(Self.bassSplitKey..<88)
+                let results = stage.verifier.evaluate(pre: pre, post: post,
+                                                      sampleRate: Float(sampleRate),
+                                                      keys: keys, chord: chord)
+                let idx = verifications.firstIndex { $0.attackID == p.attackID }
+                var v = idx.map { verifications[$0] }
+                    ?? StrikeVerification(attackID: p.attackID, timestamp: p.timestamp)
+                for r in results { v.merge(key: r.key, rise: r.rise, status: r.status) }
+                v.complete = p.stagesDone.count == stageList.count
+                if let idx { verifications[idx] = v } else { verifications.append(v) }
+            }
+            if p.stagesDone.count < stageList.count { remaining.append(p) }
+        }
+        pending = remaining
+    }
+
+    // MARK: - DSP helpers
 
     private func rootMeanSquare(_ values: [Float]) -> Float {
         var sum: Float = 0
@@ -401,7 +540,10 @@ final class AudioPitchDetector: ObservableObject {
 
         lastAttackTime = timestamp
         let confidence = min(1.0, max(0.05, onsetScore / max(fluxGate * 2.8, 1e-6)))
+        let id = nextAttackID
+        nextAttackID += 1
         return AudioAttack(
+            id: id,
             confidence: confidence,
             onsetScore: onsetScore,
             lowBandScore: lowScore,
@@ -452,8 +594,7 @@ final class AudioPitchDetector: ObservableObject {
         return keyEnergy.firstIndex(of: maxEnergy)
     }
 
-    private func pitchHints(for attack: AudioAttack?) -> [DetectedNote] {
-        guard let attack else { return [] }
+    private func pitchHints(for attack: AudioAttack) -> [DetectedNote] {
         let strongest = keyEnergy.max() ?? 0
         guard strongest > 0 else { return [] }
 
@@ -475,67 +616,70 @@ final class AudioPitchDetector: ObservableObject {
 
     // MARK: - Publishing
 
-    private func publishSnapshot(hints: [DetectedNote],
-                                 attack: AudioAttack?,
-                                 timestamp: TimeInterval) {
-        let snap = PitchSnapshot(activeNotes: hints, attack: attack, timestamp: timestamp)
+    private func publishSnapshot(timestamp: TimeInterval) {
+        recentAttacks.removeAll { timestamp - $0.timestamp > 1.5 }
+        verifications.removeAll { timestamp - $0.timestamp > 2.0 }
+        if recentAttacks.isEmpty { lastHints = [] }
+        let snap = PitchSnapshot(activeNotes: lastHints,
+                                 attack: recentAttacks.last,
+                                 recentAttacks: recentAttacks,
+                                 verifications: verifications,
+                                 timestamp: timestamp)
         lock.lock()
         _snap = snap
         lock.unlock()
     }
 
-    private func publishUI(hints: [DetectedNote],
-                           attack: AudioAttack?,
+    private func clearSnapshot() {
+        lock.lock()
+        _snap = .empty
+        lock.unlock()
+    }
+
+    private func publishUI(attack: AudioAttack?,
                            rms: Float,
                            onsetScore: Float,
                            lowScore: Float,
                            midScore: Float,
                            highScore: Float,
                            timestamp: TimeInterval) {
-        guard timestamp - lastUI > 0.08 else { return }
+        guard attack != nil || timestamp - lastUI > 0.08 else { return }
         lastUI = timestamp
 
-        let hintText = hints.map { note -> String in
-            let name = KeyboardLayout.keys[note.keyIndex].noteName
-            return "\(name):\(String(format: "%.2f", note.magnitude))"
-        }.joined(separator: " ")
-
         var debug: [String] = []
-        let label: String
         if let attack {
-            label = "attack"
-            debug.append(String(format: "ATTACK conf %.2f score %.2f", attack.confidence, attack.onsetScore))
+            debug.append(String(format: "ATTACK #%ld conf %.2f score %.2f",
+                                attack.id, attack.confidence, attack.onsetScore))
         } else {
-            label = ""
             debug.append(String(format: "score %.2f gate %.2f", onsetScore, max(minFluxScore, ambientFlux * ambientFluxRatio)))
         }
         debug.append(String(format: "rms %.4f amb %.4f", rms, ambientRMS))
         debug.append(String(format: "bands L %.2f M %.2f H %.2f", lowScore, midScore, highScore))
-        if !hintText.isEmpty {
-            debug.append("pitch hint \(hintText)")
+        if let v = verifications.last {
+            let names = v.heardKeys().map { KeyboardLayout.keys[$0].noteName }
+            debug.append("heard " + (names.isEmpty ? "-" : names.joined(separator: " ")))
         }
 
-        DispatchQueue.main.async { [weak self] in
-            self?.lastDetected = label
-            self?.fingerDebugLines = debug
-        }
+        debugStore.set(debug)
     }
 
     private func publishState(_ value: String) {
-        DispatchQueue.main.async { [weak self] in
-            self?.microphoneState = value
-        }
+        micState.set(value)
     }
 
     private func resetAudioState() {
-        ring = .init(repeating: 0, count: fftN)
+        ring = .init(repeating: 0, count: Self.ringN)
         frame = .init(repeating: 0, count: fftN)
         power = .init(repeating: 0, count: fftN / 2)
         spectrum = .init(repeating: 0, count: fftN / 2)
         prevSpectrum = .init(repeating: 0, count: fftN / 2)
         keyEnergy = .init(repeating: 0, count: 88)
-        ringW = 0
-        hopAcc = 0
+        written = 0
+        hopFill = 0
+        pending = []
+        verifications = []
+        recentAttacks = []
+        lastHints = []
         ambientRMS  = 0.0008
         ambientFlux = 0.04
         lastAttackTime = 0

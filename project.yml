@@ -27,9 +27,21 @@ targets:
       path: PianoAR/Info.plist
       properties:
         CFBundleDisplayName: PianoAR
-        CFBundleShortVersionString: "0.1.0"
-        CFBundleVersion: "1"
+        CFBundleShortVersionString: "0.2.0"
+        CFBundleVersion: "2"
         UILaunchScreen: {}
+        # ProMotion: without this key iPhone apps are capped at 60 Hz. The
+        # 120 Hz display link drives the gyro re-projection (MotionWarp).
+        CADisableMinimumFrameDurationOnPhone: true
+        # Files app → On My iPhone → PianoAR: drop .mid/.json songs in.
+        UIFileSharingEnabled: true
+        LSSupportsOpeningDocumentsInPlace: true
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: MIDI File
+            CFBundleTypeRole: Viewer
+            LSHandlerRank: Alternate
+            LSItemContentTypes:
+              - public.midi-audio
         UIRequiredDeviceCapabilities:
           - arkit
         UIRequiresFullScreen: true

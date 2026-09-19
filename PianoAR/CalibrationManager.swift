@@ -151,7 +151,7 @@ final class CalibrationManager: ObservableObject {
             }
             let candidates = observations.sorted { $0.confidence > $1.confidence }
             DispatchQueue.main.async {
-                self.processAutoCandidates(candidates, frame: frame)
+                self.processAutoCandidates(candidates, frame: frame, orientation: orientation)
                 self.autoBusy = false
             }
         }
@@ -160,7 +160,8 @@ final class CalibrationManager: ObservableObject {
     /// Main thread: convert Vision corners → view points → world raycasts,
     /// validate physical dimensions, and commit after two consistent hits.
     private func processAutoCandidates(_ candidates: [VNRectangleObservation],
-                                       frame: ARFrame) {
+                                       frame: ARFrame,
+                                       orientation: CGImagePropertyOrientation) {
         guard case .collecting(let count) = state, count == 0,
               let sv = sceneView, sv.bounds.width > 0 else { return }
 
@@ -169,9 +170,17 @@ final class CalibrationManager: ObservableObject {
         let t  = frame.displayTransform(for: io, viewportSize: viewport)
 
         func viewPoint(_ p: CGPoint) -> CGPoint {
-            // Vision normalized (origin bottom-left) → image normalized
-            // (origin top-left) → view normalized → view points.
-            let ip = CGPoint(x: p.x, y: 1 - p.y).applying(t)
+            // Vision normalized (oriented image, origin bottom-left) → native
+            // captured-image normalized (origin top-left) → view normalized →
+            // view points. Vision reports in the ORIENTED image, so with
+            // `.down` (phone in landscape-left) the point must be rotated
+            // 180° back into the native buffer first — same conversion
+            // HandTracker uses. Skipping it mirrored every auto-detected
+            // quad through the image centre.
+            let native = orientation == .down
+                ? CGPoint(x: 1 - p.x, y: p.y)
+                : CGPoint(x: p.x, y: 1 - p.y)
+            let ip = native.applying(t)
             return CGPoint(x: ip.x * viewport.width, y: ip.y * viewport.height)
         }
         func raycast(_ p: CGPoint) -> SIMD3<Float>? {
@@ -261,6 +270,102 @@ final class CalibrationManager: ObservableObject {
         calibrationData = data
         sv.session.add(anchor: ARAnchor(name: "keyboard_calibrated",
                                         transform: data.anchorTransform))
+        pendingAutoCorners = nil
+        state = .done
+    }
+
+    // MARK: - Fingertip calibration (PianoVision-style)
+    //
+    // With the phone in the headset, tapping the screen is awkward. Instead:
+    // rest the LEFT index fingertip on the front of the lowest key (A0) and
+    // the RIGHT one on the front of the highest key (C8), and hold still.
+    // LiDAR puts both fingertips in 3-D; the line between them is the
+    // keyboard's X axis and its length gives the width scale.
+
+    private var handHistory: [(t: TimeInterval, l: SIMD3<Float>, r: SIMD3<Float>)] = []
+    private var handCommitPending = false
+    private let handHold: TimeInterval = 1.2
+    /// 0…1 while both fingertips are being held in place (render thread).
+    private(set) var handCalibrationProgress: Float?
+
+    private static var standardEndKeySpan: Float {
+        KeyboardLayout.keys[KeyboardLayout.keys.count - 1].xCenter - KeyboardLayout.keys[0].xCenter
+    }
+
+    /// Render thread, every frame.
+    func attemptHandCalibration(hands: [HandTracker.HandResult],
+                                cameraPosition cam: SIMD3<Float>,
+                                time: TimeInterval) {
+        func clear() { handHistory.removeAll(); handCalibrationProgress = nil }
+        guard case .collecting(let count) = state, count == 0, !handCommitPending else {
+            clear(); return
+        }
+        let tips = hands.compactMap { h -> SIMD3<Float>? in
+            h.estimated.contains(.indexTip) ? nil : h.joints[.indexTip]
+        }
+        guard tips.count == 2 else { clear(); return }
+
+        // Order the two fingertips left → right as seen from the camera.
+        let mid = (tips[0] + tips[1]) * 0.5
+        let toCamRaw = SIMD3<Float>(cam.x - mid.x, 0, cam.z - mid.z)
+        guard simd_length(toCamRaw) > 0.05 else { clear(); return }
+        let right = simd_normalize(simd_cross(SIMD3<Float>(0, 1, 0), simd_normalize(toCamRaw)))
+        let firstIsLeft = simd_dot(tips[0] - mid, right) < simd_dot(tips[1] - mid, right)
+        let l = firstIsLeft ? tips[0] : tips[1]
+        let r = firstIsLeft ? tips[1] : tips[0]
+
+        // Plausible for fingertips on the two end keys of an 88-key piano.
+        let span = simd_length(SIMD3<Float>(r.x - l.x, 0, r.z - l.z))
+        guard span > 1.05, span < 1.35, abs(r.y - l.y) < 0.05, max(l.y, r.y) < cam.y - 0.10 else {
+            clear(); return
+        }
+
+        // Must be held still: restart the timer if either tip moves > 12 mm.
+        if let first = handHistory.first,
+           simd_length(first.l - l) > 0.012 || simd_length(first.r - r) > 0.012 {
+            handHistory.removeAll()
+        }
+        handHistory.append((time, l, r))
+        let held = time - (handHistory.first?.t ?? time)
+        handCalibrationProgress = Float(min(1, held / handHold))
+        guard held >= handHold else { return }
+
+        let n = Float(handHistory.count)
+        let lAvg = handHistory.reduce(SIMD3<Float>(repeating: 0)) { $0 + $1.l } / n
+        let rAvg = handHistory.reduce(SIMD3<Float>(repeating: 0)) { $0 + $1.r } / n
+        handCommitPending = true
+        clear()
+        DispatchQueue.main.async { [weak self] in
+            self?.commitHandCalibration(left: lAvg, right: rAvg, camera: cam)
+            self?.handCommitPending = false
+        }
+    }
+
+    /// Main thread.
+    private func commitHandCalibration(left l: SIMD3<Float>, right r: SIMD3<Float>,
+                                       camera cam: SIMD3<Float>) {
+        guard case .collecting(let count) = state, count == 0, let sv = sceneView else { return }
+        let flatSpan = SIMD3<Float>(r.x - l.x, 0, r.z - l.z)
+        let span = simd_length(flatSpan)
+        guard span > 0.5 else { return }
+
+        let kbY = SIMD3<Float>(0, 1, 0)
+        var kbX = flatSpan / span
+        var kbZ = simd_normalize(simd_cross(kbX, kbY))
+        let mid = (l + r) * 0.5
+        if simd_dot(kbZ, SIMD3<Float>(cam.x - mid.x, 0, cam.z - mid.z)) < 0 { kbX = -kbX; kbZ = -kbZ }
+
+        // Fingertips rest near the FRONT of the keys (~5 cm in front of the
+        // key-bed centre line) and LiDAR sees the top of the finger (~12 mm
+        // above the key surface). Fine-tune with SETUP › NUDGE.
+        let center = SIMD3<Float>(mid.x, mid.y - 0.012, mid.z) - kbZ * 0.05
+        let transform = simd_float4x4(columns: (SIMD4<Float>(kbX, 0), SIMD4<Float>(kbY, 0),
+                                                SIMD4<Float>(kbZ, 0), SIMD4<Float>(center, 1)))
+        let data = CalibrationData(anchorTransform: transform,
+                                   widthScale: span / Self.standardEndKeySpan,
+                                   depthScale: 1)
+        calibrationData = data
+        sv.session.add(anchor: ARAnchor(name: "keyboard_calibrated", transform: transform))
         pendingAutoCorners = nil
         state = .done
     }

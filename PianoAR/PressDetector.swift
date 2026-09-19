@@ -3,11 +3,14 @@ import Vision
 import simd
 
 struct PressEvent {
+    enum Source: String { case vision, audio }
+
     let keyIndex: Int
     let noteName: String
     let confidence: Float
     let fingerID: String
     let timestamp: TimeInterval
+    var source: Source = .vision
 }
 
 /// Vision-only key-press detection — there is no MIDI ground truth anywhere in
@@ -32,8 +35,6 @@ struct PressEvent {
 ///     bias. A loose absolute-geometry envelope still rejects detections that
 ///     are obviously implausible (e.g. a hand gesturing far above the keys).
 final class PressDetector: ObservableObject {
-    @Published var lastDetected: String = ""
-    @Published var fingerDebugLines: [String] = []
 
     // ── Trajectory shape thresholds ──────────────────────────────────────────
     private let historySize:    Int   = 6       // regression window
@@ -50,15 +51,24 @@ final class PressDetector: ObservableObject {
     private let flashRetain:        TimeInterval = 2.0
 
     // ── Guided (per-key evidence) ────────────────────────────────────────
-    private let guidedAttackWindow:  TimeInterval = 0.28
+    private let guidedAttackWindow:  TimeInterval = 0.35
     private let guidedMinAttackConf: Float = 0.24
     private let pitchSemitoneWindow: Int   = 3
-    // Audio path: a fingertip must be physically ON the key it accepts —
-    // within this many white-key widths of the key centre, inside the key
-    // bed's depth, and at surface height.
+    // Fast audio path (before the note verifier has spoken): a fingertip
+    // must be physically ON the key it accepts — within this many white-key
+    // widths of the key centre, inside the key bed's depth, at surface height.
     private let onKeyXTolKeys:  Float = 1.5
     private let onKeyZExtra:    Float = 0.025
     private let onKeyYTol:      Float = 0.050
+
+    // ── Chord-aware strike acceptance (audio note verification) ─────────
+    // One piano onset stays usable for `strikeWindow` seconds and may accept
+    // every expected key whose own partials rose at that onset. It is no
+    // longer "consumed" by the first key it accepts — that was why the
+    // second and third notes of a chord never registered.
+    private let strikeWindow:  TimeInterval = 0.9
+    private let wrongRise:     Float = 0.65   // confidently heard (S ≥ ~5 dB), but not expected
+    private let handReachKeys: Float = 3.5    // "a hand is near this key" in white-key widths
 
     // ── State ─────────────────────────────────────────────────────────────
 
@@ -83,8 +93,14 @@ final class PressDetector: ObservableObject {
     private var fingers:          [String: FingerTrack] = [:]
     private var recentPresses:    [PressEvent]          = []
     private var lastKeyPressTime: [TimeInterval]        = .init(repeating: -999, count: 88)
-    private var lastGuidedAttackTime: TimeInterval      = -999
     private var lastDebugUpdate:  TimeInterval          = 0
+
+    private struct StrikeState {
+        let groupSerial: Int           // the song group that was current when first seen
+        var acceptedKeys: Set<Int> = []
+        var wrongReported = false
+    }
+    private var strikes: [Int: StrikeState] = [:]   // audio attack id → state
 
     private static let tips: [(VNHumanHandPoseObservation.JointName, String)] = [
         (.thumbTip,  "thumb"),
@@ -96,11 +112,20 @@ final class PressDetector: ObservableObject {
 
     // MARK: - Render-thread entry
 
+    /// - Parameters:
+    ///   - expectedKeyIndices: keys of the current song group still waiting
+    ///     to be played (already-accepted chord members excluded).
+    ///   - groupKeyIndices: every key of the current group (for wrong-note
+    ///     screening).
+    ///   - groupSerial: changes whenever the song advances to a new group, so
+    ///     one strike can never satisfy two consecutive identical chords.
     func update(hands: [HandTracker.HandResult],
                 keyboardNode: SCNNode?,
                 time: TimeInterval,
                 audioSnapshot: PitchSnapshot? = nil,
                 expectedKeyIndices: Set<Int> = [],
+                groupKeyIndices: Set<Int> = [],
+                groupSerial: Int = 0,
                 keyTuning: KeyTuning? = nil) -> [PressEvent] {
 
         var visionCandidates: [PressEvent] = []
@@ -232,18 +257,19 @@ final class PressDetector: ObservableObject {
                     timestamp: time))
             }
 
-            // B) Audio: an onset accepts a remaining expected key only if a
-            //    directly-tracked fingertip is physically ON that key.
-            events += guidedAudioEvents(
+            // B) Audio strikes: every remaining expected key is checked
+            //    against its OWN partials at each recent onset (chord-aware),
+            //    needing only a hand nearby — or, before the verifier has
+            //    spoken, a directly-tracked fingertip right on the key.
+            let strike = guidedStrikeEvents(
                 hands: hands, keyboardNode: kb,
-                expectedKeyIndices: expectedKeyIndices.subtracting(claimed),
-                snapshot: audioSnapshot, time: time)
+                pendingKeys: expectedKeyIndices.subtracting(claimed),
+                groupKeys: groupKeyIndices.union(expectedKeyIndices),
+                snapshot: audioSnapshot, time: time, groupSerial: groupSerial)
+            events += strike.events
+            debugLines += strike.debug
 
             finalPresses = events
-
-            if let atk = audioSnapshot?.attack {
-                debugLines.append(String(format: "onset conf %.2f score %.2f", atk.confidence, atk.onsetScore))
-            }
         } else {
             finalPresses = visionCandidates
         }
@@ -253,29 +279,28 @@ final class PressDetector: ObservableObject {
 
         if time - lastDebugUpdate > 0.10 {
             lastDebugUpdate = time
-            let detected: String
             if !finalPresses.isEmpty {
-                detected = finalPresses.map(\.noteName).joined(separator: " ")
+                debugLines.insert("pressed " + finalPresses.map {
+                    String(format: "%@(%@ %.2f)", $0.noteName, $0.source.rawValue, $0.confidence)
+                }.joined(separator: " "), at: 0)
             } else if let last = recentPresses.last, time - last.timestamp < 1.5 {
-                detected = last.noteName
-            } else {
-                detected = ""
+                debugLines.insert("last " + last.noteName, at: 0)
             }
-            let dbg = debugLines
-            DispatchQueue.main.async { [weak self] in
-                self?.lastDetected = detected
-                self?.fingerDebugLines = dbg
-            }
+            debugStore.set(debugLines)
         }
 
         return finalPresses
     }
 
+    /// Latest debug readout — safe from any thread (render-thread HUD).
+    func debugSnapshot() -> [String] { debugStore.get() }
+    private let debugStore = Locked<[String]>([])
+
     func reset() {
         fingers.removeAll()
         recentPresses.removeAll()
         lastKeyPressTime = .init(repeating: -999, count: 88)
-        lastGuidedAttackTime = -999
+        strikes.removeAll()
     }
 
     // MARK: - Guided press detection (per-key evidence)
@@ -292,73 +317,151 @@ final class PressDetector: ObservableObject {
     // somewhere over the keyboard accepts nothing, and a right-hand press can
     // no longer auto-complete the left hand's half of a chord.
 
-    private func guidedAudioEvents(hands: [HandTracker.HandResult],
-                                   keyboardNode kb: SCNNode,
-                                   expectedKeyIndices: Set<Int>,
-                                   snapshot: PitchSnapshot?,
-                                   time: TimeInterval) -> [PressEvent] {
-        guard !expectedKeyIndices.isEmpty,
-              let snap   = snapshot,
-              let attack = snap.attack,
-              attack.confidence >= guidedMinAttackConf,
-              abs(time - attack.timestamp) <= guidedAttackWindow,
-              attack.timestamp > lastGuidedAttackTime
-        else { return [] }
+    private func guidedStrikeEvents(hands: [HandTracker.HandResult],
+                                    keyboardNode kb: SCNNode,
+                                    pendingKeys: Set<Int>,
+                                    groupKeys: Set<Int>,
+                                    snapshot: PitchSnapshot?,
+                                    time: TimeInterval,
+                                    groupSerial: Int) -> (events: [PressEvent], debug: [String]) {
+        guard let snap = snapshot else { return ([], []) }
 
-        let pitchScore = bestPitchScore(expectedKeyIndices: expectedKeyIndices, snapshot: snap)
-        let pitchContradict = !snap.activeNotes.isEmpty && pitchScore < 0.07
-        guard !pitchContradict else { return [] }
+        // Forget strikes that have aged out of the audio snapshot.
+        let live = Set(snap.recentAttacks.map(\.id))
+        strikes = strikes.filter { live.contains($0.key) }
 
-        // Direct (non-reconstructed) fingertips only.
-        let tips = collectFingertips(hands: hands, keyboardNode: kb)
-        var usedFingers = Set<String>()
+        let direct = collectFingertips(hands: hands, keyboardNode: kb, includeEstimated: false)
+        let onBoard = collectFingertips(hands: hands, keyboardNode: kb, includeEstimated: true)
+            .filter(isOverKeyboard)
+        let reach = KeyboardLayout.whiteKeyWidth * handReachKeys
+
+        var remaining = pendingKeys
         var events: [PressEvent] = []
+        var debug: [String] = []
 
-        let xTol = KeyboardLayout.whiteKeyWidth * onKeyXTolKeys
-        let zMax = KeyboardLayout.whiteKeyDepth / 2 + onKeyZExtra
+        for attack in snap.recentAttacks {
+            let age = time - attack.timestamp
+            guard age >= -0.05, age <= strikeWindow,
+                  attack.confidence >= guidedMinAttackConf else { continue }
+            var st = strikes[attack.id] ?? StrikeState(groupSerial: groupSerial)
+            // Struck while an earlier group was current: never reuse it here.
+            guard st.groupSerial == groupSerial else { continue }
+            let verification = snap.verification(for: attack.id)
 
-        for keyIndex in expectedKeyIndices.sorted() {
-            guard keyIndex >= 0, keyIndex < KeyboardLayout.keys.count else { continue }
-            let key = KeyboardLayout.keys[keyIndex]
-            let surfaceY = key.isBlack
-                ? KeyboardLayout.whiteKeyHeight + KeyboardLayout.blackKeyExtraHeight
-                : KeyboardLayout.whiteKeyHeight
+            for k in remaining.sorted() where k >= 0 && k < KeyboardLayout.keys.count {
+                let key = KeyboardLayout.keys[k]
+                let handNear = onBoard.contains { abs($0.localX - key.xCenter) <= reach }
+                let onKey = direct.contains { tipIsOnKey($0, key) }
 
-            guard let tip = tips
-                .filter({ !usedFingers.contains($0.fingerID)
-                          && abs($0.localX - key.xCenter) <= xTol
-                          && abs($0.localZ) <= zMax
-                          && abs($0.localY - surfaceY) <= onKeyYTol })
-                .min(by: { abs($0.localX - key.xCenter) < abs($1.localX - key.xCenter) })
-            else { continue }
+                var confidence: Float? = nil
+                if let v = verification, v.evaluated[k] {
+                    switch v.status[k] {
+                    case .present where handNear:
+                        // Its own partials rose + a hand is there: struck.
+                        confidence = 0.55 + 0.45 * v.rise[k]
+                    case .unsure where onKey:
+                        // Audio can't separate it (e.g. octave doubling):
+                        // a fingertip right on the key settles it.
+                        confidence = 0.45 + 0.40 * v.rise[k]
+                    default:
+                        break
+                    }
+                } else if onKey, age <= guidedAttackWindow,
+                          !pitchContradicts(expected: remaining, snapshot: snap) {
+                    // Fast path: the verifier needs ~0.2 s of post-onset
+                    // audio; a fingertip squarely on the key can't wait.
+                    confidence = attack.confidence * 0.50 + 0.20
+                }
 
-            usedFingers.insert(tip.fingerID)
-            lastKeyPressTime[keyIndex] = time
-            events.append(PressEvent(
-                keyIndex: keyIndex, noteName: key.noteName,
-                confidence: min(1.0, attack.confidence * 0.50 + pitchScore * 0.30 + 0.15),
-                fingerID: tip.fingerID,
-                timestamp: time))
+                guard let c = confidence else { continue }
+                st.acceptedKeys.insert(k)
+                remaining.remove(k)
+                lastKeyPressTime[k] = time
+                events.append(PressEvent(keyIndex: k, noteName: key.noteName,
+                                         confidence: min(1, c), fingerID: "audio",
+                                         timestamp: time, source: .audio))
+            }
+
+            // Wrong-note feedback, deliberately conservative: nothing that was
+            // expected rose at all, one other key rang out clearly, it isn't
+            // an octave/fifth partial of an expected key, and a real fingertip
+            // is right there.
+            if let v = verification, v.complete, !st.wrongReported, st.acceptedKeys.isEmpty,
+               !groupKeys.contains(where: { v.status[$0] != .absent }),
+               let wrong = v.status.indices
+                    .filter({ !groupKeys.contains($0) && v.status[$0] == .present
+                              && v.rise[$0] >= wrongRise })
+                    .filter({ w in !groupKeys.contains { Self.isHarmonicRelative(w, $0) } })
+                    .max(by: { v.rise[$0] < v.rise[$1] }),
+               direct.contains(where: { tipIsOnKey($0, KeyboardLayout.keys[wrong]) }) {
+                st.wrongReported = true
+                events.append(PressEvent(keyIndex: wrong,
+                                         noteName: KeyboardLayout.keys[wrong].noteName,
+                                         confidence: v.rise[wrong] * 0.8, fingerID: "audio",
+                                         timestamp: time, source: .audio))
+            }
+            strikes[attack.id] = st
+
+            if let v = verification {
+                let heard = v.heardKeys().map { KeyboardLayout.keys[$0].noteName }
+                debug.append(String(format: "strike #%ld %.2fs heard %@", attack.id, age,
+                                    heard.isEmpty ? "-" : heard.joined(separator: " ")))
+            } else {
+                debug.append(String(format: "strike #%ld %.2fs verifying…", attack.id, age))
+            }
         }
 
-        // Consume the onset only when it actually accepted something, so a
-        // slightly-early sound doesn't burn before the finger settles.
-        if !events.isEmpty { lastGuidedAttackTime = attack.timestamp }
-        return events
+        if !pendingKeys.isEmpty {
+            let need = pendingKeys.sorted().map { KeyboardLayout.keys[$0].noteName }
+            debug.append("need " + need.joined(separator: " "))
+        }
+        return (events, debug)
+    }
+
+    /// Octave / fifth / fourth relationships share strong partials, so a
+    /// played note can "light up" such a relative. Those are never called wrong.
+    private static func isHarmonicRelative(_ a: Int, _ b: Int) -> Bool {
+        let interval = abs(a - b) % 12
+        return interval == 0 || interval == 7 || interval == 5
+    }
+
+    private func tipIsOnKey(_ tip: FingertipLocal, _ key: KeyboardLayout.Key) -> Bool {
+        let surfaceY = key.isBlack
+            ? KeyboardLayout.whiteKeyHeight + KeyboardLayout.blackKeyExtraHeight
+            : KeyboardLayout.whiteKeyHeight
+        return abs(tip.localX - key.xCenter) <= KeyboardLayout.whiteKeyWidth * onKeyXTolKeys
+            && abs(tip.localZ) <= KeyboardLayout.whiteKeyDepth / 2 + onKeyZExtra
+            && abs(tip.localY - surfaceY) <= onKeyYTol
+    }
+
+    /// A fingertip plausibly resting on or playing the keyboard (not a hand
+    /// gesturing in the air above it).
+    private func isOverKeyboard(_ tip: FingertipLocal) -> Bool {
+        tip.localX >= -0.03 && tip.localX <= KeyboardLayout.totalWidth + 0.03
+            && abs(tip.localZ) <= KeyboardLayout.whiteKeyDepth / 2 + 0.05
+            && tip.localY >= -0.04 && tip.localY <= 0.09
+    }
+
+    private func pitchContradicts(expected: Set<Int>, snapshot: PitchSnapshot) -> Bool {
+        !snapshot.activeNotes.isEmpty
+            && bestPitchScore(expectedKeyIndices: expected, snapshot: snapshot) < 0.07
     }
 
     // MARK: - Helpers
 
-    /// Directly-observed fingertips only — an occlusion-reconstructed
-    /// (guessed) fingertip must never satisfy the on-key requirement.
+    /// Fingertips in keyboard-local coordinates (X measured from the left
+    /// edge). By default only directly-observed tips — an occlusion-
+    /// reconstructed (guessed) fingertip must never satisfy the on-key
+    /// requirement — but guessed tips are fine for "is a hand near here".
     private func collectFingertips(hands: [HandTracker.HandResult],
-                                   keyboardNode kb: SCNNode) -> [FingertipLocal] {
+                                   keyboardNode kb: SCNNode,
+                                   includeEstimated: Bool = false) -> [FingertipLocal] {
         var out: [FingertipLocal] = []
         let leftEdge = -KeyboardLayout.totalWidth / 2
         for hand in hands {
             let side = hand.isLeft ? "L" : "R"
             for (joint, name) in Self.tips {
-                guard !hand.estimated.contains(joint),
+                guard includeEstimated || !hand.estimated.contains(joint),
                       let wp = hand.joints[joint] else { continue }
                 let lp = kb.simdConvertPosition(wp, from: nil)
                 out.append(FingertipLocal(
@@ -387,9 +490,12 @@ final class PressDetector: ObservableObject {
         return best
     }
 
+    /// Onset timestamps are true capture times (they reach the render loop
+    /// up to ~0.1 s later), hence the slightly wider window than the old
+    /// callback-time stamps needed.
     private func audioBoost(_ snapshot: PitchSnapshot?, time: TimeInterval) -> Float {
         guard let snap = snapshot, let attack = snap.attack,
-              abs(time - attack.timestamp) <= 0.12 else { return 0 }
+              abs(time - attack.timestamp) <= 0.25 else { return 0 }
         return 0.06 + attack.confidence * 0.10
     }
 
