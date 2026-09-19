@@ -222,6 +222,7 @@ struct ARPassthroughView: UIViewRepresentable {
                 expectedKeyIndices: pending,
                 groupKeyIndices: groupKeys,
                 upcomingKeyIndices: songPlayer.upcomingKeyIndices(),
+                struggling: songPlayer.struggle >= 2,
                 groupSerial: songPlayer.groupSerial,
                 keyTuning: keyTuning
             )

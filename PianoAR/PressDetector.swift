@@ -137,6 +137,7 @@ final class PressDetector: ObservableObject {
                 expectedKeyIndices: Set<Int> = [],
                 groupKeyIndices: Set<Int> = [],
                 upcomingKeyIndices: Set<Int> = [],
+                struggling: Bool = false,
                 groupSerial: Int = 0,
                 keyTuning: KeyTuning? = nil) -> [PressEvent] {
 
@@ -262,7 +263,7 @@ final class PressDetector: ObservableObject {
                     hands: hands, keyboardNode: kb,
                     pendingKeys: expectedKeyIndices,
                     groupKeys: groupKeyIndices.union(expectedKeyIndices),
-                    upcoming: upcomingKeyIndices,
+                    upcoming: upcomingKeyIndices, struggling: struggling,
                     snapshot: audioSnapshot, time: time, groupSerial: groupSerial,
                     valleys: recentValleys)
                 events = strike.events
@@ -340,6 +341,7 @@ final class PressDetector: ObservableObject {
                                     pendingKeys: Set<Int>,
                                     groupKeys: Set<Int>,
                                     upcoming: Set<Int>,
+                                    struggling: Bool,
                                     snapshot: PitchSnapshot?,
                                     time: TimeInterval,
                                     groupSerial: Int,
@@ -402,11 +404,15 @@ final class PressDetector: ObservableObject {
                         // occluded by their own knuckles) and must never veto
                         // a note the microphone clearly heard.
                         confidence = 0.55 + 0.45 * v.rise[k]
-                    case .unsure where (onKey || valleyNear || octaveMate) && age <= 0.45:
+                    case .unsure where (valleyNear || octaveMate || struggling) && age <= 0.45:
                         // Masked: this key has fewer than two partials it does
                         // not share with something else already sounding, so
                         // the sound genuinely cannot decide. A finger seen
-                        // pressing it, or its octave partner heard, settles it.
+                        // *pressing* it, or its octave partner heard, settles
+                        // it. Deliberately not "a fingertip is on the key" —
+                        // a finger resting silently on a key is not evidence
+                        // of anything, and accepting on it is how a note gets
+                        // marked played while the hand just sits there.
                         confidence = 0.45 + 0.40 * v.rise[k]
                     default:
                         break

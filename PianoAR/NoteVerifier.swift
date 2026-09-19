@@ -58,6 +58,11 @@ final class NoteVerifier {
     private let partialRiseDB: Float = 3
     private let partialSNRDB: Float = 6
     private let sideLobeDB: Float = 25
+    /// Bracket on the inharmonicity estimate, and how much positional
+    /// uncertainty a partial may carry before it stops being evidence.
+    private let inharmLo: Float = 0.7
+    private let inharmHi: Float = 1.4
+    private let maxSlopCents: Float = 25
 
     /// This piano's tuning, read once per strike (see PianoTuning.snapshot).
     /// Each NoteVerifier is only ever used from the audio thread.
@@ -141,8 +146,19 @@ final class NoteVerifier {
                 if fc > maxHz { break }
                 if fc < 60 { continue }
 
-                let fLo = nf * f0 * powf(2, -tol / 1200) * sqrtf(1 + 0.5 * B * nf * nf)
-                let fHi = nf * f0 * powf(2,  tol / 1200) * sqrtf(1 + 2.0 * B * nf * nf)
+                // How badly the inharmonicity guess smears this partial. B is
+                // a per-register estimate, not a measurement, and its effect
+                // grows as n²: by partial 8 in the treble the resulting window
+                // is wider than a semitone, so the "peak" found in it is as
+                // likely to belong to a neighbouring key as to this one. Such
+                // a partial always finds something and therefore proves
+                // nothing — drop it rather than let it vote.
+                let slopLo = sqrtf(1 + inharmLo * B * nf * nf)
+                let slopHi = sqrtf(1 + inharmHi * B * nf * nf)
+                if 1200 * log2f(slopHi / slopLo) > maxSlopCents { continue }
+
+                let fLo = nf * f0 * powf(2, -tol / 1200) * slopLo
+                let fHi = nf * f0 * powf(2,  tol / 1200) * slopHi
                 let c = Int((fc / binHz).rounded())
                 let lo = max(1, min(Int((fLo / binHz).rounded(.down)), c))
                 let hi = min(after.count - 2, max(Int((fHi / binHz).rounded(.up)), c))

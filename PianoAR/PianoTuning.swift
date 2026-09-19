@@ -77,14 +77,23 @@ final class PianoTuning {
         return lo + (hi - lo) * t
     }
 
-    /// Half-width of the partial search window, in cents. Wide until the
-    /// register has been heard a few times, then tight — a tight window is
-    /// what stops one key's partials being read as another key's.
+    /// Half-width of the partial search window, in cents.
+    ///
+    /// Starts at ±65 cents and closes to ±19 as the register is heard. The
+    /// wide start is not slack, it is the way out of a deadlock: a household
+    /// piano 30–50 cents flat is entirely ordinary, and with a fixed ±35-cent
+    /// window every partial of every note falls outside it, so nothing ever
+    /// verifies — and because the tuning is learned from notes that verify,
+    /// nothing is ever learned either. The app would simply never work on
+    /// that piano and would give no hint why. ±65 cents still cannot reach
+    /// the neighbouring semitone (100 cents away), so the worst case is a few
+    /// generous notes in the first bars, and it tightens within a handful.
     func searchCents(forKey k: Int) -> Float {
         lock.lock(); defer { lock.unlock() }
-        let w = weight[Self.band(k)]
-        return 19 + 16 * expf(-w / 5)
+        return Self.width(weight[Self.band(k)])
     }
+
+    private static func width(_ w: Float) -> Float { 19 + 46 * expf(-w / 4) }
 
     /// Every key's offset and search width in one lock acquisition.
     ///
@@ -102,7 +111,7 @@ final class PianoTuning {
             let lo = cents[min(Self.bandCount - 1, max(0, i))]
             let hi = cents[min(Self.bandCount - 1, max(0, i + 1))]
             offset[k] = lo + (hi - lo) * t
-            search[k] = 19 + 16 * expf(-weight[Self.band(k)] / 5)
+            search[k] = Self.width(weight[Self.band(k)])
         }
         return (offset, search)
     }

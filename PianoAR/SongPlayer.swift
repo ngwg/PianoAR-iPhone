@@ -80,6 +80,8 @@ struct PracticeHUD: Equatable {
     let tempoPercent: Int
     let hand: PracticeHand
     let waitMode: Bool
+    /// 0 = fine, 1 = slow, 2 = stuck. See SongPlayer.struggle.
+    let struggle: Int
 }
 
 /// Song clock + practice logic.
@@ -114,8 +116,27 @@ final class SongPlayer: ObservableObject {
 
     private var startHostTime: Double = 0
     private let countInBeats = 2.0
-    private let earlySeconds = 0.35      // play-along: how early a press may count
+    private let earlySeconds = 0.35      // how early a press may count
     private let lateSeconds  = 0.40      // play-along: how late before it's a miss
+
+    /// When the current group came up, and how long a player is left waiting
+    /// before the app admits it might be the one at fault.
+    private var groupEnteredAt: TimeInterval = 0
+    private let slowAfter:  TimeInterval = 4
+    private let stuckAfter: TimeInterval = 9
+
+    /// 0 = fine. 1 = this is taking a while: say what the microphone can
+    /// hear, so the player knows whether to play louder or fix the mount.
+    /// 2 = stuck: relax the verdict for the expected keys only, and point at
+    /// SKIP. Never auto-advances — being moved past a note you never played
+    /// teaches nothing — but the way out is always one tap away and visible.
+    var struggle: Int {
+        guard isPlaying, !isComplete, waitMode, groupEnteredAt > 0 else { return 0 }
+        let held = CACurrentMediaTime() - groupEnteredAt
+        if held >= stuckAfter { return 2 }
+        if held >= slowAfter { return 1 }
+        return 0
+    }
 
     private let midiToKeyIndex: [Int: Int] = Dictionary(
         uniqueKeysWithValues: KeyboardLayout.keys.map { ($0.midiNote, $0.index) }
@@ -143,6 +164,7 @@ final class SongPlayer: ObservableObject {
         resetProgress()
         startHostTime = CACurrentMediaTime() + countInBeats * 60.0 / effectiveBPM
         isPlaying = true
+        groupEnteredAt = startHostTime
         feedback = "Get ready"
     }
 
@@ -237,8 +259,11 @@ final class SongPlayer: ObservableObject {
     func pendingKeyIndicesNow() -> Set<Int> {
         guard isPlaying, !isComplete, groupIndex < groups.count else { return [] }
         let g = groups[groupIndex]
-        if !waitMode,
-           rawBeat(at: CACurrentMediaTime()) < g.startBeat - earlySeconds * effectiveBPM / 60.0 {
+        // Nothing counts before the note is due. This used to be gated on
+        // play-along only, so in wait mode any sound during the lead-in
+        // (a chair, a cough, the first note of the count-off) could be
+        // accepted as the opening note of the song.
+        if rawBeat(at: CACurrentMediaTime()) < g.startBeat - earlySeconds * effectiveBPM / 60.0 {
             return []
         }
         return g.requiredKeys.subtracting(acceptedKeys)
@@ -354,11 +379,25 @@ final class SongPlayer: ObservableObject {
             accuracyPercent: Int((s.accuracy * 100).rounded()),
             averageTimingMs: Int(s.averageTimingMs.rounded()),
             prompt: pending,
-            feedback: feedback,
+            feedback: hint(pending) ?? feedback,
             tempoPercent: Int((tempoScale * 100).rounded()),
             hand: practiceHand,
-            waitMode: waitMode
+            waitMode: waitMode,
+            struggle: struggle
         )
+    }
+
+    /// What to say when a note is not coming through. Silence is the worst
+    /// answer here: the player cannot tell "the app can't hear me" from
+    /// "I am playing it wrong", and with no way to tell, people end up
+    /// hammering a note that was right the first time.
+    private func hint(_ pending: String) -> String? {
+        guard !pending.isEmpty else { return nil }
+        switch struggle {
+        case 1:  return "Waiting for \(pending) — try playing it a little firmer"
+        case 2:  return "Still can't hear \(pending) — tap SKIP to move on"
+        default: return nil
+        }
     }
 
     // MARK: - Private
@@ -406,6 +445,7 @@ final class SongPlayer: ObservableObject {
         groupIndex += 1
         acceptedKeys.removeAll()
         groupSerial &+= 1
+        groupEnteredAt = CACurrentMediaTime()
     }
 
     private func finish() {
