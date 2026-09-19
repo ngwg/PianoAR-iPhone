@@ -63,6 +63,9 @@ final class NoteVerifier {
     private let inharmLo: Float = 0.7
     private let inharmHi: Float = 1.4
     private let maxSlopCents: Float = 25
+    /// How far a shared partial must stand above the lower note's smooth
+    /// envelope before it counts as a second note rather than the first.
+    private let smoothExcess: Float = 0.6
 
     /// This piano's tuning, read once per strike (see PianoTuning.snapshot).
     /// Each NoteVerifier is only ever used from the audio thread.
@@ -100,6 +103,7 @@ final class NoteVerifier {
         let rise: Float      // dB, after vs before
         let snr: Float       // dB above the local background
         let residual: Float  // cents from the prediction to the real peak
+        let amp: Float       // measured level at the peak
     }
 
     /// Evaluates `keys` (0…87). `pre`/`post` must each hold `fftN` samples,
@@ -117,6 +121,9 @@ final class NoteVerifier {
         searchTable = tuning.search
         let before = magnitudeSpectrum(pre)
         let after  = magnitudeSpectrum(post)
+        // Nothing more than 50 dB under the loudest thing in the frame is a
+        // peak worth believing.
+        let globalFloor = (after.max() ?? 0) * powf(10, -50 / 20)
         let binHz  = sampleRate / Float(fftN)
         var floorCache: [Int: Float] = [:]
 
@@ -147,7 +154,11 @@ final class NoteVerifier {
                 let nf = Float(n)
                 let fc = nf * f0 * sqrtf(1 + B * nf * nf)
                 if fc > maxHz { break }
-                if fc < 60 { continue }
+                // Below ~75 Hz there is nothing worth reading: the soundboard
+                // stops radiating efficiently under its first mode (~49 Hz)
+                // and the phone's own microphone rolls the rest away. Bass
+                // keys are identified from partials 3-8 regardless.
+                if fc < 75 { continue }
 
                 // How badly the inharmonicity guess smears this partial. B is
                 // a per-register estimate, not a measurement, and its effect
@@ -172,6 +183,7 @@ final class NoteVerifier {
                 let aAfter = after[peakBin]
                 // Must be a genuine peak, not the flank of something outside.
                 guard aAfter >= after[peakBin - 1], aAfter >= after[peakBin + 1] else { continue }
+                if aAfter < globalFloor { continue }
                 if loudNeighbour(after, peak: aAfter, lo: lo, hi: hi) { continue }
 
                 var aBefore: Float = 0
@@ -188,7 +200,8 @@ final class NoteVerifier {
                                       weight: (f0 + 52) / (nf * f0 + 320),
                                       rise: 20 * log10f((aAfter + nfl) / (aBefore + nfl)),
                                       snr: 20 * log10f(aAfter / nfl),
-                                      residual: 1200 * log2f(max(peakHz, 1) / fc)))
+                                      residual: 1200 * log2f(max(peakHz, 1) / fc),
+                                      amp: aAfter))
             }
             cache[k] = obs
             return obs
@@ -270,8 +283,19 @@ final class NoteVerifier {
                         coincides($0, obsJ) || self.sharesPartial($0, withAnyOf: others, binHz: binHz)
                     }
                     if kOwn.status == .present { continue }      // k has its own proof
-                    // No partials of its own at all (e.g. an octave above j):
-                    // can't tell from sound → unsure. Otherwise it wasn't played.
+                    // k has no partials of its own — the octave case. Its
+                    // frequencies cannot settle this: a note's 2nd partial and
+                    // the octave above it differ by well under a tenth of one
+                    // FFT bin, and stretch tuning deliberately closes even
+                    // that. But the *amplitudes* can. A single note's partials
+                    // fall away smoothly; two notes an octave apart make every
+                    // even partial of the lower one stick up above that smooth
+                    // curve. So ask whether the shared partials are louder
+                    // than j alone could account for (Klapuri).
+                    if kOwn.status == .unsure,
+                       excessOverSmooth(obsK, of: obsJ) >= smoothExcess {
+                        continue                                 // genuinely both
+                    }
                     status = kOwn.status == .unsure ? .unsure : .absent
                     score = kOwn.score
                     break
@@ -284,6 +308,38 @@ final class NoteVerifier {
             out.append((k, simd_clamp(score / 8, 0, 1), status))
         }
         return out
+    }
+
+    /// How far the partials this key shares with `other` stand above the
+    /// smooth envelope of `other` alone, as a fraction of that envelope.
+    ///
+    /// Klapuri's spectral-smoothness argument: one string's partial envelope
+    /// is a smooth, mostly falling curve, so replacing every partial with the
+    /// smaller of itself and the local mean of its neighbours gives what that
+    /// note alone would look like. Whatever stands above that belongs to
+    /// something else. This is what separates "C3 was played" from "C3 and C4
+    /// were played" — in the second case C3's even partials are lifted, and
+    /// its odd ones are not.
+    private func excessOverSmooth(_ obs: [PartialObs], of other: [PartialObs]) -> Float {
+        guard other.count >= 3 else { return 0 }
+        var best: Float = 0
+        for (i, o) in other.enumerated() {
+            // Octave-wide window in partial number, i.e. n/2 ... 2n.
+            var sum: Float = 0, wsum: Float = 0
+            for (j, q) in other.enumerated() where j != i {
+                guard q.n * 2 >= o.n, q.n <= o.n * 2 else { continue }
+                let w = 1 / (1 + abs(Float(q.n - o.n)))
+                sum += q.amp * w; wsum += w
+            }
+            guard wsum > 0 else { continue }
+            let smooth = min(o.amp, sum / wsum)          // a_j <- min(a_j, g_j)
+            guard smooth > 1e-7 else { continue }
+            // Only partials this key actually shares with `other` say anything.
+            let tol = max(o.freq * 0.02, 1)
+            guard obs.contains(where: { abs($0.freq - o.freq) <= tol }) else { continue }
+            best = max(best, (o.amp - smooth) / smooth)
+        }
+        return best
     }
 
     /// Median residual of the low partials — median, because one of them may
