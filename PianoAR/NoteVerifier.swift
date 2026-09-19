@@ -104,8 +104,11 @@ final class NoteVerifier {
 
     /// Evaluates `keys` (0…87). `pre`/`post` must each hold `fftN` samples,
     /// oldest first. `chord` = every key currently expected together.
+    /// - Parameter ringing: keys already sounding when this attack happened.
+    ///   They are judged against a different null hypothesis — see `verdict`.
     func evaluate(pre: [Float], post: [Float], sampleRate: Float,
-                  keys: [Int], chord: Set<Int>) -> [(key: Int, rise: Float, status: NoteStatus)] {
+                  keys: [Int], chord: Set<Int>,
+                  ringing: Set<Int> = []) -> [(key: Int, rise: Float, status: NoteStatus)] {
         guard pre.count == fftN, post.count == fftN, sampleRate > 0 else { return [] }
         let tuning = PianoTuning.shared.snapshot()
         for k in 0..<88 {
@@ -192,8 +195,22 @@ final class NoteVerifier {
         }
 
         /// Verdict from a key's partials, skipping those `skip` rejects.
-        func verdict(_ obs: [PartialObs], f0: Float,
+        ///
+        /// `struck` = this key was already sounding, so the question changes.
+        /// Striking a key that is still ringing cannot produce much of a rise:
+        /// the partials are already occupied, and adding a second sound of
+        /// equal amplitude to one that has barely decayed is at most about
+        /// +3 dB — and if the new hammer arrives out of phase with what is
+        /// there, the partial can *drop* by 10 dB or more. So for a ringing
+        /// key the null hypothesis is not silence but **decay**: at 3-8 dB
+        /// per second, over the 40 ms measured here a note left alone falls
+        /// slightly. A rise of even 1.2 dB is already inconsistent with that,
+        /// and holding re-strikes to the same 3.5 dB bar as fresh notes is
+        /// why repeated notes went unheard.
+        func verdict(_ obs: [PartialObs], f0: Float, struck: Bool = false,
                      skip: (Float) -> Bool) -> (score: Float, status: NoteStatus) {
+            let presentBar = struck ? 1.2 : presentDB
+            let riseBar    = struck ? 1.0 : partialRiseDB
             var sum: Float = 0, wSum: Float = 0
             var rising = 0, usable = 0
             var best: (r: Float, snr: Float) = (0, 0)
@@ -204,14 +221,14 @@ final class NoteVerifier {
                 guard p.snr >= 0 else { continue }
                 sum  += p.weight * simd_clamp(p.rise, 0, 15)
                 wSum += p.weight
-                if p.rise >= partialRiseDB && p.snr >= partialSNRDB { rising += 1 }
+                if p.rise >= riseBar && p.snr >= partialSNRDB { rising += 1 }
                 if p.rise > best.r, p.snr > 0 { best = (p.rise, p.snr) }
             }
             let s = wSum > 0 ? sum / wSum : 0
             // Masked — fewer than two partials this key doesn't share with
             // something else already sounding. Only here does sound abstain.
             if usable < 2 { return (s, .unsure) }
-            if s >= presentDB && rising >= 2 { return (s, .present) }
+            if s >= presentBar && rising >= 2 { return (s, .present) }
             // A soft note spreads a small rise over many partials: the
             // weighted mean dilutes it, but four clean rising partials at
             // once is not something a decaying or sympathetic string does.
@@ -231,7 +248,8 @@ final class NoteVerifier {
             let f0 = f0Table[k]
             let others = chord.subtracting([k])
             let obsK = measure(k)
-            var (score, status) = verdict(obsK, f0: f0) {
+            let reStruck = ringing.contains(k)
+            var (score, status) = verdict(obsK, f0: f0, struck: reStruck) {
                 self.sharesPartial($0, withAnyOf: others, binHz: binHz)
             }
 
@@ -248,7 +266,7 @@ final class NoteVerifier {
                         coincides($0, obsK) || self.sharesPartial($0, withAnyOf: chord, binHz: binHz)
                     }
                     guard jOwn.status == .present, jOwn.score >= 4 else { continue }
-                    let kOwn = verdict(obsK, f0: f0) {
+                    let kOwn = verdict(obsK, f0: f0, struck: reStruck) {
                         coincides($0, obsJ) || self.sharesPartial($0, withAnyOf: others, binHz: binHz)
                     }
                     if kOwn.status == .present { continue }      // k has its own proof

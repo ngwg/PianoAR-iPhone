@@ -90,7 +90,12 @@ final class AudioPitchDetector: ObservableObject {
     private let ambientRMSRatio: Float = 2.5
     private let minFluxScore: Float = 0.18
     private let ambientFluxRatio: Float = 2.5
-    private let minAttackInterval: TimeInterval = 0.09
+    // 0.05 s = 20 notes/s, comfortably past the ~14 notes/s a trill reaches
+    // (and past what a grand's double escapement allows at ~8 per finger).
+    // It used to be 0.09 s, which quietly ate trills; it could only come down
+    // once onsets were peak-picked properly rather than fired on the first
+    // frame over threshold.
+    private let minAttackInterval: TimeInterval = 0.05
     private let maxPitchHints = 3
 
     // Where the onset sits relative to the newest sample when flux fires: the
@@ -173,6 +178,11 @@ final class AudioPitchDetector: ObservableObject {
     private var stages: [(delay: Double, verifier: NoteVerifier, bass: Bool)] {
         [(0.035, verifier4k, false), (0.030, verifier8k, true), (0.120, verifier4k, false)]
     }
+    /// When each key was last heard clearly. A key heard within the last
+    /// couple of seconds is very likely still ringing, which changes how a
+    /// fresh strike on it has to be judged (see NoteVerifier.verdict).
+    private var lastHeard: [TimeInterval] = .init(repeating: -1, count: 88)
+    private let ringingFor: TimeInterval = 2.5
     private var verifications: [StrikeVerification] = []
     private var recentAttacks: [AudioAttack] = []
     private var nextAttackID = 1
@@ -516,9 +526,19 @@ final class AudioPitchDetector: ObservableObject {
                     post[k] = ring[(postStart + k) & mask]
                 }
                 let keys = stage.bass ? Array(0..<Self.bassSplitKey) : Array(Self.bassSplitKey..<88)
+                var ringing = Set<Int>()
+                for k in 0..<88 where lastHeard[k] > 0
+                    && p.timestamp - lastHeard[k] <= ringingFor
+                    && p.timestamp - lastHeard[k] > 0.04 {
+                    ringing.insert(k)
+                }
                 let results = stage.verifier.evaluate(pre: pre, post: post,
                                                       sampleRate: Float(sampleRate),
-                                                      keys: keys, chord: chord)
+                                                      keys: keys, chord: chord,
+                                                      ringing: ringing)
+                for r in results where r.status == .present {
+                    lastHeard[r.key] = max(lastHeard[r.key], p.timestamp)
+                }
                 let idx = verifications.firstIndex { $0.attackID == p.attackID }
                 var v = idx.map { verifications[$0] }
                     ?? StrikeVerification(attackID: p.attackID, timestamp: p.timestamp)
@@ -776,6 +796,7 @@ final class AudioPitchDetector: ObservableObject {
         lastHints = []
         ambientRMS  = 0.0008
         ambientFlux = 0.04
+        lastHeard = .init(repeating: -1, count: 88)
         lastAttackTime = 0
         lastAttackScore = 0
         fluxDipped = true
