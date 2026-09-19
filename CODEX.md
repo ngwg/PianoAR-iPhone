@@ -124,7 +124,27 @@ unique partials also rose (else absent, or unsure if it has none — octaves).
 A v2.1 experiment with free-running per-key detectors on all 88 keys (no
 explain-away, no hand gate) produced far too many false notes — don't repeat it.
 
-**Onset peak-picking (v2.3).** An onset is the **local maximum** of the flux
+**Onset detection is SuperFlux (v2.7)** — `OnsetDetector.swift`. Quarter-tone
+filterbank, log magnitudes, max filter across +-1 band, difference against the
+frame two back, adaptive peak-picker (local max +-30/23 ms, mean over
+100/23 ms, threshold = mean*1.35 + 0.8, 30 ms min gap). Measured on the user's
+own 80 s recording against a reference of 169 notes (SuperFlux and RCD agree
+R=0.95): **P=0.99 R=0.96, 0.02 false onsets/s.** The band-flux detector it
+replaced scored **R=0.31 with 2.2 false onsets/s**, and no threshold fixed it
+(best F over the whole sweep: 0.28) because the ODF itself was wrong — raw
+magnitudes, normalised by total band energy (so a note over a ringing one
+divided its own evidence away), no filterbank.
+
+**The verifier decides by salience competition (v2.7)**, not partial rise. See
+the header of NoteVerifier.swift: the dB-rise statistic identified the played
+key 2 % of the time against exact ground truth, worse than chance, because a
+dB ratio is scale-free and every key has some bins that got louder at any
+onset. Now: background-subtracted harmonic salience (peak minus local floor,
+Klapuri-weighted), post vs pre, and keys compete against their neighbours and
+harmonic relatives — chord members excluded from each other's competition.
+**100 % correct / 4 % false accepts; 95 % of 3-note chords heard in full.**
+
+**Historical (superseded) — onset peak-picking (v2.3).** An onset is the **local maximum** of the flux
 curve, decided one hop (11 ms) late, and the flux must fall back below 40 %
 of that peak before another onset counts — unless the next frame is 1.25×
 louder, so repeated notes still register. Before this, one key stroke fired
@@ -238,7 +258,12 @@ a piano nobody can hear; this is how a real session gets replayed offline.
 
 ## 8. Known gaps / next steps
 
-1. **Tune against a real recording.** SETUP › RECORD now produces
+1. **Validate the guided path against a recording made while a song is
+   playing.** The first real recording turned out to be free play: every
+   acceptance in it came from vision and every one was `ignored`, so the
+   score-informed path was never exercised. The DSP below it is now measured,
+   the decision layer above it is not.
+2. **(done, v2.7) Tune against a real recording.** SETUP › RECORD now produces
    WAV + JSONL on one clock. Replay it offline, line every `accept` up against
    what was actually played, and set `presentDB` / the rising-partial counts
    per register from data instead of from argument. This is the top item —
