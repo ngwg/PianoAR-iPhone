@@ -6,10 +6,19 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      runner:
+        description: "macOS runner image (e.g. macos-latest, macos-15)"
+        default: "macos-latest"
+      xcode:
+        description: "Xcode app in /Applications (e.g. Xcode.app, Xcode_16.4.app)"
+        default: "Xcode.app"
 
 jobs:
   build:
-    runs-on: macos-latest
+    # Manual runs can pick the runner/Xcode (sideloading tools can lag behind
+    # the newest Xcode); pushes use the defaults.
+    runs-on: ${{ inputs.runner || 'macos-latest' }}
     timeout-minutes: 30
 
     steps:
@@ -19,7 +28,9 @@ jobs:
         run: ls /Applications | grep Xcode || true
 
       - name: Select Xcode
-        run: sudo xcode-select -s /Applications/Xcode.app
+        run: |
+          sudo xcode-select -s "/Applications/${{ inputs.xcode || 'Xcode.app' }}"
+          xcodebuild -version
 
       - name: Install XcodeGen
         run: brew install xcodegen
