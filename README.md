@@ -8,7 +8,7 @@ Real-piano mode on an acoustic piano (no MIDI anywhere). What's in the app:
 
 - **Key mapping from inside the headset** — pinch & hold (½ s) at the FRONT-LEFT corner of the keys, then at the FRONT-RIGHT corner. (Tapping the 4 corners on screen still works.) Fine-tune in **SETUP › ALIGN**: slide 5 mm or a whole key, depth, width, turn, height — bright key outlines show the fit while that tab is open.
 - **Note waterfall** standing behind the keys (notes fall onto the key they belong to), pulsing cues on the keys to play, key letters on the keys.
-- **Note detection by sound** — every one of the 88 keys has its own detector listening for its own partials, so chords, repeated notes and playing slightly ahead all register, wherever your hands are. Clear wrong notes (a semitone or tone off) flash red. Hand tracking (Vision + LiDAR) drives the hand overlay and menu, and only detects notes if the microphone is off.
+- **Note detection** — after every piano onset the microphone checks each expected note's own partials (chords: every note separately). A note only counts if no other key you actually hit explains the sound, and needs a hand near that key — or a very clear sound on its own. Clear wrong notes (a semitone or tone off) flash red.
 - **Practice** — wait mode or play-along, tempo 40–150 %, practice right / left / both hands, skip, results card with accuracy, streak, timing.
 - **Comfort (motion sickness)** — life-size passthrough, per-eye images centred on the lenses, 120 Hz gyro re-projection between 60 fps camera frames.
 - **AR menu** — LIBRARY · PRACTICE · COMFORT · SETUP tabs; point with your index finger and pinch to select, pinch-and-hold the title bar to move it. It shrinks to a PAUSE · SKIP · MENU pill while a song plays.

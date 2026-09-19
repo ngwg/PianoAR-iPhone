@@ -41,7 +41,7 @@ unsigned IPA → Sideloadly → real device. Be careful with syntax and types.
 | `HandTracker.swift` | Vision hand pose (≤640 px), LiDAR near-biased depth, adaptive EMA, occlusion reconstruction, duplicate-hand dedupe (median joint distance). |
 | `PressDetector.swift` | Vision trajectory state machine + guided, chord-aware audio acceptance (see §4). Lock-protected debug lines. |
 | `AudioPitchDetector.swift` | Mic ingest in 512-sample hops with host-time stamps, spectral-flux onsets, staged per-attack note verification, recent attacks/verifications snapshot. |
-| `NoteTracker.swift` | Per-key note onset detection on all 88 keys every hop (see §4); `SpectrumAnalyzer`. |
+| `NoteVerifier.swift` | Per-attack "was this expected note just struck?" with explain-away (see §4). |
 | `SongPlayer.swift` | Note groups, wait vs play-along, tempo, hand selection, skip, stats, HUD snapshot, `groupSerial`. |
 | `SongModel.swift`, `BuiltInSongs.swift`, `MIDIFileImporter.swift`, `SongLibrary.swift` | Song format, built-ins, MIDI parser, imported songs (Documents/, Documents/Songs/). |
 | `LabelFactory.swift` | Baked text textures (replaces SCNText). Prewarmed on main at launch. |
@@ -77,25 +77,31 @@ false` (prevents z-fighting flicker; a solved bug — don't revert).
 **Vision (all modes):** per fingertip, regression-slope velocity + dip below
 its own slow baseline; `idle → descending → pressed` on a real valley.
 
-**Sound decides (v2.1):** while the mic is on, notes are accepted from the
-sound alone; hand position plays no part (vision only if the mic is off).
+**Guided (song playing), per pending key of the current group** (v2.2):
+1. A vision valley within 2 keys of a pending key accepts that key.
+2. Each recent audio attack (≤ 0.9 s old, bound to the group via
+   `groupSerial`) is checked against every still-pending key:
+   - verifier says **present** + a fingertip within 6 white keys → accept;
+     **present** with score ≥ 0.7 (≈ 5.6 dB) → accept even with no hand tracked;
+   - **unsure** (e.g. upper note of an octave) + fingertip ON the key, or a hand
+     within 6 keys while another chord note was heard present → accept;
+   - before the verifier has spoken: fingertip ON the key + onset (fast path).
+3. Wrong-note flash only when nothing expected rose, one other key (not in
+   the next groups) is clearly present, it isn't an octave/4th/5th relative,
+   and a fingertip is on it.
 
-**NoteTracker** (`NoteTracker.swift`, every 512-sample hop, all 88 keys):
-each key follows its own partials n·f0·√(1+B·n²) (±35 cents) in a 4096-pt
-spectrum (8192-pt below 130 Hz). A partial counts only if it is a local peak
-≥ 6 dB above the mean of ±3–12 bins around it (hammer thumps lift everything
-and fail). Score = Klapuri-weighted mean of per-partial level increases over
-a 3-hop lag (5 for bass), clipped to 0–15 dB. Onset = local max of the score
-≥ 2.5 dB (2.0 bass) for keys the song expects, ≥ 4 dB otherwise, with ≥ 2
-rising partials (1 above 1 kHz) and a 70 ms refractory. Partials shared by
-two expected keys are skipped; unexpected octave/twelfth ghosts dropped.
-
-**Acceptance** (`PressDetector.soundEvents`): each pending key of the current
-group takes the first unused onset of that key since 0.6 s before the group
-became current; every onset is used once (repeated notes need a new strike).
-Wrong note = an unused onset ≥ 5 dB, ≤ 2 semitones from an expected key, not
-in the next groups, with no expected key struck within 120 ms. Free play:
-every onset ≥ 4 dB flashes its key.
+**NoteVerifier** (per attack, stages: 4096-pt @ +10 ms for keys ≥ C3, 8192-pt
+@ +10 ms for bass, 4096-pt @ +60 ms for rolled chords): partial n at
+n·f0·√(1+B·n²), ±35 cents; must be a real peak (no 25 dB-louder neighbour);
+partials shared with another expected chord note skipped; rise
+r = 20·log10((after+NF)/(before+NF)); S = Σw·clip(r,0,15)/Σw,
+w = (f0+52)/(n·f0+320). Present: S ≥ 3.5 dB & ≥ 2 rising partials.
+**Explain-away:** for an expected key, if a non-expected key within ±24
+semitones was clearly struck (its own unique partials present, S ≥ 4) and
+shares partials with it, the expected key only stays present if its own
+unique partials also rose (else absent, or unsure if it has none — octaves).
+A v2.1 experiment with free-running per-key detectors on all 88 keys (no
+explain-away, no hand gate) produced far too many false notes — don't repeat it.
 
 **Audio timing:** iOS taps deliver ~100 ms buffers regardless of the request;
 ingest walks them in 512-sample hops and stamps onsets with
@@ -108,12 +114,10 @@ render loop).
 
 | Parameter | File | Default | Effect |
 |---|---|---|---|
-| `minRMS`, `minFluxScore` | AudioPitchDetector | 0.0015, 0.24 | Onset gates. Lower for soft playing / quiet rooms. |
-| `ambientRMSRatio`, `ambientFluxRatio` | AudioPitchDetector | 3.0 | Onset must exceed ambient by this factor. |
-| `expectedThreshold` / `otherThreshold` | NoteTracker | 2.5 / 4.0 dB | Onset score needed for expected / other keys. Lower if notes are missed, raise if extra notes appear. |
-| `minProminence` | NoteTracker | 6 dB | How far a partial must stand above its surroundings. |
-| `earlyWindow` | PressDetector | 0.6 s | How early a strike may come before its note is current. |
-| `wrongStrength` | PressDetector | 5 dB | Strength needed to call a note wrong. |
+| `minRMS`, `minFluxScore`, ambient ratios, `minAttackInterval` | AudioPitchDetector | 0.0010, 0.18, 2.5, 0.09 s | Onset sensitivity (v2.2: more sensitive than v2). |
+| `presentDB`, `unsureDB` | NoteVerifier | 3.5, 2 dB | Per-note verdict thresholds. |
+| `handReachKeys`, `strongRise` | PressDetector | 6 keys, 0.7 | Hand-near radius; audio-only acceptance threshold. |
+| `strikeWindow` | PressDetector | 0.9 s | How long one onset can accept chord members. |
 | `defaultViewScale` | ComfortSettings | 0.66 | Eye image height / screen height (orthoscopic start). |
 | `defaultLensSpacingMM` | ComfortSettings | 63 | Distance between eye image centres. |
 
