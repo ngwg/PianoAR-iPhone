@@ -136,6 +136,26 @@ which time accepting the note may have advanced the song; reading the chord
 live meant judging the sound of the note just played against the note not
 yet played.
 
+**Re-strikes (v2.5).** A key heard clearly in the last 2.5 s is judged
+against **decay**, not silence. Striking a still-ringing key cannot raise
+its partials much — at most ~3 dB, and an out-of-phase hammer can drop them
+10 dB or more — so the fresh-note bar of 3.5 dB made repeated notes close to
+undetectable. Ringing keys use 1.2 dB / 1.0 dB per partial. The detector
+tracks `lastHeard` itself; the song is not consulted.
+
+**Partial admissibility (v2.4).** B is a per-register estimate and its effect
+grows as n², so the old 0.5x-2.0x bracket made partial 8 in the treble land in
+a window wider than a semitone: it always found a peak and therefore proved
+nothing. Bracket is now 0.7x-1.4x, and any partial whose position cannot be
+pinned within 25 cents is dropped rather than allowed to vote.
+
+**Never trapped (v2.4).** `SongPlayer.struggle`: after 4 s on a group in wait
+mode the HUD names the note and suggests playing firmer; after 9 s it says it
+still cannot hear it, points at SKIP, and relaxes the masked-note verdict for
+the expected keys only. It deliberately does not auto-advance. The count-in
+early-rejection window now applies in **both** modes (it was play-along only,
+so a cough during the lead-in could be accepted as the opening note).
+
 **PianoTuning** (v2.3): no real piano is at A4 = 440.000, and every one is
 stretch-tuned — bass flat, treble sharp, ±30 cents at the ends (Railsback).
 A fixed ±35-cent window is therefore too wide in the middle, where it lets a
@@ -145,6 +165,10 @@ per register (8 bands of 11 keys) from the median residual of partials 1–2 of
 notes the verifier is sure about, with sub-bin parabolic peak interpolation,
 narrows the window as it settles, and persists to UserDefaults. Read once per
 strike via `snapshot()` — never per partial, this runs on the audio thread.
+The window **starts at ±65 cents** and closes to ±19 as a register is heard:
+a household piano 30-50 cents flat is ordinary, and a fixed ±35 window means
+nothing verifies, so nothing is learned, so it never recovers. ±65 still
+cannot reach the neighbouring semitone.
 
 **Raw microphone.** `.measurement` mode, built-in mic selected explicitly,
 voice processing off, omnidirectional pattern requested. Not cosmetic: every
