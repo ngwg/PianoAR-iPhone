@@ -409,3 +409,4 @@ final class SongPlayer: ObservableObject {
         }
         return list.isEmpty ? "—" : list.joined(separator: " + ")
     }
+}
