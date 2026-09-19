@@ -11,6 +11,7 @@ enum MenuAction {
     case toggleSmoothing, toggleStereo, cycleHandStyle, resetComfort
     case align(KeyboardAlignment.Adjust)  // fine placement of the key overlay
     case toggleKeyLabels
+    case toggleRecording                  // SETUP › RECORD diagnostics capture
 }
 
 /// Everything the panel shows, captured once per frame on the render thread.
@@ -26,6 +27,8 @@ struct MenuState: Equatable {
     var comfort = ComfortSnapshot.default
     var keyLabels = true
     var alignReadout = ""
+    var recording = false
+    var recordSeconds = 0
 }
 
 /// Floating "tablet" AR panel — Quest-3 interaction model.
@@ -112,6 +115,7 @@ final class ARMenuOverlay {
         CGRect(x: (col == 0 ? 30 : 495) + 8, y: 226 + CGFloat(row) * 70, width: 190, height: 60)
     }
     private static let alignResetRect = CGRect(x: 30, y: 436, width: 430, height: 56)
+    private static let recordRect     = CGRect(x: 495, y: 436, width: 430, height: 56)
 
     // Minimized pill
     private static let pillRect     = CGRect(x: 150, y: 16, width: 660, height: 116)
@@ -174,7 +178,7 @@ final class ARMenuOverlay {
         case pagePrev, pageNext, minimize
         case play, restart, skip, tempoDown, tempoUp, hand, wait
         case viewDown, viewUp, lensDown, lensUp, smooth, stereo, handStyle, comfortReset
-        case mapKeys, debug, labels, alignReset
+        case mapKeys, debug, labels, alignReset, record
         case slideLeft, slideRight, keyLeft, keyRight, depthAway, depthToward
         case widthMinus, widthPlus, turnLeft, turnRight, heightDown, heightUp
         case pillPause, pillSkip, pillMenu
@@ -594,7 +598,7 @@ final class ARMenuOverlay {
         (.widthMinus, alignCell(row: 1, col: 1, button: 0)), (.widthPlus, alignCell(row: 1, col: 1, button: 1)),
         (.turnLeft, alignCell(row: 2, col: 0, button: 0)), (.turnRight, alignCell(row: 2, col: 0, button: 1)),
         (.heightDown, alignCell(row: 2, col: 1, button: 0)), (.heightUp, alignCell(row: 2, col: 1, button: 1)),
-        (.alignReset, alignResetRect),
+        (.alignReset, alignResetRect), (.record, recordRect),
     ]
 
     private var pageCount: Int { max(1, (songs.count + Self.libPerPage - 1) / Self.libPerPage) }
@@ -699,6 +703,7 @@ final class ARMenuOverlay {
         case .debug:             return .toggleDebug
         case .labels:            return .toggleKeyLabels
         case .alignReset:        return .align(.reset)
+        case .record:            return .toggleRecording
         case .slideLeft:         return .align(.moveX(-KeyboardAlignment.slideStep))
         case .slideRight:        return .align(.moveX(KeyboardAlignment.slideStep))
         case .keyLeft:           return .align(.moveX(-KeyboardAlignment.keyStep))
@@ -985,13 +990,18 @@ final class ARMenuOverlay {
             button(alignCell(row: row, col: col, button: 1), r.plus, fill: neutral, size: 24, weight: .black)
         }
         button(alignResetRect, "RESET ALIGNMENT", fill: neutral, size: 19)
+        button(recordRect,
+               s.state.recording ? String(format: "● RECORDING  %d:%02d",
+                                          s.state.recordSeconds / 60, s.state.recordSeconds % 60)
+                                 : "◉  RECORD SESSION",
+               fill: s.state.recording ? accentRed : neutral, size: 19)
 
-        let hint = "The blue outlines show where the app thinks your keys are. "
-            + "Line them up with the real keys; they stay lit while this tab is open."
+        let hint = "Outlines show where the app thinks your keys are — line them up with the real ones. "
+            + "RECORD saves the mic audio plus every detection decision to Files › PianoAR › Diagnostics."
         let para = NSMutableParagraphStyle()
         para.alignment = .left
         para.lineBreakMode = .byWordWrapping
-        (hint as NSString).draw(in: CGRect(x: 495, y: 434, width: 440, height: 110),
+        (hint as NSString).draw(in: CGRect(x: 30, y: 500, width: 900, height: 60),
                                 withAttributes: [.font: UIFont.systemFont(ofSize: 16, weight: .medium),
                                                  .foregroundColor: UIColor(white: 1, alpha: 0.55),
                                                  .paragraphStyle: para])

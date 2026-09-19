@@ -50,10 +50,11 @@ struct PitchSnapshot {
     let attack: AudioAttack?                  // most recent attack — sticky until replaced
     let recentAttacks: [AudioAttack]          // oldest first, last ~1.5 s
     let verifications: [StrikeVerification]   // oldest first, last ~2 s
+    let listening: Bool                       // microphone running
     let timestamp: TimeInterval
 
     static let empty = PitchSnapshot(activeNotes: [], attack: nil, recentAttacks: [],
-                                     verifications: [], timestamp: 0)
+                                     verifications: [], listening: false, timestamp: 0)
 
     func verification(for attackID: Int) -> StrikeVerification? {
         verifications.last { $0.attackID == attackID }
@@ -129,12 +130,33 @@ final class AudioPitchDetector: ObservableObject {
         let attackID: Int
         let onsetSample: Int
         let timestamp: TimeInterval
+        /// The notes the song wanted when this attack happened. Frozen here
+        /// on purpose: a stage runs 10-60 ms later, by which time accepting
+        /// the note may already have advanced the song, and judging this
+        /// sound against the NEXT chord is how a note nobody played gets
+        /// marked as played.
+        let chord: Set<Int>
         var stagesDone: Set<Int> = []
+    }
+
+    /// One analysis frame of the onset-detection function, kept so the peak
+    /// can be picked one hop late (see analyze).
+    private struct OnsetFrame {
+        let rms: Float
+        let score: Float
+        let low: Float
+        let mid: Float
+        let high: Float
+        let sample: Int
+        let timestamp: TimeInterval
     }
     private var pending: [PendingVerification] = []
     /// Keys the song expects together right now (set by the render loop):
     /// the verifier ignores partials shared between them.
     private let expectedKeys = Locked<Set<Int>>([])
+    private let listening = Locked<Bool>(false)
+    /// Diagnostics (SETUP › RECORD): raw microphone + every verdict.
+    weak var recorder: SessionRecorder?
 
     func setExpectedKeys(_ keys: Set<Int>) { expectedKeys.set(keys) }
 
@@ -158,6 +180,10 @@ final class AudioPitchDetector: ObservableObject {
     private var ambientRMS: Float = 0.0008
     private var ambientFlux: Float = 0.04
     private var lastAttackTime: TimeInterval = 0
+    private var lastAttackScore: Float = 0
+    private var fluxDipped = true
+    private var prevFrame: OnsetFrame?
+    private var prevPrevScore: Float = 0
     private var hasPreviousSpectrum = false
 
     private let engine = AVAudioEngine()
@@ -252,6 +278,7 @@ final class AudioPitchDetector: ObservableObject {
             }
             self.engine.stop()
             self.running = false
+            self.listening.set(false)
             self.resetAudioState()
             self.clearSnapshot()
             self.publishState("mic off")
@@ -278,6 +305,7 @@ final class AudioPitchDetector: ObservableObject {
             try session.setPreferredIOBufferDuration(Double(hop) / 48_000.0)
             try session.setActive(true)
             inputLatency = session.inputLatency
+            selectRawMicrophone(session)
 
             if tapInstalled {
                 engine.inputNode.removeTap(onBus: 0)
@@ -311,15 +339,51 @@ final class AudioPitchDetector: ObservableObject {
             engine.prepare()
             try engine.start()
             running = true
-            publishState("mic listening")
+            listening.set(true)
+            let io = Int(AVAudioSession.sharedInstance().ioBufferDuration * 1000)
+            let src = AVAudioSession.sharedInstance().currentRoute.inputs.first?
+                .selectedDataSource?.dataSourceName ?? "default"
+            publishState(String(format: "mic listening %@ %d ms", src, io))
         } catch {
             if tapInstalled {
                 engine.inputNode.removeTap(onBus: 0)
                 tapInstalled = false
             }
             running = false
+            listening.set(false)
             publishState("mic error")
             clearSnapshot()
+        }
+    }
+
+    /// Takes the microphone as raw as iOS will give it.
+    ///
+    /// Every piece of system audio processing works directly against this
+    /// detector, because the whole verdict is "did these partials get louder
+    /// than they were 40 ms ago":
+    ///  * automatic gain control pulls a loud note down and pushes a quiet
+    ///    room up, which is exactly the rise being measured — a struck note
+    ///    can end up looking flat, and the silence after it looking like an
+    ///    attack;
+    ///  * voice processing adds echo cancellation and a speech EQ that mangle
+    ///    harmonic amplitude ratios;
+    ///  * the cardioid/stereo polar patterns are not microphones at all but
+    ///    multi-mic beamformers, i.e. more DSP. Only omnidirectional is a
+    ///    single physical capsule.
+    ///
+    /// `.measurement` mode (set above) does most of this; the rest is
+    /// belt-and-braces, and all of it is best-effort — every setter here is a
+    /// *preference* that iOS may ignore.
+    private func selectRawMicrophone(_ session: AVAudioSession) {
+        try? engine.inputNode.setVoiceProcessingEnabled(false)
+        guard let mic = session.availableInputs?.first(where: { $0.portType == .builtInMic })
+        else { return }
+        try? session.setPreferredInput(mic)
+        if let source = mic.dataSources?.first(where: {
+            $0.supportedPolarPatterns?.contains(.omnidirectional) == true
+        }) {
+            try? source.setPreferredPolarPattern(.omnidirectional)
+            try? session.setPreferredDataSource(source)
         }
     }
 
@@ -338,6 +402,8 @@ final class AudioPitchDetector: ObservableObject {
         } else {
             bufferStart = CACurrentMediaTime() - Double(n) / sampleRate
         }
+
+        recorder?.writeAudio(buf)
 
         let s = ch[0]
         let mask = Self.ringN - 1
@@ -375,28 +441,42 @@ final class AudioPitchDetector: ObservableObject {
         let high = bandStats(fromHz: 1_900, toHz: 10_500, weight: 1.75)
         let onsetScore = low.flux + mid.flux + high.flux
         computeKeyEnergies()
-        let attack = makeAttack(
-            rms: rms,
-            onsetScore: onsetScore,
-            lowScore: low.flux,
-            midScore: mid.flux,
-            highScore: high.flux,
-            timestamp: frameEndTime - Double(onsetLagSamples) / sampleRate
-        )
 
-        if let attack {
-            lastHints = pitchHints(for: attack)
-            recentAttacks.append(attack)
-            pending.append(PendingVerification(attackID: attack.id,
-                                               onsetSample: written - onsetLagSamples,
-                                               timestamp: attack.timestamp))
+        // Peak-picking, one hop (11 ms) late. An onset is the LOCAL MAXIMUM
+        // of the flux curve, not simply the first frame over the threshold.
+        // Without this, one key stroke fires two or three attacks (the hammer
+        // transient, then the body of the note), and every extra attack is
+        // another chance for the next expected note to be accepted off the
+        // sound of the note just played.
+        let frameNow = OnsetFrame(rms: rms, score: onsetScore,
+                                  low: low.flux, mid: mid.flux, high: high.flux,
+                                  sample: written - onsetLagSamples,
+                                  timestamp: frameEndTime - Double(onsetLagSamples) / sampleRate)
+        var attack: AudioAttack? = nil
+        if let peak = prevFrame, peak.score >= prevPrevScore, peak.score > onsetScore,
+           let a = makeAttack(frame: peak) {
+            attack = a
+            lastHints = pitchHints(for: a)
+            recentAttacks.append(a)
+            recorder?.log("attack", ["id": a.id, "onset": a.timestamp,
+                                     "conf": a.confidence, "score": a.onsetScore])
+            pending.append(PendingVerification(attackID: a.id,
+                                               onsetSample: peak.sample,
+                                               timestamp: a.timestamp,
+                                               chord: expectedKeys.get()))
         }
+        prevPrevScore = prevFrame?.score ?? 0
+        prevFrame = frameNow
+        // A note has to decay well away from its own attack before the next
+        // onset counts.
+        if onsetScore < lastAttackScore * 0.4 { fluxDipped = true }
 
         publishUI(attack: attack, rms: rms, onsetScore: onsetScore,
                   lowScore: low.flux, midScore: mid.flux, highScore: high.flux,
                   timestamp: frameEndTime)
 
-        updateAmbient(rms: rms, onsetScore: onsetScore, isAttack: attack != nil)
+        let overGate = onsetScore >= max(minFluxScore, ambientFlux * ambientFluxRatio)
+        updateAmbient(rms: rms, onsetScore: onsetScore, isAttack: attack != nil || overGate)
         prevSpectrum = spectrum
         hasPreviousSpectrum = true
     }
@@ -409,11 +489,11 @@ final class AudioPitchDetector: ObservableObject {
         guard !pending.isEmpty else { return }
         let mask = Self.ringN - 1
         let preGap = hop                  // keep the attack itself out of "before"
-        let chord = expectedKeys.get()
         let stageList = stages
         var remaining: [PendingVerification] = []
 
         for var p in pending {
+            let chord = p.chord
             for (si, stage) in stageList.enumerated() where !p.stagesDone.contains(si) {
                 let vN = stage.verifier.fftN
                 let preStart  = p.onsetSample - preGap - vN
@@ -437,6 +517,11 @@ final class AudioPitchDetector: ObservableObject {
                 var v = idx.map { verifications[$0] }
                     ?? StrikeVerification(attackID: p.attackID, timestamp: p.timestamp)
                 for r in results { v.merge(key: r.key, rise: r.rise, status: r.status) }
+                recorder?.log("verify", [
+                    "id": p.attackID, "onset": p.timestamp, "stage": si,
+                    "keys": results.filter { $0.status != .absent || chord.contains($0.key) }
+                        .map { ["k": $0.key, "s": String(describing: $0.status), "r": $0.rise] },
+                ])
                 v.complete = p.stagesDone.count == stageList.count
                 if let idx { verifications[idx] = v } else { verifications.append(v) }
             }
@@ -521,39 +606,38 @@ final class AudioPitchDetector: ObservableObject {
         return (positiveDelta / reference * weight, currentEnergy)
     }
 
-    private func makeAttack(rms: Float,
-                            onsetScore: Float,
-                            lowScore: Float,
-                            midScore: Float,
-                            highScore: Float,
-                            timestamp: TimeInterval) -> AudioAttack? {
+    private func makeAttack(frame f: OnsetFrame) -> AudioAttack? {
         let rmsGate = max(minRMS, ambientRMS * ambientRMSRatio)
         let fluxGate = max(minFluxScore, ambientFlux * ambientFluxRatio)
-        let hasHistory = hasPreviousSpectrum
-        let enoughLevel = rms >= rmsGate
-        let enoughChange = onsetScore >= fluxGate
-        let enoughTrebleOrMid = highScore >= fluxGate * 0.14
-            || midScore >= fluxGate * 0.22
-            || (lowScore >= fluxGate * 0.80 && rms >= rmsGate * 1.15)
-        let cooledDown = timestamp - lastAttackTime >= minAttackInterval
+        let enoughTrebleOrMid = f.high >= fluxGate * 0.14
+            || f.mid >= fluxGate * 0.22
+            || (f.low >= fluxGate * 0.80 && f.rms >= rmsGate * 1.15)
+        // Refractory: after an attack the flux has to fall right back down
+        // before another one counts, because a decaying note is not a new
+        // note. A clearly harder strike may still interrupt (repeated notes).
+        let settled = fluxDipped || f.score >= lastAttackScore * 1.25
+        let cooledDown = f.timestamp - lastAttackTime >= minAttackInterval && settled
 
-        guard hasHistory, enoughLevel, enoughChange, enoughTrebleOrMid, cooledDown else {
+        guard hasPreviousSpectrum, f.rms >= rmsGate, f.score >= fluxGate,
+              enoughTrebleOrMid, cooledDown else {
             return nil
         }
 
-        lastAttackTime = timestamp
-        let confidence = min(1.0, max(0.05, onsetScore / max(fluxGate * 2.8, 1e-6)))
+        lastAttackTime = f.timestamp
+        lastAttackScore = f.score
+        fluxDipped = false
+        let confidence = min(1.0, max(0.05, f.score / max(fluxGate * 2.8, 1e-6)))
         let id = nextAttackID
         nextAttackID += 1
         return AudioAttack(
             id: id,
             confidence: confidence,
-            onsetScore: onsetScore,
-            lowBandScore: lowScore,
-            midBandScore: midScore,
-            highBandScore: highScore,
+            onsetScore: f.score,
+            lowBandScore: f.low,
+            midBandScore: f.mid,
+            highBandScore: f.high,
             pitchHintKeyIndex: strongestPitchHintIndex(),
-            timestamp: timestamp
+            timestamp: f.timestamp
         )
     }
 
@@ -627,6 +711,7 @@ final class AudioPitchDetector: ObservableObject {
                                  attack: recentAttacks.last,
                                  recentAttacks: recentAttacks,
                                  verifications: verifications,
+                                 listening: listening.get(),
                                  timestamp: timestamp)
         lock.lock()
         _snap = snap
@@ -686,6 +771,10 @@ final class AudioPitchDetector: ObservableObject {
         ambientRMS  = 0.0008
         ambientFlux = 0.04
         lastAttackTime = 0
+        lastAttackScore = 0
+        fluxDipped = true
+        prevFrame = nil
+        prevPrevScore = 0
         hasPreviousSpectrum = false
     }
 }

@@ -16,6 +16,7 @@ struct ARPassthroughView: UIViewRepresentable {
     var showDebug:      Bool   = false
     var showKeyLabels:  Bool   = true
     var alignment = KeyboardAlignment()           // SETUP › ALIGN fine placement
+    var recorder: SessionRecorder?                // SETUP › RECORD diagnostics
     var availableSongs: [Song] = []
 
     func makeCoordinator() -> Coordinator {
@@ -58,6 +59,7 @@ struct ARPassthroughView: UIViewRepresentable {
             showKeyLabels: showKeyLabels,
             comfort: comfort,
             alignment: alignment,
+            recorder: recorder,
             songs: availableSongs
         ))
     }
@@ -71,6 +73,7 @@ struct ARPassthroughView: UIViewRepresentable {
             var showKeyLabels = true
             var comfort = ComfortSnapshot.default
             var alignment = KeyboardAlignment()
+            var recorder: SessionRecorder?
             var songs: [Song] = []
         }
 
@@ -102,6 +105,8 @@ struct ARPassthroughView: UIViewRepresentable {
         private let planeNodes = NSHashTable<SCNNode>.weakObjects()
         private var lastFrameTime: TimeInterval = 0
         private var fps: Double = 60
+        private var loggedSerial = -1
+        private var lastTuningSave: TimeInterval = 0
 
         init(calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
@@ -144,8 +149,21 @@ struct ARPassthroughView: UIViewRepresentable {
             let camPos = SIMD3<Float>(camT.x, camT.y, camT.z)
 
             songPlayer.tick()
+            cfg.recorder?.tick()
+            // What the verifier has learned about this piano, kept for the
+            // next session (cheap: only writes when something changed).
+            if time - lastTuningSave > 4 { lastTuningSave = time; PianoTuning.shared.saveIfNeeded() }
             let pending   = songPlayer.pendingKeyIndicesNow()
             let groupKeys = songPlayer.groupKeyIndicesNow()
+            if songPlayer.groupSerial != loggedSerial {
+                loggedSerial = songPlayer.groupSerial
+                cfg.recorder?.log("expect", [
+                    "serial": songPlayer.groupSerial,
+                    "keys": groupKeys.sorted(),
+                    "names": groupKeys.sorted().map { KeyboardLayout.keys[$0].noteName },
+                    "pending": pending.sorted(),
+                ])
+            }
             audioDetector.setExpectedKeys(groupKeys)
 
             hand3D?.update(hands: hands, style: cfg.comfort.handStyle,
@@ -186,7 +204,9 @@ struct ARPassthroughView: UIViewRepresentable {
                     waitMode: hud.waitMode,
                     comfort: cfg.comfort,
                     keyLabels: cfg.showKeyLabels,
-                    alignReadout: cfg.alignment.readout)
+                    alignReadout: cfg.alignment.readout,
+                    recording: cfg.recorder?.isRecording ?? false,
+                    recordSeconds: cfg.recorder?.seconds ?? 0)
                 if let action = menu.update(hands: hands, keyboardNode: kb, time: time,
                                             state: state, availableSongs: cfg.songs,
                                             cameraWorldPos: camPos) {
@@ -206,8 +226,14 @@ struct ARPassthroughView: UIViewRepresentable {
                 keyTuning: keyTuning
             )
             for p in presses {
-                switch songPlayer.registerPress(keyIndex: p.keyIndex, noteName: p.noteName,
-                                                at: p.timestamp) {
+                let outcome = songPlayer.registerPress(keyIndex: p.keyIndex, noteName: p.noteName,
+                                                       at: p.timestamp)
+                cfg.recorder?.log("accept", [
+                    "k": p.keyIndex, "n": p.noteName, "c": p.confidence,
+                    "src": p.source.rawValue, "strike": p.timestamp,
+                    "outcome": String(describing: outcome).prefix(24).description,
+                ])
+                switch outcome {
                 case .correct(let expectedKeyIndex, _):
                     highway?.registerPress(keyIndex: expectedKeyIndex)
                 case .wrong(let playedKeyIndex, _, _, _):
@@ -251,6 +277,7 @@ struct ARPassthroughView: UIViewRepresentable {
             lines += pressDetector.debugSnapshot().prefix(14)
             lines.append("— AUDIO")
             lines += audioDetector.debugSnapshot().prefix(6)
+            lines.append(PianoTuning.shared.readout())
             return lines
         }
 

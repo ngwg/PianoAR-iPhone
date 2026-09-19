@@ -72,6 +72,10 @@ final class PressDetector: ObservableObject {
     // A verified note this clear (score ≥ ~5.6 dB, and not explained by some
     // other key) counts even when hand tracking has lost the hand.
     private let strongRise: Float = 0.7
+    /// How far ahead of the app a note may be played and still count.
+    private let earlyPlayWindow: TimeInterval = 0.30
+    private var groupChangedAt: TimeInterval = 0
+    private var lastGroupSerial = -1
 
     // ── State ─────────────────────────────────────────────────────────────
 
@@ -92,6 +96,10 @@ final class PressDetector: ObservableObject {
         let localY:   Float
         let localZ:   Float
     }
+
+    /// Recent press-shaped fingertip valleys: key → time. Never accepts a
+    /// note by itself; only settles sound-ambiguous cases.
+    private var recentValleys: [Int: TimeInterval] = [:]
 
     private var fingers:          [String: FingerTrack] = [:]
     private var recentPresses:    [PressEvent]          = []
@@ -135,6 +143,11 @@ final class PressDetector: ObservableObject {
         var visionCandidates: [PressEvent] = []
         var seen = Set<String>()
         var debugLines = [String]()
+
+        if groupSerial != lastGroupSerial {
+            lastGroupSerial = groupSerial
+            groupChangedAt = time
+        }
 
         if let kb = keyboardNode {
             // Trajectory tracking runs every frame regardless of guided/non-guided
@@ -211,6 +224,7 @@ final class PressDetector: ObservableObject {
                                 keyIndex: k.index, noteName: k.noteName,
                                 confidence: confidence, fingerID: fid, timestamp: time
                             ))
+                            recentValleys[k.index] = time
                         } else if dip < armDip {
                             // Pulled back up without really pressing — a false start.
                             track.phase = .idle
@@ -230,49 +244,48 @@ final class PressDetector: ObservableObject {
             for fid in fingers.keys where !seen.contains(fid) { fingers[fid] = FingerTrack() }
         }
 
+        recentValleys = recentValleys.filter { time - $0.value < 0.6 }
         let guided = !expectedKeyIndices.isEmpty
         var finalPresses: [PressEvent]
 
         if guided, let kb = keyboardNode {
-            // Per-key evidence: every expected key must earn its OWN
-            // acceptance. Previously one audio onset + a hand hovering
-            // anywhere over the keyboard accepted the WHOLE expected group —
-            // that's both "detects keys I never touched" and "pressing the
-            // right-hand note auto-completed the left hand's chord note".
-            var events:  [PressEvent] = []
-            var claimed = Set<Int>()
+            var events: [PressEvent] = []
 
-            // A) Vision: a press-shaped valley resolved on (or within 2 keys
-            //    of — vision X is good to about one key) an expected key
-            //    accepts exactly that key.
-            for cand in visionCandidates {
-                guard let nearest = expectedKeyIndices
-                        .filter({ !claimed.contains($0) })
-                        .min(by: { abs($0 - cand.keyIndex) < abs($1 - cand.keyIndex) }),
-                      abs(nearest - cand.keyIndex) <= 2 else { continue }
-                claimed.insert(nearest)
-                lastKeyPressTime[nearest] = time
-                events.append(PressEvent(
-                    keyIndex: nearest,
-                    noteName: KeyboardLayout.keys[nearest].noteName,
-                    confidence: min(1.0, cand.confidence * 0.85
-                                         + audioBoost(audioSnapshot, time: time)),
-                    fingerID: cand.fingerID,
-                    timestamp: time))
+            if audioSnapshot?.listening == true {
+                // THE PIANO DECIDES. A finger dip on its own never accepts a
+                // note any more — that is what made notes count before they
+                // were played (a finger moving toward a key, or resting on it
+                // while something else sounded, looked like a press). Hand
+                // tracking now only settles what the sound genuinely cannot
+                // tell apart, e.g. the upper note of an octave.
+                let strike = guidedStrikeEvents(
+                    hands: hands, keyboardNode: kb,
+                    pendingKeys: expectedKeyIndices,
+                    groupKeys: groupKeyIndices.union(expectedKeyIndices),
+                    upcoming: upcomingKeyIndices,
+                    snapshot: audioSnapshot, time: time, groupSerial: groupSerial,
+                    valleys: recentValleys)
+                events = strike.events
+                debugLines += strike.debug
+            } else {
+                // No microphone: vision valleys are all there is.
+                var claimed = Set<Int>()
+                for cand in visionCandidates {
+                    guard let nearest = expectedKeyIndices
+                            .filter({ !claimed.contains($0) })
+                            .min(by: { abs($0 - cand.keyIndex) < abs($1 - cand.keyIndex) }),
+                          abs(nearest - cand.keyIndex) <= 2 else { continue }
+                    claimed.insert(nearest)
+                    lastKeyPressTime[nearest] = time
+                    events.append(PressEvent(
+                        keyIndex: nearest,
+                        noteName: KeyboardLayout.keys[nearest].noteName,
+                        confidence: min(1.0, cand.confidence * 0.85),
+                        fingerID: cand.fingerID,
+                        timestamp: time))
+                }
+                debugLines.append("mic off — hand tracking only")
             }
-
-            // B) Audio strikes: every remaining expected key is checked
-            //    against its OWN partials at each recent onset (chord-aware),
-            //    needing only a hand nearby — or, before the verifier has
-            //    spoken, a directly-tracked fingertip right on the key.
-            let strike = guidedStrikeEvents(
-                hands: hands, keyboardNode: kb,
-                pendingKeys: expectedKeyIndices.subtracting(claimed),
-                groupKeys: groupKeyIndices.union(expectedKeyIndices),
-                upcoming: upcomingKeyIndices,
-                snapshot: audioSnapshot, time: time, groupSerial: groupSerial)
-            events += strike.events
-            debugLines += strike.debug
 
             finalPresses = events
         } else {
@@ -329,7 +342,8 @@ final class PressDetector: ObservableObject {
                                     upcoming: Set<Int>,
                                     snapshot: PitchSnapshot?,
                                     time: TimeInterval,
-                                    groupSerial: Int) -> (events: [PressEvent], debug: [String]) {
+                                    groupSerial: Int,
+                                    valleys: [Int: TimeInterval]) -> (events: [PressEvent], debug: [String]) {
         guard let snap = snapshot else { return ([], []) }
 
         // Forget strikes that have aged out of the audio snapshot.
@@ -350,8 +364,17 @@ final class PressDetector: ObservableObject {
             guard age >= -0.05, age <= strikeWindow,
                   attack.confidence >= guidedMinAttackConf else { continue }
             var st = strikes[attack.id] ?? StrikeState(groupSerial: groupSerial)
-            // Struck while an earlier group was current: never reuse it here.
-            guard st.groupSerial == groupSerial else { continue }
+            if st.groupSerial != groupSerial {
+                // A strike that satisfied nothing while an earlier group was
+                // current can still land this note — you played slightly
+                // ahead of the app. But only just ahead: an onset from well
+                // before this note came up belongs to the previous note, and
+                // letting it through is precisely how a note you never played
+                // lights up the moment the song advances.
+                guard st.acceptedKeys.isEmpty,
+                      attack.timestamp >= groupChangedAt - earlyPlayWindow else { continue }
+                st = StrikeState(groupSerial: groupSerial)
+            }
             let verification = snap.verification(for: attack.id)
 
             for k in remaining.sorted() where k >= 0 && k < KeyboardLayout.keys.count {
@@ -359,28 +382,35 @@ final class PressDetector: ObservableObject {
                 let handNear = onBoard.contains { abs($0.localX - key.xCenter) <= reach }
                 let onKey = direct.contains { tipIsOnKey($0, key) }
 
+                // A press-shaped fingertip dip on this key, just now.
+                let valleyNear = valleys.contains { abs($0.key - k) <= 2 && time - $0.value <= 0.35 }
+
                 var confidence: Float? = nil
                 if let v = verification, v.evaluated[k] {
-                    // Another note of this chord was clearly heard at this strike.
-                    let chordHeard = groupKeys.contains { $0 != k && v.status[$0] == .present }
+                    // An octave-related note of this chord was clearly heard:
+                    // the one case where the sound genuinely cannot separate
+                    // this key from its partner.
+                    let octaveMate = groupKeys.contains {
+                        $0 != k && v.status[$0] == .present && abs($0 - k) % 12 == 0
+                    }
                     switch v.status[k] {
-                    case .present where handNear || v.rise[k] >= strongRise:
-                        // Its own partials rose (and no other key explains
-                        // them) + a hand nearby — or the sound alone is clear.
+                    case .present:
+                        // Its own partials rose and no other key explains
+                        // them: struck. Sound alone decides here. Hand
+                        // tracking drops out constantly inside a headset (the
+                        // hands sit at the bottom edge of the camera, half
+                        // occluded by their own knuckles) and must never veto
+                        // a note the microphone clearly heard.
                         confidence = 0.55 + 0.45 * v.rise[k]
-                    case .unsure where onKey || (handNear && chordHeard):
-                        // Audio can't separate it (e.g. the upper note of an
-                        // octave): a fingertip on it, or its chord-mates heard
-                        // with a hand right there, settles it.
+                    case .unsure where (onKey || valleyNear || octaveMate) && age <= 0.45:
+                        // Masked: this key has fewer than two partials it does
+                        // not share with something else already sounding, so
+                        // the sound genuinely cannot decide. A finger seen
+                        // pressing it, or its octave partner heard, settles it.
                         confidence = 0.45 + 0.40 * v.rise[k]
                     default:
                         break
                     }
-                } else if onKey, age <= guidedAttackWindow,
-                          !pitchContradicts(expected: remaining, snapshot: snap) {
-                    // Fast path: the verifier needs ~0.2 s of post-onset
-                    // audio; a fingertip squarely on the key can't wait.
-                    confidence = attack.confidence * 0.50 + 0.20
                 }
 
                 guard let c = confidence else { continue }
@@ -416,6 +446,15 @@ final class PressDetector: ObservableObject {
                 let heard = v.heardKeys().map { KeyboardLayout.keys[$0].noteName }
                 debug.append(String(format: "strike #%ld %.2fs heard %@", attack.id, age,
                                     heard.isEmpty ? "-" : heard.joined(separator: " ")))
+                // Why each wanted note did or didn't pass, for tuning.
+                for k in pendingKeys.sorted() where k >= 0 && k < 88 {
+                    guard v.evaluated[k] else { continue }
+                    let key = KeyboardLayout.keys[k]
+                    let handNear = onBoard.contains { abs($0.localX - key.xCenter) <= reach }
+                    debug.append(String(format: "  %@ %@ %.2f hand:%@", key.noteName,
+                                        String(describing: v.status[k]), v.rise[k],
+                                        handNear ? "y" : "n"))
+                }
             } else {
                 debug.append(String(format: "strike #%ld %.2fs verifying…", attack.id, age))
             }

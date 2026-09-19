@@ -20,6 +20,7 @@ struct ContentView: View {
     @StateObject private var audioDetector = AudioPitchDetector()
     @StateObject private var keyTuning     = KeyTuning()
     @StateObject private var comfort       = ComfortSettings()
+    @StateObject private var recorder      = SessionRecorder()
 
     @State private var showDebug = false
     @AppStorage("ui.keyLabels") private var showKeyLabels = true
@@ -40,6 +41,7 @@ struct ContentView: View {
             showDebug: showDebug,
             showKeyLabels: showKeyLabels,
             alignment: alignment,
+            recorder: recorder,
             availableSongs: allSongs
         )
         .ignoresSafeArea()
@@ -54,6 +56,7 @@ struct ContentView: View {
                 screen.brightness = max(screen.brightness, 0.85)
             }
             LabelFactory.prewarm()
+            audioDetector.recorder = recorder
             importedSongs = SongLibrary.loadImported()
             if songPlayer.song == nil { songPlayer.load(BuiltInSongs.first) }
             if calibration.state == .idle { calibration.startCalibration() }
@@ -132,6 +135,8 @@ struct ContentView: View {
             alignment.apply(adjust)
         case .toggleKeyLabels:
             showKeyLabels.toggle()
+        case .toggleRecording:
+            recorder.toggle()
         }
     }
 }

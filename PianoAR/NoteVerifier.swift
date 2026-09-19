@@ -5,7 +5,7 @@ import simd
 /// Audio verdict for one key at one strike.
 enum NoteStatus: UInt8, Comparable {
     case absent = 0     // its partials did not rise — not struck
-    case unsure = 1     // too few distinguishable partials (e.g. upper note of an octave)
+    case unsure = 1     // masked: too few partials it doesn't share with something else
     case present = 2    // its own partials rose clearly — struck
 
     static func < (a: NoteStatus, b: NoteStatus) -> Bool { a.rawValue < b.rawValue }
@@ -22,18 +22,25 @@ enum NoteStatus: UInt8, Comparable {
 /// shows nothing. This is how commercial trainers verify too (expected-note
 /// salience rather than free transcription).
 ///
-/// Method (Klapuri-weighted partial rise, per the research notes):
-///  * partial n of note f0 at n·f0·√(1+B·n²), searched ±35 cents (stretch
-///    tuning + inharmonicity uncertainty), at least ±0.5 bin;
-///  * a partial only counts if it is a real spectral peak (not a Hann
-///    side lobe of a much louder neighbour);
+/// Method (Klapuri-weighted partial rise):
+///  * partial n of note f0 at n·f0·√(1+B·n²), where f0 carries the real
+///    piano's measured stretch (PianoTuning) and the window is that key's
+///    learned search width — tight where the tuning is known;
+///  * a partial only counts if it is a real spectral peak (not a Hann side
+///    lobe of a much louder neighbour) and is actually above the local
+///    background — a partial buried in noise carries no information;
 ///  * partials shared with ANOTHER expected chord note are skipped (C4's 3rd
 ///    partial ≈ G4's 2nd …), so each chord member is judged on its own;
 ///  * rise r = 20·log10((after+NF)/(before+NF)) with NF the local background,
 ///    so loud and soft notes score alike;
-///  * S = Σ w·clip(r,0,15)/Σ w with w = (f0+52)/(n·f0+320);
-///    present if S ≥ 4 dB with ≥ 2 rising partials, unsure if fewer than 2
-///    usable partials or 2 ≤ S < 4 dB.
+///  * S = Σ w·clip(r,0,15)/Σ w with w = (f0+52)/(n·f0+320).
+///
+/// The verdict is deliberately two-sided with no middle: **present** when the
+/// key's own partials rose, **unsure** only when the key has fewer than two
+/// partials it doesn't share with something else already sounding (the octave
+/// case — sound genuinely cannot decide, and the caller may look at the
+/// hands), **absent** otherwise. A "weak but maybe" band is what makes a
+/// trainer accept notes nobody played, so there isn't one.
 final class NoteVerifier {
     let fftN: Int
 
@@ -45,11 +52,9 @@ final class NoteVerifier {
     private var ip: [Float]
     private var power: [Float]
 
+    /// Generous tolerance for "these two keys share this partial" tests.
     private let centsTol: Float = 35
-    // 3.5 (was 4): catches softer notes; explain-away below keeps other
-    // keys' overtones from sneaking through at the lower threshold.
     private let presentDB: Float = 3.5
-    private let unsureDB: Float = 2
     private let partialRiseDB: Float = 3
     private let partialSNRDB: Float = 6
     private let sideLobeDB: Float = 25
@@ -69,14 +74,22 @@ final class NoteVerifier {
 
     deinit { vDSP_destroy_fftsetup(setup) }
 
-    static func f0(ofKey k: Int) -> Float { 440 * powf(2, Float(k + 21 - 69) / 12) }
+    /// Equal temperament at A4 = 440.
+    static func nominalF0(ofKey k: Int) -> Float { 440 * powf(2, Float(k + 21 - 69) / 12) }
+
+    /// What this key actually sounds at on the piano in the room.
+    static func f0(ofKey k: Int) -> Float {
+        nominalF0(ofKey: k) * powf(2, PianoTuning.shared.offsetCents(forKey: k) / 1200)
+    }
 
     /// One usable partial measured at a strike.
     private struct PartialObs {
-        let freq: Float
+        let n: Int
+        let freq: Float      // where we predicted it
         let weight: Float
         let rise: Float      // dB, after vs before
         let snr: Float       // dB above the local background
+        let residual: Float  // cents from the prediction to the real peak
     }
 
     /// Evaluates `keys` (0…87). `pre`/`post` must each hold `fftN` samples,
@@ -107,6 +120,7 @@ final class NoteVerifier {
             if let c = cache[k] { return c }
             let f0 = Self.f0(ofKey: k)
             let B = Self.inharmonicity(f0: f0)
+            let tol = PianoTuning.shared.searchCents(forKey: k)
             let maxN = f0 < 130 ? 16 : 12
             let maxHz: Float = min(sampleRate / 2 - 200, f0 >= 1000 ? 10_000 : 6_000)
             var obs: [PartialObs] = []
@@ -117,8 +131,8 @@ final class NoteVerifier {
                 if fc > maxHz { break }
                 if fc < 60 { continue }
 
-                let fLo = nf * f0 * powf(2, -centsTol / 1200) * sqrtf(1 + 0.5 * B * nf * nf)
-                let fHi = nf * f0 * powf(2,  centsTol / 1200) * sqrtf(1 + 2.0 * B * nf * nf)
+                let fLo = nf * f0 * powf(2, -tol / 1200) * sqrtf(1 + 0.5 * B * nf * nf)
+                let fHi = nf * f0 * powf(2,  tol / 1200) * sqrtf(1 + 2.0 * B * nf * nf)
                 let c = Int((fc / binHz).rounded())
                 let lo = max(1, min(Int((fLo / binHz).rounded(.down)), c))
                 let hi = min(after.count - 2, max(Int((fHi / binHz).rounded(.up)), c))
@@ -134,10 +148,18 @@ final class NoteVerifier {
                 var aBefore: Float = 0
                 for b in lo...hi { aBefore = max(aBefore, before[b]) }
                 let nfl = noiseFloor(peakBin)
-                obs.append(PartialObs(freq: fc,
+                // Sub-bin peak position: at 4096/48k one bin is ~12 Hz, which
+                // is 20 cents up at A4 — far too coarse to learn a tuning from.
+                let y0 = after[peakBin - 1], y1 = aAfter, y2 = after[peakBin + 1]
+                let denom = y0 - 2 * y1 + y2
+                let shift = abs(denom) > 1e-12 ? simd_clamp(0.5 * (y0 - y2) / denom, -0.5, 0.5) : 0
+                let peakHz = (Float(peakBin) + shift) * binHz
+                obs.append(PartialObs(n: n,
+                                      freq: fc,
                                       weight: (f0 + 52) / (nf * f0 + 320),
                                       rise: 20 * log10f((aAfter + nfl) / (aBefore + nfl)),
-                                      snr: 20 * log10f(aAfter / nfl)))
+                                      snr: 20 * log10f(aAfter / nfl),
+                                      residual: 1200 * log2f(max(peakHz, 1) / fc)))
             }
             cache[k] = obs
             return obs
@@ -150,16 +172,26 @@ final class NoteVerifier {
             var rising = 0, usable = 0
             var best: (r: Float, snr: Float) = (0, 0)
             for p in obs where !skip(p.freq) {
+                usable += 1
+                // Below the background there is nothing to see: including it
+                // would let the noise floor vote.
+                guard p.snr >= 0 else { continue }
                 sum  += p.weight * simd_clamp(p.rise, 0, 15)
                 wSum += p.weight
-                usable += 1
                 if p.rise >= partialRiseDB && p.snr >= partialSNRDB { rising += 1 }
                 if p.rise > best.r, p.snr > 0 { best = (p.rise, p.snr) }
             }
             let s = wSum > 0 ? sum / wSum : 0
+            // Masked — fewer than two partials this key doesn't share with
+            // something else already sounding. Only here does sound abstain.
+            if usable < 2 { return (s, .unsure) }
             if s >= presentDB && rising >= 2 { return (s, .present) }
-            if f0 >= 1000 && usable <= 2 && best.r >= 9 && best.snr >= 12 { return (s, .present) }
-            if usable < 2 || s >= unsureDB { return (s, .unsure) }
+            // A soft note spreads a small rise over many partials: the
+            // weighted mean dilutes it, but four clean rising partials at
+            // once is not something a decaying or sympathetic string does.
+            if rising >= 4 && s >= 2 { return (s, .present) }
+            // Top octave: two or three partials is all there is up there.
+            if f0 >= 1000 && usable <= 3 && best.r >= 9 && best.snr >= 12 { return (s, .present) }
             return (s, .absent)
         }
 
@@ -201,9 +233,24 @@ final class NoteVerifier {
                     break
                 }
             }
+
+            // A note we are sure about is also a tuning measurement: where its
+            // low partials really sat tells us how this register is tuned.
+            if status == .present, score >= 5 { learnTuning(key: k, from: obsK) }
             out.append((k, simd_clamp(score / 8, 0, 1), status))
         }
         return out
+    }
+
+    /// Median residual of the low partials — median, because one of them may
+    /// be sitting on another note's partial and be pulled off.
+    private func learnTuning(key k: Int, from obs: [PartialObs]) {
+        var res = obs.filter { $0.n <= 2 && $0.snr >= 12 && $0.rise >= partialRiseDB }
+            .map(\.residual)
+        guard !res.isEmpty else { return }
+        res.sort()
+        PianoTuning.shared.observe(key: k, residualCents: res[res.count / 2],
+                                   confidence: min(1, Float(res.count) * 0.5))
     }
 
     /// Stiffness of piano strings by register (defaults from the literature;
