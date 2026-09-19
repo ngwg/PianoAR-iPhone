@@ -258,8 +258,32 @@ a piano nobody can hear; this is how a real session gets replayed offline.
 
 ## 8. Known gaps / next steps
 
-1. **Validate the guided path against a recording made while a song is
-   playing.** The first real recording turned out to be free play: every
+### End-to-end validation (v2.7)
+
+The whole guided path — SuperFlux onsets, salience verifier, acceptance rules,
+song advancement — replayed on rendered melodies with exact ground truth, in
+the room noise from the user's own recording, with the piano 22 cents flat and
+inharmonicity 1.5x the model:
+
+| case | result |
+|---|---|
+| melody, 11 single notes | 11/11 advanced, 0 stalls |
+| immediately repeated notes | 9/9, 0 stalls |
+| octaves (4 groups) | 4/4, 0 stalls (no vision needed) |
+| triads (4 groups) | 4/4, 0 stalls |
+| fast passage, 220 ms apart | 9/9, 0 stalls |
+| quiet playing (1/3 level) | 11/11, 0 stalls |
+| **isolated wrong note** (+-2..7 st) | **0/100 advanced** |
+| **silence, nothing played** | **0/6 advanced** |
+| a *stream* of consecutive wrong notes | ~10 % of groups advance |
+
+The last row is the remaining limitation: when several wrong notes ring on top
+of each other, the accumulated spectrum can occasionally make an expected key
+the best local explanation. Tightening `competeFrac` past 0.85 closes it but
+starts stalling real notes (5/32), so 0.75 is the operating point. Harness:
+`endtoend.py` / `newrule.py` in the analysis scratch.
+
+1. **Confirm on-device with a recording made while a song is playing.** The first real recording turned out to be free play: every
    acceptance in it came from vision and every one was `ignored`, so the
    score-informed path was never exercised. The DSP below it is now measured,
    the decision layer above it is not.
