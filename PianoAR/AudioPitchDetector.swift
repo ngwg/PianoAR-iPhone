@@ -383,7 +383,7 @@ final class AudioPitchDetector: ObservableObject {
             $0.supportedPolarPatterns?.contains(.omnidirectional) == true
         }) {
             try? source.setPreferredPolarPattern(.omnidirectional)
-            try? session.setPreferredDataSource(source)
+            try? mic.setPreferredDataSource(source)
         }
     }
 

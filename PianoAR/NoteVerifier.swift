@@ -59,6 +59,11 @@ final class NoteVerifier {
     private let partialSNRDB: Float = 6
     private let sideLobeDB: Float = 25
 
+    /// This piano's tuning, read once per strike (see PianoTuning.snapshot).
+    /// Each NoteVerifier is only ever used from the audio thread.
+    private var f0Table = (0..<88).map { NoteVerifier.nominalF0(ofKey: $0) }
+    private var searchTable = [Float](repeating: 35, count: 88)
+
     init(fftN: Int) {
         precondition(fftN > 0 && fftN & (fftN - 1) == 0, "fftN must be a power of two")
         self.fftN = fftN
@@ -97,6 +102,11 @@ final class NoteVerifier {
     func evaluate(pre: [Float], post: [Float], sampleRate: Float,
                   keys: [Int], chord: Set<Int>) -> [(key: Int, rise: Float, status: NoteStatus)] {
         guard pre.count == fftN, post.count == fftN, sampleRate > 0 else { return [] }
+        let tuning = PianoTuning.shared.snapshot()
+        for k in 0..<88 {
+            f0Table[k] = Self.nominalF0(ofKey: k) * powf(2, tuning.offset[k] / 1200)
+        }
+        searchTable = tuning.search
         let before = magnitudeSpectrum(pre)
         let after  = magnitudeSpectrum(post)
         let binHz  = sampleRate / Float(fftN)
@@ -118,9 +128,9 @@ final class NoteVerifier {
         var cache: [Int: [PartialObs]] = [:]
         func measure(_ k: Int) -> [PartialObs] {
             if let c = cache[k] { return c }
-            let f0 = Self.f0(ofKey: k)
+            let f0 = f0Table[k]
             let B = Self.inharmonicity(f0: f0)
-            let tol = PianoTuning.shared.searchCents(forKey: k)
+            let tol = searchTable[k]
             let maxN = f0 < 130 ? 16 : 12
             let maxHz: Float = min(sampleRate / 2 - 200, f0 >= 1000 ? 10_000 : 6_000)
             var obs: [PartialObs] = []
@@ -202,7 +212,7 @@ final class NoteVerifier {
 
         var out: [(key: Int, rise: Float, status: NoteStatus)] = []
         for k in keys where k >= 0 && k < 88 {
-            let f0 = Self.f0(ofKey: k)
+            let f0 = f0Table[k]
             let others = chord.subtracting([k])
             let obsK = measure(k)
             var (score, status) = verdict(obsK, f0: f0) {
@@ -218,7 +228,7 @@ final class NoteVerifier {
                 for j in max(0, k - 24)...min(87, k + 24) where j != k && !chord.contains(j) {
                     let obsJ = measure(j)
                     guard obsK.contains(where: { coincides($0.freq, obsJ) }) else { continue }
-                    let jOwn = verdict(obsJ, f0: Self.f0(ofKey: j)) {
+                    let jOwn = verdict(obsJ, f0: f0Table[j]) {
                         coincides($0, obsK) || self.sharesPartial($0, withAnyOf: chord, binHz: binHz)
                     }
                     guard jOwn.status == .present, jOwn.score >= 4 else { continue }
@@ -268,7 +278,7 @@ final class NoteVerifier {
         guard !others.isEmpty else { return false }
         let tolHz = max(f * (powf(2, centsTol / 1200) - 1), 2 * binHz)
         for o in others {
-            let g0 = Self.f0(ofKey: o)
+            let g0 = f0Table[o]
             let B = Self.inharmonicity(f0: g0)
             // Only partial numbers near f / g0 can match.
             let guess = Int((f / g0).rounded())

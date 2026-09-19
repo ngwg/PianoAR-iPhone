@@ -86,6 +86,27 @@ final class PianoTuning {
         return 19 + 16 * expf(-w / 5)
     }
 
+    /// Every key's offset and search width in one lock acquisition.
+    ///
+    /// `evaluate` runs on the realtime audio thread and touches these for
+    /// every partial of every candidate key — thousands of times per strike.
+    /// Taking a lock that often on that thread risks a priority inversion and
+    /// a dropout, so it is taken exactly once per strike instead.
+    func snapshot() -> (offset: [Float], search: [Float]) {
+        lock.lock(); defer { lock.unlock() }
+        var offset = [Float](repeating: 0, count: 88)
+        var search = [Float](repeating: 0, count: 88)
+        for k in 0..<88 {
+            let pos = (Float(k) - Float(Self.bandSize) / 2) / Float(Self.bandSize)
+            let i = Int(floor(pos)), t = pos - Float(Int(floor(pos)))
+            let lo = cents[min(Self.bandCount - 1, max(0, i))]
+            let hi = cents[min(Self.bandCount - 1, max(0, i + 1))]
+            offset[k] = lo + (hi - lo) * t
+            search[k] = 19 + 16 * expf(-weight[Self.band(k)] / 5)
+        }
+        return (offset, search)
+    }
+
     /// Feed back the residual measured on a note we are sure about.
     /// `c` is how far the real partial sat from where we predicted it
     /// (already including the current offset), `confidence` ≈ 0…1.
