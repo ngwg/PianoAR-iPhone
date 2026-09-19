@@ -51,6 +51,9 @@ final class CalibrationManager: ObservableObject {
 
     func startCalibration() {
         reset()
+        // Re-mapping is started by a pinch on the menu; that pinch must open
+        // before the first corner can be captured.
+        pinchLatched = true
         state = .collecting(count: 0)
     }
 
