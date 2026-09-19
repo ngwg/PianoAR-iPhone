@@ -23,7 +23,7 @@ struct ContentView: View {
 
     @State private var showDebug = false
     @AppStorage("ui.keyLabels") private var showKeyLabels = true
-    @State private var nudge = SIMD2<Float>(0, 0)
+    @State private var alignment = KeyboardAlignment()
     @State private var importedSongs: [Song] = []
     @State private var savedBrightness: CGFloat?
 
@@ -39,7 +39,7 @@ struct ContentView: View {
             onMenuAction: handleMenuAction,
             showDebug: showDebug,
             showKeyLabels: showKeyLabels,
-            keyboardNudge: nudge,
+            alignment: alignment,
             availableSongs: allSongs
         )
         .ignoresSafeArea()
@@ -107,7 +107,7 @@ struct ContentView: View {
             showDebug.toggle()
         case .recalibrate:
             if songPlayer.isPlaying { songPlayer.stop() }
-            nudge = .zero
+            alignment = KeyboardAlignment()
             pressDetector.reset()
             calibration.startCalibration()
         case .tempo(let delta):
@@ -128,9 +128,8 @@ struct ContentView: View {
             comfort.cycleHandStyle()
         case .resetComfort:
             comfort.resetViewDefaults()
-        case .nudge(let x, let z):
-            nudge += SIMD2<Float>(x, z)
-            nudge = simd_clamp(nudge, SIMD2<Float>(repeating: -0.05), SIMD2<Float>(repeating: 0.05))
+        case .align(let adjust):
+            alignment.apply(adjust)
         case .toggleKeyLabels:
             showKeyLabels.toggle()
         }

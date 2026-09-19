@@ -80,6 +80,56 @@ enum KeyboardNode {
         return root
     }
 
+    /// Bright key outlines for alignment (SETUP › ALIGN and just after
+    /// mapping): a line at every white-key boundary, the front and back edges,
+    /// and an outline around every black key — flattened into one node so it
+    /// costs a single draw call. Hidden by default.
+    static func makeOutlines() -> SCNNode {
+        let container = SCNNode()
+        let mat = SCNMaterial()
+        mat.lightingModel        = .constant
+        mat.diffuse.contents     = UIColor(red: 0.35, green: 0.95, blue: 1.0, alpha: 0.9)
+        mat.blendMode            = .alpha
+        mat.isDoubleSided        = true
+        mat.writesToDepthBuffer  = false
+        mat.readsFromDepthBuffer = false
+
+        let lineW: CGFloat = 0.0014
+        let leftEdge = -KeyboardLayout.totalWidth / 2
+        let whiteY = KeyboardLayout.whiteKeyHeight + 0.0012
+        func line(width: CGFloat, length: CGFloat, at p: SIMD3<Float>) {
+            let box = SCNBox(width: width, height: 0.0006, length: length, chamferRadius: 0)
+            box.materials = [mat]
+            let n = SCNNode(geometry: box)
+            n.simdPosition = p
+            container.addChildNode(n)
+        }
+
+        for i in 0...52 {
+            let x = leftEdge + Float(i) * KeyboardLayout.whiteKeyWidth
+            line(width: lineW, length: CGFloat(KeyboardLayout.whiteKeyDepth), at: SIMD3<Float>(x, whiteY, 0))
+        }
+        for z in [KeyboardLayout.whiteKeyDepth / 2, -KeyboardLayout.whiteKeyDepth / 2] {
+            line(width: CGFloat(KeyboardLayout.totalWidth), length: lineW, at: SIMD3<Float>(0, whiteY, z))
+        }
+
+        let bz = -(KeyboardLayout.whiteKeyDepth - KeyboardLayout.blackKeyDepth) / 2
+        let by = KeyboardLayout.whiteKeyHeight + KeyboardLayout.blackKeyExtraHeight + 0.0012
+        let hw = KeyboardLayout.blackKeyWidth / 2
+        for key in KeyboardLayout.keys where key.isBlack {
+            let cx = leftEdge + key.xCenter
+            line(width: lineW, length: CGFloat(KeyboardLayout.blackKeyDepth), at: SIMD3<Float>(cx - hw, by, bz))
+            line(width: lineW, length: CGFloat(KeyboardLayout.blackKeyDepth), at: SIMD3<Float>(cx + hw, by, bz))
+            line(width: CGFloat(KeyboardLayout.blackKeyWidth), length: lineW,
+                 at: SIMD3<Float>(cx, by, bz + KeyboardLayout.blackKeyDepth / 2))
+        }
+
+        let flat = container.flattenedClone()
+        flat.renderingOrder = 30
+        flat.isHidden = true
+        return flat
+    }
+
     /// Transparent overlay for real-piano mode: faint glow planes over each white key
     /// so key positions are visible without covering the actual piano underneath.
     /// NoteHighway adds the key labels and active-note highlights on top of this.

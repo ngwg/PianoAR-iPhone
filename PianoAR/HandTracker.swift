@@ -55,7 +55,6 @@ final class HandTracker: ObservableObject {
     private var isProcessing = false
     // No frame-count gate — process as fast as Vision allows; isProcessing prevents queuing.
     private let visionQueue  = DispatchQueue(label: "com.piano.vision", qos: .userInteractive)
-    private var smoothed:     [String: SIMD3<Float>]        = [:]
     private var smoothedAge:  [String: TimeInterval]        = [:]
     private var lastDepthByKey: [String: Float]             = [:]
     // Per-hand canonical skeleton: each joint's position in the palm-local frame,
@@ -100,11 +99,13 @@ final class HandTracker: ObservableObject {
                      orientation: CGImagePropertyOrientation) {
         defer { isProcessing = false }
 
-        // Downscale to ≤640 px on the long side before Vision.
-        // At 1920×1440 input that's ~3× linear = ~9× fewer pixels → dramatically faster ML.
+        // Downscale to ≤1024 px on the long side before Vision. From head
+        // height the hands are small in the frame; 1024 px (vs the old 640)
+        // gives the keypoint model a noticeably sharper hand crop — better
+        // fingertips — while still ~3.5× fewer pixels than the full image.
         // Vision's normalized [0,1] output is resolution-independent, so depth/3D math
         // below still uses the original camera.imageResolution.
-        let visionInput = downscaled(pixelBuffer, maxSide: 640)
+        let visionInput = downscaled(pixelBuffer, maxSide: 1024)
 
         let request = VNDetectHumanHandPoseRequest()
         request.maximumHandCount = 2
@@ -118,9 +119,10 @@ final class HandTracker: ObservableObject {
         let imgW = Float(camera.imageResolution.width)
         let imgH = Float(camera.imageResolution.height)
         var results: [HandResult] = []
+        let sides = assignSides(observations, now: CACurrentMediaTime())
 
-        for obs in observations {
-            let side = obs.chirality == .left ? "L" : "R"
+        for (oi, obs) in observations.enumerated() {
+            let side = sides[oi]
             var joints: [VNHumanHandPoseObservation.JointName: SIMD3<Float>] = [:]
 
             for name in HandTracker.allJoints {
@@ -158,28 +160,17 @@ final class HandTracker: ObservableObject {
 
                 let world = cameraPixelToWorld(px: nx, py: ny, depth: depth, camera: camera)
 
-                // Adaptive EMA: fast-follow when the hand moves, heavy-smooth when still.
-                // Eliminates lag on fast gestures while suppressing jitter at rest.
-                let s: SIMD3<Float>
-                if recent, let prev = smoothed[key] {
-                    let dist  = simd_length(world - prev)
-                    // Heavier floor than before (α 0.10 vs 0.20): sub-5 mm/frame
-                    // deltas are almost entirely sensor noise, so smooth them
-                    // hard; real motion still ramps to α 0.9 by ~4.5 cm/frame.
-                    let alpha = simd_clamp(dist / 0.05, 0.10, 0.90)
-                    s = prev + alpha * (world - prev)
-                } else {
-                    // Stale or first appearance — jump directly to avoid "snap" from old position.
-                    s = world
-                }
-                smoothed[key]    = s
+                // One-Euro filter: heavy smoothing while the finger is still
+                // (kills LiDAR/keypoint jitter), light smoothing as it speeds
+                // up (no lag on real motion).
+                let s = oneEuro(key, world, now)
                 smoothedAge[key] = now
                 joints[name]     = s
             }
 
             if !joints.isEmpty {
                 let estimated = completeHand(side: side, joints: &joints)
-                results.append(HandResult(isLeft: obs.chirality == .left,
+                results.append(HandResult(isLeft: side == "L",
                                           joints: joints, estimated: estimated))
             }
         }
@@ -197,7 +188,104 @@ final class HandTracker: ObservableObject {
             results = [q0 >= q1 ? results[0] : results[1]]
         }
 
+        // Brief-dropout hold: Vision loses a hand for a frame or two all the
+        // time (fingers over keys, motion blur). Re-show its last pose for up
+        // to 150 ms, marked estimated so nothing treats it as a real
+        // observation — no more flicker in the overlay or the menu cursor.
+        let holdNow = CACurrentMediaTime()
+        var fresh: Set<String> = []
+        for r in results {
+            let side = r.isLeft ? "L" : "R"
+            fresh.insert(side)
+            lastSeenHand[side] = (r, holdNow)
+        }
+        for side in ["L", "R"] where !fresh.contains(side) {
+            if let held = lastSeenHand[side], holdNow - held.time < 0.15 {
+                var h = held.hand
+                h.estimated = Set(h.joints.keys)
+                results.append(h)
+            }
+        }
+
         commit(results, count: observations.count)
+    }
+
+    // MARK: - Hand identity + smoothing
+
+    private var slotPos: [String: (point: CGPoint, time: TimeInterval)] = [:]
+    private var lastSeenHand: [String: (hand: HandResult, time: TimeInterval)] = [:]
+
+    private struct EuroState { var x: SIMD3<Float>; var dx: SIMD3<Float>; var t: TimeInterval }
+    private var euro: [String: EuroState] = [:]
+    private let euroMinCutoff: Float = 0.7   // Hz — strong smoothing at rest
+    private let euroBeta: Float = 5.0        // per m/s — loosens as the hand moves
+    private let euroDCutoff: Float = 1.0
+
+    /// One-Euro filter (Casiez et al.): cutoff = minCutoff + beta·speed.
+    private func oneEuro(_ key: String, _ x: SIMD3<Float>, _ t: TimeInterval) -> SIMD3<Float> {
+        guard let s = euro[key], t > s.t, t - s.t < Self.smoothedStaleTimeout else {
+            euro[key] = EuroState(x: x, dx: .zero, t: t)
+            return x
+        }
+        let dt = Float(t - s.t)
+        func alpha(_ cutoff: Float) -> Float {
+            let tau = 1 / (2 * Float.pi * cutoff)
+            return 1 / (1 + tau / dt)
+        }
+        let dx = s.dx + alpha(euroDCutoff) * ((x - s.x) / dt - s.dx)
+        let xf = s.x + alpha(euroMinCutoff + euroBeta * simd_length(dx)) * (x - s.x)
+        euro[key] = EuroState(x: xf, dx: dx, t: t)
+        return xf
+    }
+
+    /// Left/right by continuity, not Vision's per-frame chirality guess
+    /// (which flips): each detection goes to the hand slot it's nearest to;
+    /// chirality only decides when there's no recent history.
+    private func assignSides(_ observations: [VNHumanHandPoseObservation],
+                             now: TimeInterval) -> [String] {
+        let anchors = observations.map { Self.anchorPoint($0) }
+        var sides = observations.map { $0.chirality == .left ? "L" : "R" }
+        func recent(_ s: String) -> CGPoint? {
+            guard let v = slotPos[s], now - v.time < 0.5 else { return nil }
+            return v.point
+        }
+        func dist(_ a: CGPoint?, _ b: CGPoint?) -> CGFloat {
+            guard let a, let b else { return .greatestFiniteMagnitude }
+            return hypot(a.x - b.x, a.y - b.y)
+        }
+        let l = recent("L"), r = recent("R")
+
+        if observations.count == 2 {
+            if let l, let r {
+                let keep = dist(anchors[0], l) + dist(anchors[1], r)
+                let swap = dist(anchors[0], r) + dist(anchors[1], l)
+                sides = keep <= swap ? ["L", "R"] : ["R", "L"]
+            } else if sides[0] == sides[1] {
+                // Both called the same hand: the one further left in the
+                // upright image is the left hand.
+                let x0 = anchors[0]?.x ?? 0, x1 = anchors[1]?.x ?? 1
+                sides = x0 <= x1 ? ["L", "R"] : ["R", "L"]
+            }
+        } else if observations.count == 1, let a = anchors[0], l != nil || r != nil {
+            let dl = dist(a, l), dr = dist(a, r)
+            if min(dl, dr) < 0.12 { sides = [dl <= dr ? "L" : "R"] }
+        }
+
+        for (i, s) in sides.enumerated() {
+            if let a = anchors[i] { slotPos[s] = (a, now) }
+        }
+        return sides
+    }
+
+    /// Wrist, or the mean of the confident joints (normalized image space).
+    private static func anchorPoint(_ obs: VNHumanHandPoseObservation) -> CGPoint? {
+        if let w = try? obs.recognizedPoint(.wrist), w.confidence > 0.3 { return w.location }
+        guard let pts = try? obs.recognizedPoints(.all) else { return nil }
+        let good = pts.values.filter { $0.confidence > 0.3 }
+        guard !good.isEmpty else { return nil }
+        let n = CGFloat(good.count)
+        return CGPoint(x: good.reduce(CGFloat(0)) { $0 + $1.location.x } / n,
+                       y: good.reduce(CGFloat(0)) { $0 + $1.location.y } / n)
     }
 
     /// Two detections are one physical hand when their matching joints

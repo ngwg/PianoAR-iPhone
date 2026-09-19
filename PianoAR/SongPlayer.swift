@@ -253,6 +253,16 @@ final class SongPlayer: ObservableObject {
     /// Kept for older call sites.
     func expectedKeyIndicesNow() -> Set<Int> { pendingKeyIndicesNow() }
 
+    /// Required keys of the next `count` groups after the current one —
+    /// playing slightly ahead is not a mistake.
+    func upcomingKeyIndices(count: Int = 2) -> Set<Int> {
+        guard isPlaying, !isComplete, groupIndex + 1 < groups.count else { return [] }
+        let end = min(groups.count, groupIndex + 1 + count)
+        var keys = Set<Int>()
+        for g in groups[(groupIndex + 1)..<end] { keys.formUnion(g.requiredKeys) }
+        return keys
+    }
+
     /// Start beat of the group being waited on / played right now.
     func currentGroupStartBeat() -> Double? {
         guard isPlaying, !isComplete, groupIndex < groups.count else { return nil }
@@ -278,11 +288,14 @@ final class SongPlayer: ObservableObject {
         }
     }
 
-    func registerPress(keyIndex: Int, noteName: String) -> PracticePressResult {
+    /// `strikeTime`: when the key was actually struck (sound onsets arrive a
+    /// little after the fact); used for the early/late timing stats.
+    func registerPress(keyIndex: Int, noteName: String,
+                       at strikeTime: TimeInterval? = nil) -> PracticePressResult {
         guard isPlaying, !isComplete, groupIndex < groups.count else { return .ignored }
         let g = groups[groupIndex]
         let now = CACurrentMediaTime()
-        let raw = rawBeat(at: now)
+        let raw = rawBeat(at: min(now, strikeTime ?? now))
         if !waitMode, raw < g.startBeat - earlySeconds * effectiveBPM / 60.0 { return .ignored }
 
         guard g.allKeys.contains(keyIndex) else {

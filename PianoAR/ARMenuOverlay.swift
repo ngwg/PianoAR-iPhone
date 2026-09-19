@@ -9,7 +9,7 @@ enum MenuAction {
     case cycleHand, toggleWaitMode
     case viewScale(Double), lensSpacing(Double)
     case toggleSmoothing, toggleStereo, cycleHandStyle, resetComfort
-    case nudge(x: Float, z: Float)        // metres, keyboard-local
+    case align(KeyboardAlignment.Adjust)  // fine placement of the key overlay
     case toggleKeyLabels
 }
 
@@ -25,6 +25,7 @@ struct MenuState: Equatable {
     var waitMode = true
     var comfort = ComfortSnapshot.default
     var keyLabels = true
+    var alignReadout = ""
 }
 
 /// Floating "tablet" AR panel — Quest-3 interaction model.
@@ -99,14 +100,18 @@ final class ARMenuOverlay {
     private static let comfortResetRect = CGRect(x: 490, y: 346, width: 430, height: 60)
 
     // Setup
-    private static let recalRect     = CGRect(x: 40,  y: 130, width: 430, height: 64)
-    private static let debugRect     = CGRect(x: 490, y: 130, width: 430, height: 64)
-    private static let labelsRect    = CGRect(x: 40,  y: 208, width: 430, height: 64)
-    private static let nudgeFwdRect  = CGRect(x: 430, y: 318, width: 100, height: 60)
-    private static let nudgeBackRect = CGRect(x: 430, y: 470, width: 100, height: 60)
-    private static let nudgeLeftRect = CGRect(x: 300, y: 394, width: 110, height: 60)
-    private static let nudgeRightRect = CGRect(x: 550, y: 394, width: 110, height: 60)
-    private static let nudgeStep: Float = 0.002
+    // Setup: top row, then an ALIGN grid of labelled button pairs (two columns).
+    private static let mapRect       = CGRect(x: 30,  y: 122, width: 300, height: 52)
+    private static let debugRect     = CGRect(x: 345, y: 122, width: 270, height: 52)
+    private static let labelsRect    = CGRect(x: 630, y: 122, width: 300, height: 52)
+    private static func alignCell(row: Int, col: Int, button: Int) -> CGRect {
+        CGRect(x: (col == 0 ? 30 : 495) + 200 + CGFloat(button) * 120,
+               y: 226 + CGFloat(row) * 70, width: 110, height: 60)
+    }
+    private static func alignLabel(row: Int, col: Int) -> CGRect {
+        CGRect(x: (col == 0 ? 30 : 495) + 8, y: 226 + CGFloat(row) * 70, width: 190, height: 60)
+    }
+    private static let alignResetRect = CGRect(x: 30, y: 436, width: 430, height: 56)
 
     // Minimized pill
     private static let pillRect     = CGRect(x: 150, y: 16, width: 660, height: 116)
@@ -169,7 +174,9 @@ final class ARMenuOverlay {
         case pagePrev, pageNext, minimize
         case play, restart, skip, tempoDown, tempoUp, hand, wait
         case viewDown, viewUp, lensDown, lensUp, smooth, stereo, handStyle, comfortReset
-        case recalibrate, debug, labels, nudgeFwd, nudgeBack, nudgeLeft, nudgeRight
+        case mapKeys, debug, labels, alignReset
+        case slideLeft, slideRight, keyLeft, keyRight, depthAway, depthToward
+        case widthMinus, widthPlus, turnLeft, turnRight, heightDown, heightUp
         case pillPause, pillSkip, pillMenu
 
         var actionable: Bool { self != .none && self != .handle }
@@ -179,6 +186,9 @@ final class ARMenuOverlay {
     private var activeTab: Tab = .library
     private var libPage = 0
     private var minimized = false
+
+    /// SETUP tab open → the renderer lights up the key outlines.
+    var showsAlignment: Bool { !minimized && activeTab == .setup }
     private var wasPlaying = false
     private var state = MenuState()
     private var songs: [Song] = []
@@ -577,9 +587,14 @@ final class ARMenuOverlay {
         (.handStyle, handStyleRect), (.comfortReset, comfortResetRect),
     ]
     private static let setupControls: [(Region, CGRect)] = [
-        (.recalibrate, recalRect), (.debug, debugRect), (.labels, labelsRect),
-        (.nudgeFwd, nudgeFwdRect), (.nudgeBack, nudgeBackRect),
-        (.nudgeLeft, nudgeLeftRect), (.nudgeRight, nudgeRightRect),
+        (.mapKeys, mapRect), (.debug, debugRect), (.labels, labelsRect),
+        (.slideLeft, alignCell(row: 0, col: 0, button: 0)), (.slideRight, alignCell(row: 0, col: 0, button: 1)),
+        (.keyLeft, alignCell(row: 0, col: 1, button: 0)), (.keyRight, alignCell(row: 0, col: 1, button: 1)),
+        (.depthAway, alignCell(row: 1, col: 0, button: 0)), (.depthToward, alignCell(row: 1, col: 0, button: 1)),
+        (.widthMinus, alignCell(row: 1, col: 1, button: 0)), (.widthPlus, alignCell(row: 1, col: 1, button: 1)),
+        (.turnLeft, alignCell(row: 2, col: 0, button: 0)), (.turnRight, alignCell(row: 2, col: 0, button: 1)),
+        (.heightDown, alignCell(row: 2, col: 1, button: 0)), (.heightUp, alignCell(row: 2, col: 1, button: 1)),
+        (.alignReset, alignResetRect),
     ]
 
     private var pageCount: Int { max(1, (songs.count + Self.libPerPage - 1) / Self.libPerPage) }
@@ -680,13 +695,22 @@ final class ARMenuOverlay {
         case .stereo:            return .toggleStereo
         case .handStyle:         return .cycleHandStyle
         case .comfortReset:      return .resetComfort
-        case .recalibrate:       return .recalibrate
+        case .mapKeys:           return .recalibrate
         case .debug:             return .toggleDebug
         case .labels:            return .toggleKeyLabels
-        case .nudgeFwd:          return .nudge(x: 0, z: -Self.nudgeStep)
-        case .nudgeBack:         return .nudge(x: 0, z: Self.nudgeStep)
-        case .nudgeLeft:         return .nudge(x: -Self.nudgeStep, z: 0)
-        case .nudgeRight:        return .nudge(x: Self.nudgeStep, z: 0)
+        case .alignReset:        return .align(.reset)
+        case .slideLeft:         return .align(.moveX(-KeyboardAlignment.slideStep))
+        case .slideRight:        return .align(.moveX(KeyboardAlignment.slideStep))
+        case .keyLeft:           return .align(.moveX(-KeyboardAlignment.keyStep))
+        case .keyRight:          return .align(.moveX(KeyboardAlignment.keyStep))
+        case .depthAway:         return .align(.moveZ(-KeyboardAlignment.slideStep))
+        case .depthToward:       return .align(.moveZ(KeyboardAlignment.slideStep))
+        case .widthMinus:        return .align(.width(-KeyboardAlignment.widthStep))
+        case .widthPlus:         return .align(.width(KeyboardAlignment.widthStep))
+        case .turnLeft:          return .align(.rotate(KeyboardAlignment.turnStep))
+        case .turnRight:         return .align(.rotate(-KeyboardAlignment.turnStep))
+        case .heightDown:        return .align(.moveY(-KeyboardAlignment.heightStep))
+        case .heightUp:          return .align(.moveY(KeyboardAlignment.heightStep))
         }
     }
 
@@ -937,19 +961,40 @@ final class ARMenuOverlay {
     }
 
     private static func drawSetup(_ s: PanelSnap) {
-        button(recalRect, "⌖  RECALIBRATE KEYBOARD", fill: neutral, size: 21)
+        button(mapRect, "⌖  MAP KEYS (PINCH)", fill: accentBlue, size: 20)
         button(debugRect, s.state.debugOn ? "DEBUG:  ON" : "DEBUG:  OFF",
-               fill: s.state.debugOn ? accentGreen : neutral, size: 21)
+               fill: s.state.debugOn ? accentGreen : neutral, size: 20)
         button(labelsRect, s.state.keyLabels ? "KEY LABELS:  ON" : "KEY LABELS:  OFF",
-               fill: s.state.keyLabels ? accentGreen : neutral, size: 21)
-        centered("NUDGE KEYBOARD  (2 mm)", in: CGRect(x: 0, y: 280, width: texW, height: 34),
-                 font: .systemFont(ofSize: 20, weight: .heavy), color: UIColor(white: 1, alpha: 0.6))
-        button(nudgeFwdRect, "▲", fill: neutral, size: 30, weight: .black)
-        button(nudgeBackRect, "▼", fill: neutral, size: 30, weight: .black)
-        button(nudgeLeftRect, "◀", fill: neutral, size: 30, weight: .black)
-        button(nudgeRightRect, "▶", fill: neutral, size: 30, weight: .black)
-        centered("away ▲   ▼ toward you", in: CGRect(x: 0, y: 540, width: texW, height: 24),
-                 font: .systemFont(ofSize: 15, weight: .semibold), color: UIColor(white: 1, alpha: 0.4))
+               fill: s.state.keyLabels ? accentGreen : neutral, size: 20)
+
+        centered(s.state.alignReadout, in: CGRect(x: 20, y: 182, width: texW - 40, height: 34),
+                 font: .monospacedDigitSystemFont(ofSize: 17, weight: .semibold),
+                 color: UIColor(red: 0.55, green: 0.95, blue: 1.0, alpha: 0.9))
+
+        let rows: [(label: String, minus: String, plus: String)] = [
+            ("SLIDE 5 mm", "◀", "▶"), ("SLIDE 1 KEY", "◀◀", "▶▶"),
+            ("DEPTH", "▲ away", "▼ near"), ("WIDTH", "−", "+"),
+            ("TURN", "↺", "↻"), ("HEIGHT", "▼", "▲"),
+        ]
+        let labelFont = UIFont.systemFont(ofSize: 19, weight: .heavy)
+        for (i, r) in rows.enumerated() {
+            let row = i / 2, col = i % 2
+            leftTruncated(r.label, in: alignLabel(row: row, col: col), font: labelFont,
+                          color: UIColor(white: 1, alpha: 0.75))
+            button(alignCell(row: row, col: col, button: 0), r.minus, fill: neutral, size: 24, weight: .black)
+            button(alignCell(row: row, col: col, button: 1), r.plus, fill: neutral, size: 24, weight: .black)
+        }
+        button(alignResetRect, "RESET ALIGNMENT", fill: neutral, size: 19)
+
+        let hint = "The blue outlines show where the app thinks your keys are. "
+            + "Line them up with the real keys; they stay lit while this tab is open."
+        let para = NSMutableParagraphStyle()
+        para.alignment = .left
+        para.lineBreakMode = .byWordWrapping
+        (hint as NSString).draw(in: CGRect(x: 495, y: 434, width: 440, height: 110),
+                                withAttributes: [.font: UIFont.systemFont(ofSize: 16, weight: .medium),
+                                                 .foregroundColor: UIColor(white: 1, alpha: 0.55),
+                                                 .paragraphStyle: para])
     }
 
     private static func centered(_ text: String, in rect: CGRect, font: UIFont, color: UIColor) {

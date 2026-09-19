@@ -15,7 +15,7 @@ struct ARPassthroughView: UIViewRepresentable {
     var onMenuAction:   ((MenuAction) -> Void)?
     var showDebug:      Bool   = false
     var showKeyLabels:  Bool   = true
-    var keyboardNudge:  SIMD2<Float> = .zero      // keyboard-local x, z (m)
+    var alignment = KeyboardAlignment()           // SETUP › ALIGN fine placement
     var availableSongs: [Song] = []
 
     func makeCoordinator() -> Coordinator {
@@ -57,7 +57,7 @@ struct ARPassthroughView: UIViewRepresentable {
             showDebug: showDebug,
             showKeyLabels: showKeyLabels,
             comfort: comfort,
-            nudge: keyboardNudge,
+            alignment: alignment,
             songs: availableSongs
         ))
     }
@@ -70,7 +70,7 @@ struct ARPassthroughView: UIViewRepresentable {
             var showDebug = false
             var showKeyLabels = true
             var comfort = ComfortSnapshot.default
-            var nudge = SIMD2<Float>(0, 0)
+            var alignment = KeyboardAlignment()
             var songs: [Song] = []
         }
 
@@ -93,8 +93,12 @@ struct ARPassthroughView: UIViewRepresentable {
         /// The keyboard content node: key tops sit at y = whiteKeyHeight in
         /// its local space, exactly on the real key tops (see nodeFor).
         private weak var keyboardNode: SCNNode?
-        /// Unscaled parent of the keyboard content + UI panels (nudge target).
+        /// Unscaled parent of the keyboard content + UI panels (alignment target).
         private weak var keyboardFrame: SCNNode?
+        private weak var outlines: SCNNode?
+        private var outlinesUntil: TimeInterval = 0
+        private var baseScale = SIMD2<Float>(1, 1)          // mapped width / depth scale
+        private var pinchMarker: SCNNode?
         private let planeNodes = NSHashTable<SCNNode>.weakObjects()
         private var lastFrameTime: TimeInterval = 0
         private var fps: Double = 60
@@ -147,22 +151,26 @@ struct ARPassthroughView: UIViewRepresentable {
             hand3D?.update(hands: hands, style: cfg.comfort.handStyle,
                            menu: menuOverlay, keyboardNode: keyboardNode)
 
-            // ── Calibration: auto-detect, fingertip calibration, planes ──────
+            // ── Calibration: pinch mapping (and taps), planes, hints ─────────
             calibration.attemptAutoDetect(frame: frame,
                                           orientation: handTracker.imageOrientation,
                                           time: time)
-            calibration.attemptHandCalibration(hands: hands, cameraPosition: camPos, time: time)
+            calibration.attemptPinchMapping(hands: hands, cameraPosition: camPos, time: time)
             let calibrating = calibration.state.isCollecting
             for node in planeNodes.allObjects { node.isHidden = !calibrating }
+            updatePinchMarker(scene: sceneView.scene)
 
             if hintBar == nil, let cam = sceneView.pointOfView {
                 hintBar = HintBarOverlay(cameraNode: cam)
             }
-            hintBar?.update(text: currentHintText())
+            hintBar?.update(text: currentHintText(time: time))
 
-            // Fine placement nudge from the SETUP tab.
-            keyboardFrame?.simdPosition = SIMD3<Float>(cfg.nudge.x, -KeyboardLayout.whiteKeyHeight,
-                                                       cfg.nudge.y)
+            // Fine placement from SETUP › ALIGN, on top of the mapping.
+            let a = cfg.alignment
+            keyboardFrame?.simdPosition = SIMD3<Float>(a.x, -KeyboardLayout.whiteKeyHeight + a.y, a.z)
+            keyboardFrame?.simdOrientation = simd_quatf(angle: a.yaw, axis: SIMD3<Float>(0, 1, 0))
+            keyboardNode?.scale = SCNVector3(baseScale.x * a.width, 1, baseScale.y)
+            outlines?.isHidden = !((menuOverlay?.showsAlignment ?? false) || time < outlinesUntil)
 
             // ── AR menu ──────────────────────────────────────────────────────
             if let kb = keyboardNode, let menu = menuOverlay {
@@ -177,7 +185,8 @@ struct ARPassthroughView: UIViewRepresentable {
                     hand: hud.hand,
                     waitMode: hud.waitMode,
                     comfort: cfg.comfort,
-                    keyLabels: cfg.showKeyLabels)
+                    keyLabels: cfg.showKeyLabels,
+                    alignReadout: cfg.alignment.readout)
                 if let action = menu.update(hands: hands, keyboardNode: kb, time: time,
                                             state: state, availableSongs: cfg.songs,
                                             cameraWorldPos: camPos) {
@@ -192,11 +201,13 @@ struct ARPassthroughView: UIViewRepresentable {
                 audioSnapshot: audio,
                 expectedKeyIndices: pending,
                 groupKeyIndices: groupKeys,
+                upcomingKeyIndices: songPlayer.upcomingKeyIndices(),
                 groupSerial: songPlayer.groupSerial,
                 keyTuning: keyTuning
             )
             for p in presses {
-                switch songPlayer.registerPress(keyIndex: p.keyIndex, noteName: p.noteName) {
+                switch songPlayer.registerPress(keyIndex: p.keyIndex, noteName: p.noteName,
+                                                at: p.timestamp) {
                 case .correct(let expectedKeyIndex, _):
                     highway?.registerPress(keyIndex: expectedKeyIndex)
                 case .wrong(let playedKeyIndex, _, _, _):
@@ -263,10 +274,19 @@ struct ARPassthroughView: UIViewRepresentable {
                 // Keys + waterfall follow the measured keyboard size...
                 let content = KeyboardNode.makeOverlay()
                 if let d = calibration.calibrationData {
-                    content.scale = SCNVector3(d.widthScale, 1, d.depthScale)
+                    baseScale = SIMD2<Float>(d.widthScale, d.depthScale)
+                } else {
+                    baseScale = SIMD2<Float>(1, 1)
                 }
+                content.scale = SCNVector3(baseScale.x, 1, baseScale.y)
                 let hw = NoteHighway()
                 content.addChildNode(hw.rootNode)
+                // Bright key outlines: shown for a few seconds after mapping so
+                // you can check the fit, and whenever SETUP is open.
+                let outline = KeyboardNode.makeOutlines()
+                content.addChildNode(outline)
+                outlines = outline
+                outlinesUntil = CACurrentMediaTime() + 8
                 frameNode.addChildNode(content)
 
                 // ...UI panels are never stretched by that scale.
@@ -301,27 +321,52 @@ struct ARPassthroughView: UIViewRepresentable {
             updatePlane(node, for: plane)
         }
 
-        private func currentHintText() -> String {
+        private func currentHintText(time: TimeInterval) -> String {
+            if let hint = calibration.mappingHint(time: time) { return hint }
             switch calibration.state {
             case .idle:
                 return "Look at your piano keys"
             case .collecting(let n):
-                if n == 0 {
-                    if let p = calibration.handCalibrationProgress {
-                        return "Hold still… \(Int(p * 100))%"
-                    }
-                    return "Scanning for the keys… or rest both index fingers on the lowest and highest key"
-                }
                 let labels = [
                     "",
                     "Tap corner 2/4 — near-right (high notes, front)",
                     "Tap corner 3/4 — far-right (high notes, back)",
                     "Tap corner 4/4 — far-left (low notes, back)",
                 ]
-                return labels[min(n, 3)]
+                return labels[min(max(n, 0), 3)]
             case .done:
                 return ""
             }
+        }
+
+        /// A glowing dot at the live pinch point while mapping; it grows and
+        /// turns green as the half-second hold completes.
+        private func updatePinchMarker(scene: SCNScene) {
+            guard let preview = calibration.pinchPreview else {
+                pinchMarker?.isHidden = true
+                return
+            }
+            if pinchMarker == nil {
+                let s = SCNSphere(radius: 0.010)
+                s.segmentCount = 16
+                let m = SCNMaterial()
+                m.lightingModel = .constant
+                m.writesToDepthBuffer = false
+                m.readsFromDepthBuffer = false
+                s.materials = [m]
+                let n = SCNNode(geometry: s)
+                n.renderingOrder = 320
+                scene.rootNode.addChildNode(n)
+                pinchMarker = n
+            }
+            guard let n = pinchMarker else { return }
+            let p = CGFloat(preview.progress)
+            n.simdPosition = preview.position
+            let scale = Float(0.8 + 0.8 * p)
+            n.scale = SCNVector3(scale, scale, scale)
+            n.geometry?.firstMaterial?.diffuse.contents =
+                UIColor(red: 1 - 0.8 * p, green: 0.6 + 0.4 * p, blue: 1 - 0.6 * p, alpha: 0.95)
+            n.isHidden = false
         }
 
         private func cornerMarker() -> SCNNode {

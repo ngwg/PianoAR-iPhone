@@ -43,6 +43,7 @@ final class CalibrationManager: ObservableObject {
     weak var sceneView: ARSCNView?
 
     // ── Auto-detection state ──────────────────────────────────────────────
+    var autoDetectEnabled = false
     private let autoQueue = DispatchQueue(label: "com.piano.autodetect", qos: .userInitiated)
     private var autoBusy = false
     private var lastAutoAttempt: TimeInterval = 0
@@ -105,6 +106,10 @@ final class CalibrationManager: ObservableObject {
         cornerAnchorIDs = []
         calibrationData = nil
         pendingAutoCorners = nil
+        pinchLeft = nil
+        pinchSamples = []
+        pinchHoldStart = nil
+        pinchPreview = nil
         state = .idle
     }
 
@@ -125,6 +130,9 @@ final class CalibrationManager: ObservableObject {
     func attemptAutoDetect(frame: ARFrame,
                            orientation: CGImagePropertyOrientation,
                            time: TimeInterval) {
+        // Off by default: pinch mapping is the headset flow, and a rectangle
+        // guess landing while you're mid-pinch would fight it.
+        guard autoDetectEnabled else { return }
         guard case .collecting(let count) = state, count == 0 else { return }
         guard time - lastAutoAttempt > 0.5, !autoBusy else { return }
         lastAutoAttempt = time
@@ -274,100 +282,180 @@ final class CalibrationManager: ObservableObject {
         state = .done
     }
 
-    // MARK: - Fingertip calibration (PianoVision-style)
+    // MARK: - Pinch mapping (headset-friendly)
     //
     // With the phone in the headset, tapping the screen is awkward. Instead:
-    // rest the LEFT index fingertip on the front of the lowest key (A0) and
-    // the RIGHT one on the front of the highest key (C8), and hold still.
-    // LiDAR puts both fingertips in 3-D; the line between them is the
-    // keyboard's X axis and its length gives the width scale.
+    // pinch (thumb + index together) and hold for half a second at the
+    // FRONT-LEFT corner of the keys, then at the FRONT-RIGHT corner. LiDAR
+    // puts each pinch in 3-D; the line between them is the keyboard's front
+    // edge, its length the keyboard width. The order doesn't matter — left
+    // and right are taken from where you stand.
 
-    private var handHistory: [(t: TimeInterval, l: SIMD3<Float>, r: SIMD3<Float>)] = []
-    private var handCommitPending = false
-    private let handHold: TimeInterval = 1.2
-    /// 0…1 while both fingertips are being held in place (render thread).
-    private(set) var handCalibrationProgress: Float?
+    private var pinchLeft: SIMD3<Float>?
+    private var pinchHoldStart: TimeInterval?
+    private var pinchSamples: [SIMD3<Float>] = []
+    private var pinchLatched = false          // captured; waiting for the pinch to open
+    private var pinchCommitPending = false
+    private var pinchClosed: [Bool: Bool] = [:]
+    private let pinchOn: Float = 0.025
+    private let pinchOff: Float = 0.045
+    private let pinchHold: TimeInterval = 0.5
+    /// LiDAR sees the top of the pinched fingertips, ~12 mm above the keys.
+    private let pinchHeightOffset: Float = 0.012
 
-    private static var standardEndKeySpan: Float {
-        KeyboardLayout.keys[KeyboardLayout.keys.count - 1].xCenter - KeyboardLayout.keys[0].xCenter
+    /// Live pinch feedback for the renderer (render thread).
+    private(set) var pinchPreview: (position: SIMD3<Float>, progress: Float)?
+    private var mappingMessage: String?
+    private var mappingMessageUntil: TimeInterval = 0
+
+    /// Render thread, every frame while calibrating.
+    func attemptPinchMapping(hands: [HandTracker.HandResult],
+                             cameraPosition cam: SIMD3<Float>,
+                             time: TimeInterval) {
+        func idle() { pinchPreview = nil; pinchHoldStart = nil; pinchSamples = [] }
+        guard case .collecting(let count) = state, count == 0, !pinchCommitPending else {
+            idle(); return
+        }
+
+        var pinch: SIMD3<Float>?
+        for h in hands {
+            guard !h.estimated.contains(.thumbTip), !h.estimated.contains(.indexTip),
+                  let t = h.joints[.thumbTip], let i = h.joints[.indexTip] else { continue }
+            let d = simd_length(t - i)
+            let closed = (pinchClosed[h.isLeft] ?? false) ? d < pinchOff : d < pinchOn
+            pinchClosed[h.isLeft] = closed
+            if closed { pinch = (t + i) * 0.5 }
+        }
+        guard let p = pinch else {
+            pinchLatched = false              // opened: ready for the next corner
+            idle(); return
+        }
+        if pinchLatched { pinchPreview = nil; return }
+
+        // Must be held still: restart the hold if the pinch moves > 2 cm.
+        if let first = pinchSamples.first, simd_length(first - p) > 0.02 {
+            pinchSamples = []
+            pinchHoldStart = nil
+        }
+        if pinchHoldStart == nil { pinchHoldStart = time }
+        pinchSamples.append(p)
+        let progress = Float(min(1, (time - (pinchHoldStart ?? time)) / pinchHold))
+        pinchPreview = (p, progress)
+        guard progress >= 1 else { return }
+
+        let point = pinchSamples.reduce(SIMD3<Float>(repeating: 0), +) / Float(pinchSamples.count)
+        idle()
+        pinchLatched = true
+        if let first = pinchLeft {
+            pinchCommitPending = true
+            DispatchQueue.main.async { [weak self] in
+                self?.commitPinchMapping(a: first, b: point, camera: cam)
+                self?.pinchCommitPending = false
+            }
+        } else {
+            pinchLeft = point
+            DispatchQueue.main.async { [weak self] in self?.addCornerMarker(at: point, index: 0) }
+        }
     }
 
-    /// Render thread, every frame.
-    func attemptHandCalibration(hands: [HandTracker.HandResult],
-                                cameraPosition cam: SIMD3<Float>,
-                                time: TimeInterval) {
-        func clear() { handHistory.removeAll(); handCalibrationProgress = nil }
-        guard case .collecting(let count) = state, count == 0, !handCommitPending else {
-            clear(); return
-        }
-        let tips = hands.compactMap { h -> SIMD3<Float>? in
-            h.estimated.contains(.indexTip) ? nil : h.joints[.indexTip]
-        }
-        guard tips.count == 2 else { clear(); return }
+    /// Hint-bar text while mapping (render thread). nil = nothing to say.
+    func mappingHint(time: TimeInterval) -> String? {
+        if let m = mappingMessage, time < mappingMessageUntil { return m }
+        guard case .collecting(let count) = state, count == 0 else { return nil }
+        if let p = pinchPreview { return "Hold the pinch still… \(Int(p.progress * 100))%" }
+        return pinchLeft == nil
+            ? "MAP KEYS 1/2 — pinch & hold at the FRONT-LEFT corner of the keys"
+            : "MAP KEYS 2/2 — now pinch & hold at the FRONT-RIGHT corner"
+    }
 
-        // Order the two fingertips left → right as seen from the camera.
-        let mid = (tips[0] + tips[1]) * 0.5
-        let toCamRaw = SIMD3<Float>(cam.x - mid.x, 0, cam.z - mid.z)
-        guard simd_length(toCamRaw) > 0.05 else { clear(); return }
-        let right = simd_normalize(simd_cross(SIMD3<Float>(0, 1, 0), simd_normalize(toCamRaw)))
-        let firstIsLeft = simd_dot(tips[0] - mid, right) < simd_dot(tips[1] - mid, right)
-        let l = firstIsLeft ? tips[0] : tips[1]
-        let r = firstIsLeft ? tips[1] : tips[0]
+    private func showMessage(_ text: String, seconds: TimeInterval) {
+        mappingMessage = text
+        mappingMessageUntil = CACurrentMediaTime() + seconds
+    }
 
-        // Plausible for fingertips on the two end keys of an 88-key piano.
-        let span = simd_length(SIMD3<Float>(r.x - l.x, 0, r.z - l.z))
-        guard span > 1.05, span < 1.35, abs(r.y - l.y) < 0.05, max(l.y, r.y) < cam.y - 0.10 else {
-            clear(); return
-        }
-
-        // Must be held still: restart the timer if either tip moves > 12 mm.
-        if let first = handHistory.first,
-           simd_length(first.l - l) > 0.012 || simd_length(first.r - r) > 0.012 {
-            handHistory.removeAll()
-        }
-        handHistory.append((time, l, r))
-        let held = time - (handHistory.first?.t ?? time)
-        handCalibrationProgress = Float(min(1, held / handHold))
-        guard held >= handHold else { return }
-
-        let n = Float(handHistory.count)
-        let lAvg = handHistory.reduce(SIMD3<Float>(repeating: 0)) { $0 + $1.l } / n
-        let rAvg = handHistory.reduce(SIMD3<Float>(repeating: 0)) { $0 + $1.r } / n
-        handCommitPending = true
-        clear()
-        DispatchQueue.main.async { [weak self] in
-            self?.commitHandCalibration(left: lAvg, right: rAvg, camera: cam)
-            self?.handCommitPending = false
-        }
+    private func addCornerMarker(at p: SIMD3<Float>, index: Int) {
+        guard let sv = sceneView else { return }
+        var t = matrix_identity_float4x4
+        t.columns.3 = SIMD4<Float>(p.x, p.y, p.z, 1)
+        let marker = ARAnchor(name: "corner_\(index)", transform: t)
+        sv.session.add(anchor: marker)
+        cornerAnchorIDs.append(marker.identifier)
     }
 
     /// Main thread.
-    private func commitHandCalibration(left l: SIMD3<Float>, right r: SIMD3<Float>,
-                                       camera cam: SIMD3<Float>) {
+    private func commitPinchMapping(a: SIMD3<Float>, b: SIMD3<Float>, camera cam: SIMD3<Float>) {
         guard case .collecting(let count) = state, count == 0, let sv = sceneView else { return }
-        let flatSpan = SIMD3<Float>(r.x - l.x, 0, r.z - l.z)
-        let span = simd_length(flatSpan)
-        guard span > 0.5 else { return }
+
+        // Left/right as seen from where the player stands.
+        let mid = (a + b) * 0.5
+        let toCamRaw = SIMD3<Float>(cam.x - mid.x, 0, cam.z - mid.z)
+        let toCam = simd_length(toCamRaw) > 0.01 ? simd_normalize(toCamRaw) : SIMD3<Float>(0, 0, 1)
+        let rightDir = simd_normalize(simd_cross(SIMD3<Float>(0, 1, 0), toCam))
+        let (l, r) = simd_dot(b - a, rightDir) >= 0 ? (a, b) : (b, a)
+
+        let flat = SIMD3<Float>(r.x - l.x, 0, r.z - l.z)
+        let span = simd_length(flat)
+        guard span > 0.9, span < 1.5 else {
+            pinchLeft = nil
+            removeCornerMarkers()
+            showMessage(String(format: "That was %.0f cm apart — a full piano is about 122 cm. Start again at the FRONT-LEFT corner.",
+                               span * 100), seconds: 5)
+            return
+        }
 
         let kbY = SIMD3<Float>(0, 1, 0)
-        var kbX = flatSpan / span
+        var kbX = flat / span
         var kbZ = simd_normalize(simd_cross(kbX, kbY))
-        let mid = (l + r) * 0.5
-        if simd_dot(kbZ, SIMD3<Float>(cam.x - mid.x, 0, cam.z - mid.z)) < 0 { kbX = -kbX; kbZ = -kbZ }
+        if simd_dot(kbZ, toCam) < 0 { kbX = -kbX; kbZ = -kbZ }
 
-        // Fingertips rest near the FRONT of the keys (~5 cm in front of the
-        // key-bed centre line) and LiDAR sees the top of the finger (~12 mm
-        // above the key surface). Fine-tune with SETUP › NUDGE.
-        let center = SIMD3<Float>(mid.x, mid.y - 0.012, mid.z) - kbZ * 0.05
+        // Key-top height: a detected horizontal plane right under the pinch
+        // points if there is one, else the pinch height minus finger thickness.
+        let pinchY = (l.y + r.y) * 0.5
+        let surfaceY = keySurfaceHeight(near: mid, below: pinchY, frame: sv.session.currentFrame)
+            ?? (pinchY - pinchHeightOffset)
+
+        // The pinches mark the FRONT edge; the key-bed centre is half a key
+        // depth further back.
+        let front = SIMD3<Float>(mid.x, surfaceY, mid.z)
+        let center = front - kbZ * (KeyboardLayout.whiteKeyDepth / 2)
         let transform = simd_float4x4(columns: (SIMD4<Float>(kbX, 0), SIMD4<Float>(kbY, 0),
                                                 SIMD4<Float>(kbZ, 0), SIMD4<Float>(center, 1)))
-        let data = CalibrationData(anchorTransform: transform,
-                                   widthScale: span / Self.standardEndKeySpan,
-                                   depthScale: 1)
-        calibrationData = data
+        calibrationData = CalibrationData(anchorTransform: transform,
+                                          widthScale: span / KeyboardLayout.totalWidth,
+                                          depthScale: 1)
+        addCornerMarker(at: b, index: 1)
         sv.session.add(anchor: ARAnchor(name: "keyboard_calibrated", transform: transform))
+        pinchLeft = nil
         pendingAutoCorners = nil
         state = .done
+        showMessage("Keys mapped! If the outlines are off, fine-tune in SETUP › ALIGN.", seconds: 5)
+    }
+
+    /// Height of a detected horizontal plane under `p` (within 6 cm below the
+    /// pinch height), if ARKit has found one there.
+    private func keySurfaceHeight(near p: SIMD3<Float>, below pinchY: Float,
+                                  frame: ARFrame?) -> Float? {
+        guard let frame else { return nil }
+        var best: Float?
+        for case let plane as ARPlaneAnchor in frame.anchors where plane.alignment == .horizontal {
+            let local4 = plane.transform.inverse * SIMD4<Float>(p.x, p.y, p.z, 1)
+            let dx = abs(local4.x - plane.center.x)
+            let dz = abs(local4.z - plane.center.z)
+            guard dx < plane.planeExtent.width / 2 + 0.05,
+                  dz < plane.planeExtent.height / 2 + 0.05 else { continue }
+            let y = (plane.transform * SIMD4<Float>(plane.center.x, plane.center.y, plane.center.z, 1)).y
+            guard y <= pinchY + 0.005, y >= pinchY - 0.06 else { continue }
+            if best == nil || y > best! { best = y }
+        }
+        return best
+    }
+
+    private func removeCornerMarkers() {
+        guard let sv = sceneView, let frame = sv.session.currentFrame else { return }
+        for anchor in frame.anchors where cornerAnchorIDs.contains(anchor.identifier) {
+            sv.session.remove(anchor: anchor)
+        }
+        cornerAnchorIDs = []
     }
 
     // MARK: - Geometry

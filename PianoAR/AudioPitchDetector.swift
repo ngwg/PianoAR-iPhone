@@ -22,49 +22,26 @@ struct AudioAttack {
     let timestamp: TimeInterval   // capture time of the onset (CACurrentMediaTime clock)
 }
 
-/// Per-key evidence that each key was freshly struck at one attack — see
-/// NoteVerifier. Filled in stages as post-onset audio arrives: middle and
-/// treble keys ~0.1 s after the onset, bass keys ~0.19 s, and a second,
-/// later look at middle/treble for rolled chords ~0.15 s.
-struct StrikeVerification {
-    let attackID: Int
-    let timestamp: TimeInterval          // onset time, same as the attack's
-    var rise: [Float] = .init(repeating: 0, count: 88)            // 0...1
-    var status: [NoteStatus] = .init(repeating: .absent, count: 88)
-    var evaluated: [Bool] = .init(repeating: false, count: 88)
-    var complete = false
-
-    func heardKeys() -> [Int] {
-        status.indices.filter { status[$0] == .present }
-    }
-
-    mutating func merge(key: Int, rise r: Float, status s: NoteStatus) {
-        rise[key] = max(rise[key], r)
-        status[key] = max(status[key], s)
-        evaluated[key] = true
-    }
-}
-
 struct PitchSnapshot {
     let activeNotes: [DetectedNote]           // debug pitch hints for the latest attack
     let attack: AudioAttack?                  // most recent attack — sticky until replaced
     let recentAttacks: [AudioAttack]          // oldest first, last ~1.5 s
-    let verifications: [StrikeVerification]   // oldest first, last ~2 s
+    let noteOnsets: [NoteOnset]               // per-key strikes, oldest first, last ~2 s
+    let expectedScores: [(key: Int, score: Float)]   // live NoteTracker scores (debug)
+    let listening: Bool                       // mic running
     let timestamp: TimeInterval
 
     static let empty = PitchSnapshot(activeNotes: [], attack: nil, recentAttacks: [],
-                                     verifications: [], timestamp: 0)
-
-    func verification(for attackID: Int) -> StrikeVerification? {
-        verifications.last { $0.attackID == attackID }
-    }
+                                     noteOnsets: [], expectedScores: [], listening: false,
+                                     timestamp: 0)
 }
 
-/// Microphone-side piano attack detector + expected-note verifier.
+/// Microphone-side piano detector: global attack detection (debug) plus the
+/// per-key NoteTracker that decides which keys were actually struck.
 ///
 /// Audio answers two questions: "did a piano-like attack happen, and when?"
 /// (spectral-flux onset detection on a short window) and, per attack, "which
-/// keys got freshly struck?" (NoteVerifier, long window). The press detector
+/// keys got freshly struck?" (NoteTracker, per key, every hop). The press detector
 /// only ever asks the second question about the keys the song expects next.
 final class AudioPitchDetector: ObservableObject {
     // Debug readout for the in-headset panel. Lock-protected instead of
@@ -112,37 +89,26 @@ final class AudioPitchDetector: ObservableObject {
     private var spectrum: [Float]
     private var prevSpectrum: [Float]
 
-    // Long ring buffer: holds enough history for the verifier's pre-onset
-    // window plus its post-onset window (0.68 s @ 48 kHz).
+    // Ring buffer of recent samples (0.68 s @ 48 kHz) feeding all analyses.
     private static let ringN = 32_768
     private var ring: [Float]
     private var written: Int = 0          // total samples ever written
     private var hopFill = 0
 
-    // Expected-note verification
-    private let verifier4k = NoteVerifier(fftN: 4096)   // 85 ms: middle + treble
-    private let verifier8k = NoteVerifier(fftN: 8192)   // 171 ms: bass semitones need the resolution
-    private struct PendingVerification {
-        let attackID: Int
-        let onsetSample: Int
-        let timestamp: TimeInterval
-        var stagesDone: Set<Int> = []
-    }
-    private var pending: [PendingVerification] = []
+    // Per-key note detection (see NoteTracker): two spectra every hop.
+    private let shortSpec = SpectrumAnalyzer(n: 4096)   // 85 ms: middle + treble
+    private let longSpec  = SpectrumAnalyzer(n: 8192)   // 171 ms: bass semitones need the resolution
+    private var shortBuf = [Float](repeating: 0, count: 4096)
+    private var longBuf  = [Float](repeating: 0, count: 8192)
+    private let tracker = NoteTracker(shortN: 4096, longN: 8192)
+    private var noteOnsets: [NoteOnset] = []
     /// Keys the song expects together right now (set by the render loop):
-    /// the verifier ignores partials shared between them.
+    /// they get the lower "expected" threshold and ignore shared partials.
     private let expectedKeys = Locked<Set<Int>>([])
+    private let listening = Locked<Bool>(false)
 
     func setExpectedKeys(_ keys: Set<Int>) { expectedKeys.set(keys) }
 
-    /// Verification stages: (post-onset delay in s, verifier, low-register keys?).
-    /// Two looks at middle/treble cover chords that are rolled or slightly
-    /// spread; the bass waits for the long window.
-    private static let bassSplitKey = 27   // C3 (~131 Hz) and above use the 4k window
-    private var stages: [(delay: Double, verifier: NoteVerifier, bass: Bool)] {
-        [(0.010, verifier4k, false), (0.010, verifier8k, true), (0.060, verifier4k, false)]
-    }
-    private var verifications: [StrikeVerification] = []
     private var recentAttacks: [AudioAttack] = []
     private var nextAttackID = 1
 
@@ -249,6 +215,7 @@ final class AudioPitchDetector: ObservableObject {
             }
             self.engine.stop()
             self.running = false
+            self.listening.set(false)
             self.resetAudioState()
             self.clearSnapshot()
             self.publishState("mic off")
@@ -291,6 +258,7 @@ final class AudioPitchDetector: ObservableObject {
             sampleRate = fmt.sampleRate
             binRes = Float(fmt.sampleRate) / Float(fftN)
             keyBins = Self.keyFreqs.map { Int(($0 / binRes).rounded()) }
+            tracker.configure(sampleRate: Float(fmt.sampleRate))
             resetAudioState()
 
             // iOS may hand the tap far larger buffers than requested (often
@@ -308,6 +276,7 @@ final class AudioPitchDetector: ObservableObject {
             engine.prepare()
             try engine.start()
             running = true
+            listening.set(true)
             publishState("mic listening")
         } catch {
             if tapInstalled {
@@ -315,6 +284,7 @@ final class AudioPitchDetector: ObservableObject {
                 tapInstalled = false
             }
             running = false
+            listening.set(false)
             publishState("mic error")
             clearSnapshot()
         }
@@ -350,7 +320,6 @@ final class AudioPitchDetector: ObservableObject {
                 analyze(frameEndTime: bufferStart + Double(i) / sampleRate)
             }
         }
-        runDueVerifications()
         publishSnapshot(timestamp: bufferStart + Double(n) / sampleRate)
     }
 
@@ -384,9 +353,21 @@ final class AudioPitchDetector: ObservableObject {
         if let attack {
             lastHints = pitchHints(for: attack)
             recentAttacks.append(attack)
-            pending.append(PendingVerification(attackID: attack.id,
-                                               onsetSample: written - onsetLagSamples,
-                                               timestamp: attack.timestamp))
+        }
+
+        // Per-key note detection on the longer windows.
+        if written >= longBuf.count {
+            let longStart = written - longBuf.count
+            for k in 0..<longBuf.count { longBuf[k] = ring[(longStart + k) & mask] }
+            let shortStart = written - shortBuf.count
+            for k in 0..<shortBuf.count { shortBuf[k] = ring[(shortStart + k) & mask] }
+            shortSpec.analyze(shortBuf)
+            longSpec.analyze(longBuf)
+            let found = tracker.process(short: shortSpec, long: longSpec,
+                                        hopEnd: frameEndTime,
+                                        hopDuration: Double(hop) / sampleRate,
+                                        expected: expectedKeys.get())
+            if !found.isEmpty { noteOnsets += found }
         }
 
         publishUI(attack: attack, rms: rms, onsetScore: onsetScore,
@@ -396,50 +377,6 @@ final class AudioPitchDetector: ObservableObject {
         updateAmbient(rms: rms, onsetScore: onsetScore, isAttack: attack != nil)
         prevSpectrum = spectrum
         hasPreviousSpectrum = true
-    }
-
-    // MARK: - Expected-note verification
-
-    /// Runs every verification stage whose post-onset window has fully
-    /// arrived, merging results into that attack's StrikeVerification.
-    private func runDueVerifications() {
-        guard !pending.isEmpty else { return }
-        let mask = Self.ringN - 1
-        let preGap = hop                  // keep the attack itself out of "before"
-        let chord = expectedKeys.get()
-        let stageList = stages
-        var remaining: [PendingVerification] = []
-
-        for var p in pending {
-            for (si, stage) in stageList.enumerated() where !p.stagesDone.contains(si) {
-                let vN = stage.verifier.fftN
-                let preStart  = p.onsetSample - preGap - vN
-                let postStart = p.onsetSample + Int(stage.delay * sampleRate)
-                guard written >= postStart + vN else { continue }      // not recorded yet
-                p.stagesDone.insert(si)
-                // Not enough history, or already overwritten: skip the stage.
-                guard preStart >= 0, written - preStart <= Self.ringN else { continue }
-
-                var pre  = [Float](repeating: 0, count: vN)
-                var post = [Float](repeating: 0, count: vN)
-                for k in 0..<vN {
-                    pre[k]  = ring[(preStart + k) & mask]
-                    post[k] = ring[(postStart + k) & mask]
-                }
-                let keys = stage.bass ? Array(0..<Self.bassSplitKey) : Array(Self.bassSplitKey..<88)
-                let results = stage.verifier.evaluate(pre: pre, post: post,
-                                                      sampleRate: Float(sampleRate),
-                                                      keys: keys, chord: chord)
-                let idx = verifications.firstIndex { $0.attackID == p.attackID }
-                var v = idx.map { verifications[$0] }
-                    ?? StrikeVerification(attackID: p.attackID, timestamp: p.timestamp)
-                for r in results { v.merge(key: r.key, rise: r.rise, status: r.status) }
-                v.complete = p.stagesDone.count == stageList.count
-                if let idx { verifications[idx] = v } else { verifications.append(v) }
-            }
-            if p.stagesDone.count < stageList.count { remaining.append(p) }
-        }
-        pending = remaining
     }
 
     // MARK: - DSP helpers
@@ -618,12 +555,16 @@ final class AudioPitchDetector: ObservableObject {
 
     private func publishSnapshot(timestamp: TimeInterval) {
         recentAttacks.removeAll { timestamp - $0.timestamp > 1.5 }
-        verifications.removeAll { timestamp - $0.timestamp > 2.0 }
+        noteOnsets.removeAll { timestamp - $0.time > 2.0 }
         if recentAttacks.isEmpty { lastHints = [] }
+        let expected = expectedKeys.get().sorted()
+        let scores = expected.filter { $0 >= 0 && $0 < 88 }.map { (key: $0, score: tracker.liveScore[$0]) }
         let snap = PitchSnapshot(activeNotes: lastHints,
                                  attack: recentAttacks.last,
                                  recentAttacks: recentAttacks,
-                                 verifications: verifications,
+                                 noteOnsets: noteOnsets,
+                                 expectedScores: scores,
+                                 listening: listening.get(),
                                  timestamp: timestamp)
         lock.lock()
         _snap = snap
@@ -655,10 +596,10 @@ final class AudioPitchDetector: ObservableObject {
         }
         debug.append(String(format: "rms %.4f amb %.4f", rms, ambientRMS))
         debug.append(String(format: "bands L %.2f M %.2f H %.2f", lowScore, midScore, highScore))
-        if let v = verifications.last {
-            let names = v.heardKeys().map { KeyboardLayout.keys[$0].noteName }
-            debug.append("heard " + (names.isEmpty ? "-" : names.joined(separator: " ")))
+        let heard = noteOnsets.suffix(6).map {
+            String(format: "%@%.0f", KeyboardLayout.keys[$0.key].noteName, $0.strength)
         }
+        debug.append("heard " + (heard.isEmpty ? "-" : heard.joined(separator: " ")))
 
         debugStore.set(debug)
     }
@@ -676,8 +617,8 @@ final class AudioPitchDetector: ObservableObject {
         keyEnergy = .init(repeating: 0, count: 88)
         written = 0
         hopFill = 0
-        pending = []
-        verifications = []
+        noteOnsets = []
+        tracker.reset()
         recentAttacks = []
         lastHints = []
         ambientRMS  = 0.0008
