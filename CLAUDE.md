@@ -152,14 +152,20 @@ hard problem in this whole project, more so than for PianoVision itself).
      crossing the depth threshold. This is what separates "actually pressed"
      from "hovering close to the surface," which a naive single-frame
      threshold will get wrong constantly.
-   - **Optional secondary cross-check:** listen on the iPhone mic for a sharp
-     amplitude transient (note-attack onset) at approximately the time vision
-     predicts a press. This cannot identify *which* key was hit (full
-     polyphonic pitch detection is a separate hard problem and explicitly out
-     of scope — do not attempt it), but a transient at roughly the right time
-     is decent corroborating evidence that something was struck, useful to
-     suppress vision false-positives that have no acoustic evidence behind
-     them at all.
+   - **Superseded as of v2.1 — the sound decides, not the hands.** This
+     section originally said the mic was a secondary cross-check and that
+     identifying *which* key was hit was out of scope. That was right about
+     blind polyphonic transcription, which remains out of scope, and wrong
+     about the problem actually being solved here. The song always says which
+     notes are expected next, so the question is never "what notes are these?"
+     but "did *these* notes just get struck?" — score-informed verification,
+     which is tractable and is what every commercial trainer does. In practice
+     it also had to change direction: hand tracking drops out constantly
+     inside a headset (hands at the bottom edge of the camera, half occluded
+     by their own knuckles), so letting vision veto a note the microphone
+     heard clearly threw away correct playing. Vision is now the secondary
+     cue, used only to break a tie the sound genuinely cannot — see CODEX.md
+     §4, which is the live description of the detector.
    - Build this with a debug overlay mode from day one (live depth values vs.
      threshold per key region, trajectory state per tracked finger) — this is
      experimental, tunable territory and needs to be debuggable, not a black

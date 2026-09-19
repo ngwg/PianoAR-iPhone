@@ -136,6 +136,17 @@ which time accepting the note may have advanced the song; reading the chord
 live meant judging the sound of the note just played against the note not
 yet played.
 
+**Octaves (v2.6).** Frequency cannot separate them and never could: a note's
+2nd partial and the octave above differ by 0.06-0.65 Hz against a 5.4-10.8 Hz
+bin (50-170x finer), and stretch tuning closes even that, because tuners set
+octaves by matching partials. Amplitude can. One string's partials fall away
+smoothly; two notes an octave apart lift every *even* partial of the lower one
+above that curve and leave the odd ones alone. `excessOverSmooth` replaces each
+of the lower note's partials with min(itself, local mean of its neighbours over
+an octave-wide window in partial number) — Klapuri's smoothness test — and asks
+whether the shared partials stand >= 60 % above it. Only genuinely ambiguous
+cases still fall back to vision.
+
 **Re-strikes (v2.5).** A key heard clearly in the last 2.5 s is judged
 against **decay**, not silence. Striking a still-ringing key cannot raise
 its partials much — at most ~3 dB, and an out-of-phase hammer can drop them
@@ -257,7 +268,28 @@ a piano nobody can hear; this is how a real session gets replayed offline.
    give the mic port an open path rather than a sealed pocket, and foam over
    it is nearly free (<2.5 dB at 20 kHz) while buying 15–27 dB against breath.
    No published measurement of this exists — it would have to be measured.
-6. Log verifier S per register during play and tune thresholds per register.
-7. Lens-distortion correction (Cardboard k1/k2 barrel shader); Metal
+6. **Gain-invariant front end.** Adaptive whitening (Stowell & Plumbley:
+   `P = max(|S|, r, m*P_prev)`, `S /= P`, m = 0.9969 at 86 fps / 25.6 s
+   relaxation, r set from measured room noise) plus log-magnitude flux. Boeck's
+   attenuation test (0/-5/-10/-15 dB) shows these degrade gracefully where raw
+   linear flux with a fixed threshold does not. This turns residual iPhone AGC
+   from an unfixable platform problem into a solved DSP choice — `.measurement`
+   mode only "minimizes" processing, it does not promise raw. Rescales every
+   flux threshold, so do it with a recording in hand, not blind.
+7. **Complex-domain (RCD) onset detector in parallel with spectral flux.**
+   Magnitude-only detection is blind to "transitions between harmonically
+   related notes" by construction; RCD scores F=0.955 on 106k real piano
+   onsets and is phase-sensitive, half-wave rectified so offsets don't fire.
+8. **Predicted-decay subtraction for the sustain pedal.** Pedal down lifts every
+   damper, raising the local floor at exactly the bins being tested. Liang et
+   al. threshold the *residual* after subtracting each ringing note's predicted
+   partial contribution, in dB, with peak-location as a second feature. Note
+   room reverb and pedal are the same observable — a pedal heuristic tuned in a
+   dry room over-reads pedal in a live one.
+9. **Register gates.** Above F6-G6 (~1400-1570 Hz) a piano has no dampers at
+   all and the rear duplex is mistuned by ~50 cents (outliers +190/-100), so
+   the top two octaves always ring; widen tolerance or down-weight there.
+10. Log verifier S per register during play and tune thresholds per register.
+11. Lens-distortion correction (Cardboard k1/k2 barrel shader); Metal
    compositor with homography warp.
-8. Loops/bookmarks, per-hand results, finger numbers on bars.
+12. Loops/bookmarks, per-hand results, finger numbers on bars.
