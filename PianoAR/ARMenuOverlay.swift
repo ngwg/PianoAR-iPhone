@@ -14,6 +14,8 @@ enum MenuAction {
     case toggleRecording                  // SETUP › RECORD diagnostics capture
     case toggleCalibration                // SETUP › CALIBRATE guided note pass
     case seek(Double)                     // 0...1 along the piece
+    case loopSetStart, loopSetEnd, loopPhrase, loopToggle
+    case cycleTextSize, toggleContrast, cycleDwell, toggleColorBlind, resetAccess
 }
 
 /// Everything the panel shows, captured once per frame on the render thread.
@@ -33,6 +35,15 @@ struct MenuState: Equatable {
     var recordSeconds = 0
     var calibrating = false
     var progress: Float = 0
+    var bar = 0
+    var barCount = 0
+    var loopOn = false
+    var loopFrom: Float = 0
+    var loopTo: Float = 1
+    var loopFirstBar = 0
+    var loopLastBar = 0
+    var loopLaps = 0
+    var access = AccessibilitySnapshot.default
 }
 
 /// Floating "tablet" AR panel — Quest-3 interaction model.
@@ -58,7 +69,10 @@ final class ARMenuOverlay {
     // Small, and off to the side where it does not cover the keys or the
     // sheet. Making it bigger to fit more on it was the wrong move: the way
     // to stop a panel feeling cramped is to put less on it.
-    private static let panW: Float = 0.34
+    // 0.36 × 0.24 is exactly 3:2, the same as the 960 × 640 texture, so a
+    // square in texture space is square in the headset. It was 0.34 wide,
+    // which quietly stretched every circle and every corner radius.
+    private static let panW: Float = 0.36
     private static let panH: Float = 0.24
     private static let texW: CGFloat = 960
     private static let texH: CGFloat = 640
@@ -90,19 +104,31 @@ final class ARMenuOverlay {
     private static let pagePrevRect = CGRect(x: 700, y: 64, width: 110, height: 44)
     private static let pageNextRect = CGRect(x: 828, y: 64, width: 110, height: 44)
 
-    // Practice
-    /// The scrub bar. Wide and tall on purpose — it is the one control that
-    /// is aimed at rather than pressed, so it has to forgive a shaky ray.
-    private static let seekRect      = CGRect(x: 40,  y: 132, width: 880, height: 96)
-    private static let playRect      = CGRect(x: 330, y: 262, width: 300, height: 118)
-    private static let restartRect   = CGRect(x: 40,  y: 262, width: 260, height: 118)
-    private static let skipRect      = CGRect(x: 660, y: 262, width: 260, height: 118)
-    private static let tempoDownRect = CGRect(x: 40,  y: 410, width: 190, height: 104)
-    private static let tempoUpRect   = CGRect(x: 500, y: 410, width: 190, height: 104)
-    // Moved off the playing screen: both are chosen once and then left
-    // alone, so they were only ever adding to the clutter in front of you.
-    private static let handRect      = CGRect(x: 730, y: 410, width: 190, height: 104)
-    private static let waitRect      = CGRect(x: 240, y: 410, width: 250, height: 104)
+    // ── Practice ────────────────────────────────────────────────────────
+    // Four bands, each one a row of controls of the same height, all on the
+    // same 36 px side margin. Nothing here is smaller than 110 × 78 px,
+    // which at the panel's near scale is about a 2 cm target.
+    /// The scrub bar. It is the one control that is *aimed* at rather than
+    /// pressed, so its hit area is the whole card, not just the track.
+    private static let seekRect      = CGRect(x: 36,  y: 176, width: 888, height: 94)
+    private static let restartRect   = CGRect(x: 36,  y: 280, width: 252, height: 104)
+    private static let playRect      = CGRect(x: 318, y: 280, width: 324, height: 104)
+    private static let skipRect      = CGRect(x: 672, y: 280, width: 252, height: 104)
+    private static let loopPhraseRect = CGRect(x: 36,  y: 394, width: 282, height: 78)
+    private static let loopARect      = CGRect(x: 348, y: 394, width: 132, height: 78)
+    private static let loopBRect      = CGRect(x: 498, y: 394, width: 132, height: 78)
+    private static let loopOnRect     = CGRect(x: 648, y: 394, width: 276, height: 78)
+    private static let tempoDownRect = CGRect(x: 36,  y: 482, width: 110, height: 78)
+    private static let tempoUpRect   = CGRect(x: 256, y: 482, width: 110, height: 78)
+    private static let waitRect      = CGRect(x: 396, y: 482, width: 252, height: 78)
+    private static let handRect      = CGRect(x: 672, y: 482, width: 252, height: 78)
+
+    // ── Access ──────────────────────────────────────────────────────────
+    private static let textSizeRect  = CGRect(x: 36,  y: 138, width: 888, height: 90)
+    private static let contrastRect  = CGRect(x: 36,  y: 236, width: 888, height: 90)
+    private static let dwellRect     = CGRect(x: 36,  y: 334, width: 888, height: 90)
+    private static let cbRect        = CGRect(x: 36,  y: 432, width: 600, height: 90)
+    private static let accessResetRect = CGRect(x: 648, y: 432, width: 276, height: 90)
 
     // Comfort
     private static let viewDownRect  = CGRect(x: 560, y: 126, width: 80, height: 56)
@@ -131,10 +157,11 @@ final class ARMenuOverlay {
     private static let calibRect      = CGRect(x: 806, y: 480, width: 130, height: 80)
 
     // Minimized pill
-    private static let pillRect     = CGRect(x: 150, y: 16, width: 660, height: 116)
-    private static let pauseRect    = CGRect(x: 170, y: 30, width: 200, height: 88)
-    private static let pillSkipRect = CGRect(x: 380, y: 30, width: 200, height: 88)
-    private static let menuRect     = CGRect(x: 590, y: 30, width: 200, height: 88)
+    private static let pillRect     = CGRect(x: 40,  y: 16, width: 880, height: 116)
+    private static let pauseRect    = CGRect(x: 58,  y: 30, width: 206, height: 88)
+    private static let pillLoopRect = CGRect(x: 276, y: 30, width: 206, height: 88)
+    private static let pillSkipRect = CGRect(x: 494, y: 30, width: 206, height: 88)
+    private static let menuRect     = CGRect(x: 712, y: 30, width: 190, height: 88)
 
     private static func tabRect(_ t: Tab) -> CGRect {
         let w = texW / CGFloat(Tab.allCases.count)
@@ -159,9 +186,8 @@ final class ARMenuOverlay {
     private static let pokeFireZ:    Float        = 0.015
     // Dwell is the fallback when a pinch will not register, which inside a
     // headset is often — the hands sit at the bottom edge of the camera and
-    // half occlude themselves. Making it quicker makes it a real alternative
-    // rather than a last resort.
-    private static let dwellTime:    TimeInterval = 0.45
+    // half occlude themselves. How long it takes now lives in
+    // AccessibilitySettings, because the right value differs per person.
     private static let debounce:     TimeInterval = 0.30
     private static let xyMargin:     Float        = 0.030
     private static let pinchOn:  Float = 0.022
@@ -185,12 +211,24 @@ final class ARMenuOverlay {
 
     // ── Tabs / regions ──────────────────────────────────────────────────────
     private enum Tab: Int, CaseIterable {
-        case library, practice, comfort, setup
+        case library, practice, comfort, access, setup
+        /// Short enough to fit five tabs across, even at HUGE text.
         var title: String {
+            switch self {
+            case .library:  return "SONGS"
+            case .practice: return "PLAY"
+            case .comfort:  return "VIEW"
+            case .access:   return "ACCESS"
+            case .setup:    return "SETUP"
+            }
+        }
+        /// Spelled out in the header, where there is room.
+        var heading: String {
             switch self {
             case .library:  return "LIBRARY"
             case .practice: return "PRACTICE"
-            case .comfort:  return "COMFORT"
+            case .comfort:  return "VIEW & COMFORT"
+            case .access:   return "ACCESSIBILITY"
             case .setup:    return "SETUP"
             }
         }
@@ -203,11 +241,13 @@ final class ARMenuOverlay {
         case song(Int)                     // absolute song index
         case pagePrev, pageNext, minimize
         case play, restart, skip, tempoDown, tempoUp, hand, wait, seek
+        case loopPhrase, loopA, loopB, loopOn
+        case textSize, contrast, dwell, colorBlind, accessReset
         case viewDown, viewUp, lensDown, lensUp, smooth, stereo, handStyle, comfortReset
         case mapKeys, debug, labels, alignReset, record, calibrate
         case slideLeft, slideRight, keyLeft, keyRight, depthAway, depthToward
         case widthMinus, widthPlus, turnLeft, turnRight, heightDown, heightUp
-        case pillPause, pillSkip, pillMenu
+        case pillPause, pillSkip, pillMenu, pillLoop
 
         var actionable: Bool { self != .none && self != .handle }
     }
@@ -513,8 +553,15 @@ final class ARMenuOverlay {
             let tipOnFace = abs(b.tip.x) < Self.panW/2 && abs(b.tip.y) < Self.panH/2
             if b.tip.z > Self.pokeArmZ { pokeArmed = true }
             let poked = pokeArmed && tipOnFace && targetStable && b.tip.z < Self.pokeFireZ
-            let dwellProg = Float(simd_clamp((time - dwellStart) / Self.dwellTime, 0, 1))
-            let dwellFire = (time - dwellStart) >= Self.dwellTime && firedRegion != region
+            // With hover-to-select off the ring stays empty: showing a
+            // progress arc that never completes would promise a selection
+            // that is not coming.
+            let dwellSecs = state.access.dwell.seconds
+            let dwellProg = dwellSecs.map {
+                Float(simd_clamp((time - dwellStart) / $0, 0, 1))
+            } ?? 0
+            let dwellFire = dwellSecs.map { (time - dwellStart) >= $0 } == true
+                            && firedRegion != region
                             && region.actionable
 
             if time - lastTap > Self.debounce {
@@ -614,8 +661,14 @@ final class ARMenuOverlay {
     private static let practiceControls: [(Region, CGRect)] = [
         (.play, playRect), (.restart, restartRect), (.skip, skipRect),
         (.seek, seekRect),
+        (.loopPhrase, loopPhraseRect), (.loopA, loopARect),
+        (.loopB, loopBRect), (.loopOn, loopOnRect),
         (.tempoDown, tempoDownRect), (.tempoUp, tempoUpRect),
         (.hand, handRect), (.wait, waitRect),
+    ]
+    private static let accessControls: [(Region, CGRect)] = [
+        (.textSize, textSizeRect), (.contrast, contrastRect), (.dwell, dwellRect),
+        (.colorBlind, cbRect), (.accessReset, accessResetRect),
     ]
     private static let comfortControls: [(Region, CGRect)] = [
         (.viewDown, viewDownRect), (.viewUp, viewUpRect),
@@ -647,6 +700,7 @@ final class ARMenuOverlay {
         let pt = texPoint(localX: localX, localY: localY)
         if minimized {
             if Self.pauseRect.contains(pt)    { return .pillPause }
+            if Self.pillLoopRect.contains(pt) { return .pillLoop }
             if Self.pillSkipRect.contains(pt) { return .pillSkip }
             if Self.menuRect.contains(pt)     { return .pillMenu }
             return .none
@@ -670,6 +724,7 @@ final class ARMenuOverlay {
             return .none
         case .practice: table = Self.practiceControls
         case .comfort:  table = Self.comfortControls
+        case .access:   table = Self.accessControls
         case .setup:    table = Self.setupControls
         }
         return table.first { $0.1.contains(pt) }?.0 ?? .none
@@ -688,10 +743,12 @@ final class ARMenuOverlay {
         case .pageNext:    return Self.pageNextRect
         case .minimize:    return Self.minimizeRect
         case .pillPause:   return Self.pauseRect
+        case .pillLoop:    return Self.pillLoopRect
         case .pillSkip:    return Self.pillSkipRect
         case .pillMenu:    return Self.menuRect
         default:
-            let all = Self.practiceControls + Self.comfortControls + Self.setupControls
+            let all = Self.practiceControls + Self.comfortControls
+                    + Self.accessControls + Self.setupControls
             return all.first { $0.0 == region }?.1
         }
     }
@@ -725,8 +782,20 @@ final class ARMenuOverlay {
         case .hand:              return .cycleHand
         case .wait:              return .toggleWaitMode
         case .seek:
-            let f = (cursorTex.x - Self.seekRect.minX) / Self.seekRect.width
+            // The bar is inset inside its card, so aiming has to be measured
+            // against the track the player can actually see.
+            let track = Self.seekTrack
+            let f = (cursorTex.x - track.minX) / track.width
             return .seek(Double(min(1, max(0, f))))
+        case .loopPhrase:        return .loopPhrase
+        case .loopA:             return .loopSetStart
+        case .loopB:             return .loopSetEnd
+        case .pillLoop, .loopOn: return .loopToggle
+        case .textSize:          return .cycleTextSize
+        case .contrast:          return .toggleContrast
+        case .dwell:             return .cycleDwell
+        case .colorBlind:        return .toggleColorBlind
+        case .accessReset:       return .resetAccess
         case .viewDown:          return .viewScale(-0.02)
         case .viewUp:            return .viewScale(0.02)
         case .lensDown:          return .lensSpacing(-0.5)
@@ -785,13 +854,87 @@ final class ARMenuOverlay {
     // seen through two plastic lenses inside a dark shell, which costs a lot
     // of brightness and most of the saturation — colours that look right on a
     // monitor read as grey mush in the headset.
-    private static let accentBlue   = UIColor(red: 0.32, green: 0.66, blue: 1.00, alpha: 1.00)
-    private static let accentGreen  = UIColor(red: 0.20, green: 0.80, blue: 0.44, alpha: 1.00)
-    private static let accentRed    = UIColor(red: 1.00, green: 0.30, blue: 0.30, alpha: 1.00)
-    private static let accentPurple = UIColor(red: 0.60, green: 0.40, blue: 1.00, alpha: 1.00)
-    private static let neutral      = UIColor(white: 1, alpha: 0.22)
+    // ── Style state ─────────────────────────────────────────────────────
+    // Set once at the top of bake() and read by every draw helper below.
+    // bake() is only ever called from the main queue and runs start to
+    // finish synchronously, so these never overlap between two bakes.
+    private static var tScale: CGFloat = 1
+    private static var hiCon = false
+
+    static func fnt(_ size: CGFloat, _ w: UIFont.Weight) -> UIFont {
+        .systemFont(ofSize: (size * tScale).rounded(), weight: w)
+    }
+    static func monoFnt(_ size: CGFloat, _ w: UIFont.Weight) -> UIFont {
+        .monospacedDigitSystemFont(ofSize: (size * tScale).rounded(), weight: w)
+    }
+    /// White at a given alpha — lifted in high-contrast mode, where every
+    /// subtitle and hint that was deliberately faint becomes unreadable.
+    private static func dim(_ a: CGFloat) -> UIColor {
+        UIColor(white: 1, alpha: hiCon ? min(1, a * 0.45 + 0.55) : a)
+    }
+    private static func lift(_ c: UIColor) -> UIColor {
+        guard hiCon else { return c }
+        var h: CGFloat = 0, sat: CGFloat = 0, b: CGFloat = 0, a: CGFloat = 0
+        guard c.getHue(&h, saturation: &sat, brightness: &b, alpha: &a) else { return c }
+        return UIColor(hue: h, saturation: sat * 0.86, brightness: min(1, b * 1.15 + 0.10), alpha: a)
+    }
+
+    private static var accentBlue:   UIColor { lift(UIColor(red: 0.32, green: 0.66, blue: 1.00, alpha: 1)) }
+    private static var accentGreen:  UIColor { lift(UIColor(red: 0.20, green: 0.80, blue: 0.44, alpha: 1)) }
+    private static var accentRed:    UIColor { lift(UIColor(red: 1.00, green: 0.30, blue: 0.30, alpha: 1)) }
+    private static var accentPurple: UIColor { lift(UIColor(red: 0.60, green: 0.40, blue: 1.00, alpha: 1)) }
+    /// Loops get their own colour so a marked section is never confused with
+    /// progress (blue) or with a toggle that happens to be on (green).
+    private static var accentAmber:  UIColor { lift(UIColor(red: 1.00, green: 0.70, blue: 0.22, alpha: 1)) }
+    private static var neutral:      UIColor { UIColor(white: 1, alpha: hiCon ? 0.34 : 0.22) }
+
+    /// The visible part of the scrub bar. The hit area is the whole card
+    /// around it, but a tap has to be measured against what you can see.
+    private static var seekTrack: CGRect {
+        CGRect(x: seekRect.minX + 20, y: seekRect.minY + 38, width: seekRect.width - 40, height: 26)
+    }
+
+    /// A grouping container — the thing that stops a screen reading as a
+    /// loose pile of buttons.
+    private static func card(_ r: CGRect, radius: CGFloat = 22) {
+        UIColor(white: 1, alpha: hiCon ? 0.12 : 0.055).setFill()
+        UIBezierPath(roundedRect: r, cornerRadius: radius).fill()
+        dim(0.12).setStroke()
+        let b = UIBezierPath(roundedRect: r.insetBy(dx: 0.75, dy: 0.75), cornerRadius: radius)
+        b.lineWidth = 1.5
+        b.stroke()
+    }
+
+    private static func rightAligned(_ text: String, in rect: CGRect, font: UIFont, color: UIColor) {
+        let attrs: [NSAttributedString.Key: Any] = [.font: font, .foregroundColor: color]
+        let sz = text.size(withAttributes: attrs)
+        text.draw(at: CGPoint(x: rect.maxX - sz.width, y: rect.midY - sz.height / 2), withAttributes: attrs)
+    }
+
+    /// One settings line: name on the left, current value on the right.
+    /// Reads as a list rather than a wall of identical buttons, and the
+    /// whole row is the target.
+    private static func settingRow(_ r: CGRect, _ label: String, _ value: String, on: Bool) {
+        button(r, "", fill: neutral, size: 1, radius: 26)
+        leftTruncated(label, in: CGRect(x: r.minX + 28, y: r.minY, width: r.width * 0.52, height: r.height),
+                      font: fnt(27, .heavy), color: .white)
+        rightAligned(value, in: CGRect(x: r.midX, y: r.minY, width: r.width / 2 - 28, height: r.height),
+                     font: fnt(27, .heavy), color: on ? accentGreen : dim(0.72))
+    }
+
+    private static func wrapped(_ text: String, in rect: CGRect, size: CGFloat,
+                                align: NSTextAlignment = .left, alpha: CGFloat = 0.55) {
+        let para = NSMutableParagraphStyle()
+        para.alignment = align
+        para.lineBreakMode = .byWordWrapping
+        (text as NSString).draw(in: rect, withAttributes: [.font: fnt(size, .medium),
+                                                           .foregroundColor: dim(alpha),
+                                                           .paragraphStyle: para])
+    }
 
     private static func bake(_ s: PanelSnap) -> UIImage {
+        tScale = s.state.access.textSize.scale
+        hiCon  = s.state.access.highContrast
         let sz = CGSize(width: texW, height: texH)
         return UIGraphicsImageRenderer(size: sz).image { ctx in
             if s.minimized {
@@ -800,11 +943,15 @@ final class ARMenuOverlay {
                 return
             }
             let full = CGRect(origin: .zero, size: sz)
-            UIColor(red: 0.03, green: 0.02, blue: 0.09, alpha: 0.97).setFill()
-            UIBezierPath(roundedRect: full, cornerRadius: 28).fill()
+            UIColor(red: 0.03, green: 0.02, blue: 0.09, alpha: hiCon ? 1.0 : 0.97).setFill()
+            UIBezierPath(roundedRect: full, cornerRadius: 30).fill()
             if let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
-                                         colors: [UIColor(red: 0.10, green: 0.05, blue: 0.22, alpha: 1).cgColor,
-                                                  UIColor(red: 0.05, green: 0.03, blue: 0.14, alpha: 1).cgColor] as CFArray,
+                                         colors: [UIColor(red: hiCon ? 0.04 : 0.11,
+                                                          green: hiCon ? 0.03 : 0.06,
+                                                          blue: hiCon ? 0.10 : 0.24, alpha: 1).cgColor,
+                                                  UIColor(red: hiCon ? 0.01 : 0.04,
+                                                          green: hiCon ? 0.01 : 0.02,
+                                                          blue: hiCon ? 0.04 : 0.12, alpha: 1).cgColor] as CFArray,
                                          locations: [0, 1]) {
                 ctx.cgContext.saveGState()
                 UIBezierPath(roundedRect: full, cornerRadius: 28).addClip()
@@ -819,6 +966,7 @@ final class ARMenuOverlay {
             case .library:  drawLibrary(s)
             case .practice: drawPractice(s)
             case .comfort:  drawComfort(s)
+            case .access:   drawAccess(s)
             case .setup:    drawSetup(s)
             }
             drawTabBar(s)
@@ -829,31 +977,61 @@ final class ARMenuOverlay {
     /// Bright ring around whatever the cursor targets.
     private static func ring(_ r: CGRect?) {
         guard let r else { return }
-        UIColor(red: 0.55, green: 0.95, blue: 1.0, alpha: 0.95).setStroke()
-        let p = UIBezierPath(roundedRect: r.insetBy(dx: -4, dy: -4), cornerRadius: 18)
-        p.lineWidth = 4
+        // In high contrast the ring becomes yellow: at a glance it has to be
+        // obvious which control is armed, and a pale blue outline on a dark
+        // panel is exactly the cue that low-vision users lose first.
+        let c = hiCon ? UIColor(red: 1.0, green: 0.92, blue: 0.25, alpha: 1)
+                      : UIColor(red: 0.55, green: 0.95, blue: 1.0, alpha: 0.95)
+        c.withAlphaComponent(0.22).setStroke()
+        let glow = UIBezierPath(roundedRect: r.insetBy(dx: -9, dy: -9), cornerRadius: 24)
+        glow.lineWidth = 10
+        glow.stroke()
+        c.setStroke()
+        let p = UIBezierPath(roundedRect: r.insetBy(dx: -4, dy: -4), cornerRadius: 20)
+        p.lineWidth = hiCon ? 6 : 4
         p.stroke()
     }
 
     private static func button(_ r: CGRect, _ title: String, fill: UIColor,
                                size: CGFloat = 22, weight: UIFont.Weight = .bold,
                                text: UIColor = .white, radius: CGFloat = 16) {
+        let rad = min(radius, r.height / 2)
+        let path = UIBezierPath(roundedRect: r, cornerRadius: rad)
         fill.setFill()
-        UIBezierPath(roundedRect: r, cornerRadius: radius).fill()
-        UIColor(white: 1, alpha: 0.14).setStroke()
-        let p = UIBezierPath(roundedRect: r.insetBy(dx: 0.75, dy: 0.75), cornerRadius: radius)
-        p.lineWidth = 1.5
-        p.stroke()
-        centered(title, in: r, font: .systemFont(ofSize: size, weight: weight), color: text)
+        path.fill()
+        // A top-down sheen: a flat fill reads as a painted rectangle, the
+        // same fill with a highlight along its top edge reads as a key.
+        if let ctx = UIGraphicsGetCurrentContext(),
+           let g = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(),
+                              colors: [UIColor(white: 1, alpha: 0.18).cgColor,
+                                       UIColor(white: 1, alpha: 0.00).cgColor] as CFArray,
+                              locations: [0, 1]) {
+            ctx.saveGState()
+            path.addClip()
+            ctx.drawLinearGradient(g, start: CGPoint(x: r.minX, y: r.minY),
+                                   end: CGPoint(x: r.minX, y: r.midY), options: [])
+            ctx.restoreGState()
+        }
+        dim(hiCon ? 0.55 : 0.16).setStroke()
+        let b = UIBezierPath(roundedRect: r.insetBy(dx: 0.9, dy: 0.9), cornerRadius: rad)
+        b.lineWidth = hiCon ? 2.5 : 1.5
+        b.stroke()
+        guard !title.isEmpty else { return }
+        centered(title, in: r, font: fnt(size, weight), color: text)
     }
 
     private static func drawPill(_ s: PanelSnap) {
-        UIColor(red: 0.04, green: 0.03, blue: 0.11, alpha: 0.88).setFill()
+        UIColor(red: 0.04, green: 0.03, blue: 0.11, alpha: hiCon ? 0.98 : 0.88).setFill()
         UIBezierPath(roundedRect: pillRect, cornerRadius: pillRect.height / 2).fill()
         button(pauseRect, s.state.isPlaying ? "❚❚  PAUSE" : "▶  PLAY",
-               fill: s.state.isPlaying ? accentRed : accentBlue, size: 34, weight: .heavy, radius: 40)
-        button(pillSkipRect, "SKIP  ▸▸", fill: neutral, size: 34, weight: .heavy, radius: 40)
-        button(menuRect, "☰  MENU", fill: accentPurple, size: 34, weight: .heavy, radius: 40)
+               fill: s.state.isPlaying ? accentRed : accentBlue, size: 31, weight: .heavy, radius: 40)
+        // The loop you want is nearly always the bars you have just played,
+        // so marking one has to be reachable without opening the menu.
+        button(pillLoopRect, s.state.loopOn ? "⟲  LOOP ON" : "⟲  LOOP",
+               fill: s.state.loopOn ? accentAmber : neutral, size: 31, weight: .heavy,
+               text: s.state.loopOn ? .black : .white, radius: 40)
+        button(pillSkipRect, "SKIP  ▸▸", fill: neutral, size: 31, weight: .heavy, radius: 40)
+        button(menuRect, "☰  MENU", fill: accentPurple, size: 31, weight: .heavy, radius: 40)
     }
 
     private static func drawGrabHandle(_ s: PanelSnap) {
@@ -869,7 +1047,7 @@ final class ARMenuOverlay {
         }
         let title = s.grabbing ? "MOVING…" : "PIANOAR"
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: 25, weight: .black),
+            .font: fnt(25, .black),
             .foregroundColor: UIColor(white: 1, alpha: s.grabbing ? 0.95 : 0.65),
             .kern: 3.2 as NSObject,
         ]
@@ -878,7 +1056,7 @@ final class ARMenuOverlay {
         if !s.grabbing {
             let hint = "PINCH & HOLD TO MOVE"
             let hAttrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: 21, weight: .semibold),
+                .font: fnt(21, .semibold),
                 .foregroundColor: UIColor(white: 1, alpha: 0.45),
             ]
             let hsz = hint.size(withAttributes: hAttrs)
@@ -888,8 +1066,8 @@ final class ARMenuOverlay {
     }
 
     private static func drawHeader(_ s: PanelSnap) {
-        centered(s.tab.title, in: CGRect(x: 0, y: handleH, width: texW, height: headerH),
-                 font: .systemFont(ofSize: 29, weight: .black), color: UIColor(white: 1, alpha: 0.6))
+        centered(s.tab.heading, in: CGRect(x: 0, y: handleH, width: texW, height: headerH),
+                 font: fnt(29, .black), color: dim(0.62))
         if s.state.isPlaying {
             button(minimizeRect, "▾  MINIMIZE", fill: neutral, size: 24)
         }
@@ -906,10 +1084,14 @@ final class ARMenuOverlay {
             let r = tabRect(t)
             if t == s.tab {
                 accentPurple.setFill()
-                UIBezierPath(rect: r).fill()
+                UIBezierPath(roundedRect: r.insetBy(dx: 7, dy: 8), cornerRadius: 18).fill()
+                UIColor.white.setFill()
+                UIBezierPath(roundedRect: CGRect(x: r.midX - 26, y: r.maxY - 9,
+                                                 width: 52, height: 4),
+                             cornerRadius: 2).fill()
             }
-            centered(t.title, in: r, font: .systemFont(ofSize: 25, weight: .bold),
-                     color: t == s.tab ? .white : UIColor(white: 1, alpha: 0.45))
+            centered(t.title, in: r, font: fnt(24, .bold),
+                     color: t == s.tab ? .white : dim(0.5))
         }
         UIColor(white: 1, alpha: 0.16).setFill()
         UIBezierPath(rect: CGRect(x: 0, y: tabTop, width: texW, height: 1)).fill()
@@ -925,7 +1107,7 @@ final class ARMenuOverlay {
         ]
         if s.pageTitles.isEmpty {
             centered("No songs", in: CGRect(x: 0, y: contentTop, width: texW, height: 200),
-                     font: .systemFont(ofSize: 29, weight: .semibold), color: UIColor(white: 1, alpha: 0.5))
+                     font: fnt(29, .semibold), color: UIColor(white: 1, alpha: 0.5))
         }
         // The library is not limited to what ships with the app, and nothing
         // said so. Any MIDI file dropped into the app's folder shows up here,
@@ -933,7 +1115,7 @@ final class ARMenuOverlay {
         // so cannot be written into the app itself.
         centered("Add your own: put a .mid file in Files › On My iPhone › PianoAR",
                  in: CGRect(x: 0, y: 556, width: texW, height: 26),
-                 font: .systemFont(ofSize: 21, weight: .medium),
+                 font: fnt(21, .medium),
                  color: UIColor(white: 1, alpha: 0.45))
         for (i, title) in s.pageTitles.enumerated() {
             let rect = libCellRect(i)
@@ -947,69 +1129,134 @@ final class ARMenuOverlay {
             let chip = CGRect(x: rect.minX + 10, y: rect.midY - 18, width: 36, height: 36)
             accent.setFill()
             UIBezierPath(roundedRect: chip, cornerRadius: 10).fill()
-            centered("♪", in: chip, font: .systemFont(ofSize: 25, weight: .bold), color: .white)
+            centered("♪", in: chip, font: fnt(25, .bold), color: .white)
             let textRect = CGRect(x: chip.maxX + 10, y: rect.minY,
                                   width: rect.maxX - chip.maxX - 18, height: rect.height)
             leftTruncated(title.isEmpty ? "Untitled" : title, in: textRect,
-                          font: .systemFont(ofSize: 25, weight: .semibold), color: .white)
+                          font: fnt(25, .semibold), color: .white)
         }
         if s.pageCount > 1 {
             centered("\(s.page + 1) / \(s.pageCount)",
                      in: CGRect(x: 0, y: tabTop - 30, width: texW, height: 26),
-                     font: .systemFont(ofSize: 21, weight: .bold), color: UIColor(white: 1, alpha: 0.45))
+                     font: fnt(21, .bold), color: UIColor(white: 1, alpha: 0.45))
         }
     }
 
     private static func drawPractice(_ s: PanelSnap) {
         let st = s.state
-        centered(st.currentTitle.isEmpty ? "Pick a song in LIBRARY" : st.currentTitle,
-                 in: CGRect(x: 40, y: contentTop + 2, width: texW - 80, height: 46),
-                 font: .systemFont(ofSize: 32, weight: .heavy), color: .white)
+        let hasSong = !st.currentTitle.isEmpty
+
+        // ── title and where you are in it ────────────────────────────────
+        leftTruncated(hasSong ? st.currentTitle : "Pick a song in SONGS",
+                      in: CGRect(x: 40, y: 118, width: 590, height: 50),
+                      font: fnt(31, .heavy), color: .white)
+        if st.barCount > 0 {
+            rightAligned("BAR \(st.bar) / \(st.barCount)",
+                         in: CGRect(x: 630, y: 118, width: 294, height: 50),
+                         font: monoFnt(26, .heavy), color: dim(0.75))
+        }
 
         // ── scrub bar ────────────────────────────────────────────────────
-        let track = CGRect(x: seekRect.minX, y: seekRect.midY - 13,
-                           width: seekRect.width, height: 26)
-        UIColor(white: 1, alpha: 0.14).setFill()
+        card(seekRect)
+        let track = seekTrack
+        let prog  = CGFloat(min(1, max(0, st.progress)))
+        let clamp01: (Float) -> CGFloat = { CGFloat(min(1, max(0, $0))) }
+
+        // bar ticks, one per four bars, so long pieces stay readable
+        if st.barCount > 0 {
+            let step = max(4, (st.barCount / 12 + 1) * 4)
+            dim(0.20).setFill()
+            var b = step
+            while b < st.barCount {
+                let x = track.minX + track.width * CGFloat(b) / CGFloat(st.barCount)
+                UIBezierPath(rect: CGRect(x: x - 1, y: track.minY - 13, width: 2, height: 10)).fill()
+                b += step
+            }
+        }
+
+        dim(0.14).setFill()
         UIBezierPath(roundedRect: track, cornerRadius: 13).fill()
-        let done = CGRect(x: track.minX, y: track.minY,
-                          width: track.width * CGFloat(min(1, max(0, st.progress))),
-                          height: track.height)
+
+        // the marked section sits behind progress and stands taller than it,
+        // so "where I am" and "what I am repeating" never look like one thing
+        if st.loopOn {
+            let a = track.minX + track.width * clamp01(st.loopFrom)
+            let b = track.minX + track.width * clamp01(st.loopTo)
+            let band = CGRect(x: a, y: track.minY - 7, width: max(6, b - a), height: track.height + 14)
+            accentAmber.withAlphaComponent(0.30).setFill()
+            UIBezierPath(roundedRect: band, cornerRadius: 12).fill()
+            accentAmber.setFill()
+            for x in [a, b] {
+                UIBezierPath(roundedRect: CGRect(x: x - 3, y: band.minY, width: 6, height: band.height),
+                             cornerRadius: 3).fill()
+            }
+        }
+
+        let done = CGRect(x: track.minX, y: track.minY, width: track.width * prog, height: track.height)
         accentBlue.setFill()
         UIBezierPath(roundedRect: done, cornerRadius: 13).fill()
-        // the handle, big enough to aim at with a shaky ray
-        let hx = track.minX + track.width * CGFloat(min(1, max(0, st.progress)))
-        let knob = CGRect(x: hx - 21, y: seekRect.midY - 21, width: 42, height: 42)
+
+        // playhead: white disc with a dark core, readable over any of the above
+        let hx = track.minX + track.width * prog
         UIColor.white.setFill()
-        UIBezierPath(ovalIn: knob).fill()
-        centered("\(Int((st.progress * 100).rounded()))%  —  tap the bar to jump",
-                 in: CGRect(x: seekRect.minX, y: seekRect.maxY - 30,
-                            width: seekRect.width, height: 28),
-                 font: .systemFont(ofSize: 21, weight: .semibold),
-                 color: UIColor(white: 1, alpha: 0.55))
+        UIBezierPath(ovalIn: CGRect(x: hx - 15, y: track.midY - 15, width: 30, height: 30)).fill()
+        UIColor(red: 0.05, green: 0.04, blue: 0.14, alpha: 1).setFill()
+        UIBezierPath(ovalIn: CGRect(x: hx - 5, y: track.midY - 5, width: 10, height: 10)).fill()
+
+        let caption: String
+        if st.loopOn {
+            caption = st.loopLaps > 0
+                ? "LOOP  bars \(st.loopFirstBar)–\(st.loopLastBar)   ·   \(st.loopLaps)× round"
+                : "LOOP  bars \(st.loopFirstBar)–\(st.loopLastBar)"
+        } else {
+            caption = hasSong ? "Tap anywhere on the bar to jump there" : ""
+        }
+        centered(caption, in: CGRect(x: track.minX, y: seekRect.maxY - 28, width: track.width, height: 26),
+                 font: fnt(21, .semibold), color: st.loopOn ? accentAmber : dim(0.55))
 
         // ── transport ────────────────────────────────────────────────────
-        button(playRect, st.isPlaying ? "❚❚  PAUSE" : "▶  PLAY",
-               fill: st.isPlaying ? accentRed : accentBlue, size: 40, weight: .black, radius: 26)
         button(restartRect, "↺  START", fill: neutral, size: 28, radius: 26)
+        button(playRect, st.isPlaying ? "❚❚  PAUSE" : "▶  PLAY",
+               fill: st.isPlaying ? accentRed : accentBlue, size: 38, weight: .black, radius: 26)
         button(skipRect, "SKIP  ▸▸", fill: neutral, size: 28, radius: 26)
 
-        // ── one settings row ─────────────────────────────────────────────
-        button(tempoDownRect, "−", fill: neutral, size: 44, weight: .black, radius: 24)
-        button(tempoUpRect, "+", fill: neutral, size: 44, weight: .black, radius: 24)
+        // ── section practice ─────────────────────────────────────────────
+        button(loopPhraseRect, "⟲  LOOP 4 BARS", fill: neutral, size: 25, radius: 24)
+        button(loopARect, "SET  A", fill: neutral, size: 24, radius: 24)
+        button(loopBRect, "SET  B", fill: neutral, size: 24, radius: 24)
+        button(loopOnRect, st.loopOn ? "LOOP:  ON" : "LOOP:  OFF",
+               fill: st.loopOn ? accentAmber : neutral, size: 26,
+               text: st.loopOn ? .black : .white, radius: 24)
+
+        // ── tempo, mode, hands ───────────────────────────────────────────
+        button(tempoDownRect, "−", fill: neutral, size: 40, weight: .black, radius: 24)
+        button(tempoUpRect, "+", fill: neutral, size: 40, weight: .black, radius: 24)
         centered("\(st.tempoPercent)%",
                  in: CGRect(x: tempoDownRect.maxX, y: tempoDownRect.minY,
-                            width: tempoUpRect.minX - tempoDownRect.maxX,
-                            height: tempoDownRect.height),
-                 font: .systemFont(ofSize: 34, weight: .heavy), color: .white)
+                            width: tempoUpRect.minX - tempoDownRect.maxX, height: tempoDownRect.height),
+                 font: monoFnt(32, .heavy), color: .white)
         button(waitRect, st.waitMode ? "WAIT FOR ME" : "PLAY-ALONG",
-               fill: st.waitMode ? accentGreen : accentPurple, size: 25, radius: 24)
-        button(handRect, st.hand.label.uppercased(), fill: neutral, size: 25, radius: 24)
+               fill: st.waitMode ? accentGreen : accentPurple, size: 24, radius: 24)
+        button(handRect, st.hand.label.uppercased(), fill: neutral, size: 24, radius: 24)
+    }
+
+    private static func drawAccess(_ s: PanelSnap) {
+        let a = s.state.access
+        settingRow(textSizeRect, "TEXT SIZE", a.textSize.label, on: a.textSize != .normal)
+        settingRow(contrastRect, "HIGH CONTRAST", a.highContrast ? "ON" : "OFF", on: a.highContrast)
+        settingRow(dwellRect, "HOVER TO SELECT", a.dwell.label, on: a.dwell != .off)
+        settingRow(cbRect, "COLOUR-BLIND SAFE", a.colorBlindSafe ? "ON" : "OFF", on: a.colorBlindSafe)
+        button(accessResetRect, "RESET", fill: neutral, size: 26, radius: 26)
+        wrapped("HOVER TO SELECT fires a control by resting on it, for when a pinch will not "
+                + "register — set it OFF to require a pinch. COLOUR-BLIND SAFE keeps the hands "
+                + "blue and orange but turns played notes white and wrong ones magenta.",
+                in: CGRect(x: 40, y: 526, width: texW - 80, height: 40), size: 20)
     }
 
     private static func drawComfort(_ s: PanelSnap) {
         let c = s.state.comfort
-        let labelFont = UIFont.systemFont(ofSize: 27, weight: .heavy)
-        let valueFont = UIFont.systemFont(ofSize: 33, weight: .heavy)
+        let labelFont = fnt(27, .heavy)
+        let valueFont = fnt(33, .heavy)
         leftTruncated("VIEW SIZE", in: CGRect(x: 40, y: viewDownRect.minY, width: 480, height: viewDownRect.height),
                       font: labelFont, color: .white)
         leftTruncated("LENS SPACING", in: CGRect(x: 40, y: lensDownRect.minY, width: 480, height: lensDownRect.height),
@@ -1035,7 +1282,7 @@ final class ARMenuOverlay {
         para.alignment = .center
         para.lineBreakMode = .byWordWrapping
         (hint as NSString).draw(in: CGRect(x: 50, y: 424, width: texW - 100, height: 130),
-                                withAttributes: [.font: UIFont.systemFont(ofSize: 24, weight: .medium),
+                                withAttributes: [.font: fnt(24, .medium),
                                                  .foregroundColor: UIColor(white: 1, alpha: 0.62),
                                                  .paragraphStyle: para])
     }
@@ -1048,7 +1295,7 @@ final class ARMenuOverlay {
                fill: s.state.keyLabels ? accentGreen : neutral, size: 26)
 
         centered(s.state.alignReadout, in: CGRect(x: 20, y: 182, width: texW - 40, height: 34),
-                 font: .monospacedDigitSystemFont(ofSize: 22, weight: .semibold),
+                 font: monoFnt(22, .semibold),
                  color: UIColor(red: 0.55, green: 0.95, blue: 1.0, alpha: 0.9))
 
         let rows: [(label: String, minus: String, plus: String)] = [
@@ -1056,7 +1303,7 @@ final class ARMenuOverlay {
             ("DEPTH", "▲ away", "▼ near"), ("WIDTH", "−", "+"),
             ("TURN", "↺", "↻"), ("HEIGHT", "▼", "▲"),
         ]
-        let labelFont = UIFont.systemFont(ofSize: 24, weight: .heavy)
+        let labelFont = fnt(24, .heavy)
         for (i, r) in rows.enumerated() {
             let row = i / 2, col = i % 2
             leftTruncated(r.label, in: alignLabel(row: row, col: col), font: labelFont,
@@ -1081,7 +1328,7 @@ final class ARMenuOverlay {
         para.alignment = .left
         para.lineBreakMode = .byWordWrapping
         (hint as NSString).draw(in: CGRect(x: 30, y: 500, width: 900, height: 60),
-                                withAttributes: [.font: UIFont.systemFont(ofSize: 21, weight: .medium),
+                                withAttributes: [.font: fnt(21, .medium),
                                                  .foregroundColor: UIColor(white: 1, alpha: 0.55),
                                                  .paragraphStyle: para])
     }

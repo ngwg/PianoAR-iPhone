@@ -80,6 +80,32 @@ final class NoteHighway {
     private static let matFlashGood   = mat(UIColor(red: 0.15, green: 1.0, blue: 0.45, alpha: 1), blend: .add)
     private static let matFlashBad    = mat(UIColor(red: 1.0, green: 0.15, blue: 0.12, alpha: 1), blend: .add)
 
+    /// Left/right stay blue and orange, which is the one hue pair that
+    /// survives every kind of colour blindness. What does not survive is
+    /// green-for-played sitting next to orange-for-left-hand, and red-for-
+    /// wrong next to it — so in safe mode "played" becomes white and "wrong"
+    /// becomes magenta, both of which stay distinct from the bar colours for
+    /// deuteranopes and protanopes alike.
+    ///
+    /// Materials are shared by every bar and cue, so writing to their
+    /// contents repaints the whole sheet without rebuilding any geometry.
+    static func setPalette(colorBlindSafe: Bool) {
+        let played: UIColor = colorBlindSafe
+            ? UIColor(red: 1.00, green: 1.00, blue: 1.00, alpha: 0.95)
+            : UIColor(red: 0.30, green: 1.00, blue: 0.55, alpha: 0.85)
+        let good: UIColor = colorBlindSafe
+            ? UIColor(red: 0.85, green: 0.95, blue: 1.00, alpha: 1)
+            : UIColor(red: 0.15, green: 1.00, blue: 0.45, alpha: 1)
+        let bad: UIColor = colorBlindSafe
+            ? UIColor(red: 1.00, green: 0.10, blue: 0.85, alpha: 1)
+            : UIColor(red: 1.00, green: 0.15, blue: 0.12, alpha: 1)
+        matBarPlayed.diffuse.contents  = played
+        matFlashGood.diffuse.contents  = good
+        matFlashGood.emission.contents = good.cgColor
+        matFlashBad.diffuse.contents   = bad
+        matFlashBad.emission.contents  = bad.cgColor
+    }
+
     // MARK: Nodes
     private let sheet = SCNNode()            // tilted; local +Y runs up the sheet
     private var background: SCNNode!

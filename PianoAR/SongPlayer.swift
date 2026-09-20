@@ -109,6 +109,17 @@ final class SongPlayer: ObservableObject {
     private(set) var acceptedKeys: Set<Int> = []
     private(set) var stats = PracticeStats()
 
+    /// Section practice. `loopTo` is inclusive, both are group indices.
+    ///
+    /// The whole point of practising is repeating the eight bars you cannot
+    /// play yet, and until now the only way to reach bar 40 was to play the
+    /// thirty-nine before it.
+    private(set) var loopEnabled = false
+    private(set) var loopFrom = 0
+    private(set) var loopTo   = 0
+    /// Times round the loop - shown so you can see the repetition happening.
+    private(set) var loopLaps = 0
+
     private(set) var bpm: Double = 120
     private(set) var tempoScale: Double = 1.0
     private(set) var practiceHand: PracticeHand = .both
@@ -159,6 +170,13 @@ final class SongPlayer: ObservableObject {
         }
         bpm = song.bpm
         rebuildGroups()
+        // Deliberately left empty rather than spanning the song: an unset
+        // loop is what lets one press of LOOP mean "repeat the phrase I am
+        // in" instead of "repeat everything".
+        loopEnabled = false
+        loopFrom = 0
+        loopTo = 0
+        loopLaps = 0
         resetProgress()
         isPlaying = false
         feedback = "Ready: \(song.title ?? "Practice")"
@@ -167,9 +185,19 @@ final class SongPlayer: ObservableObject {
     func play() {
         guard song != nil else { return }
         resetProgress()
-        startHostTime = CACurrentMediaTime() + countInBeats * 60.0 / effectiveBPM
+        // With a loop armed, "start" means the start of the section being
+        // practised. Anything else would throw you back to bar 1 every time.
+        if loopEnabled, !groups.isEmpty {
+            groupIndex = min(groups.count - 1, max(0, loopFrom))
+            groupSerial &+= 1
+        }
+        loopLaps = 0
+        let now = CACurrentMediaTime()
+        let lead = countInBeats * 60.0 / effectiveBPM
+        let offset = groups.isEmpty ? 0 : groups[groupIndex].startBeat * 60.0 / effectiveBPM
+        startHostTime = now + lead - offset
         isPlaying = true
-        groupEnteredAt = startHostTime
+        groupEnteredAt = now + lead
         feedback = "Get ready"
     }
 
@@ -245,20 +273,123 @@ final class SongPlayer: ObservableObject {
             }
             break
         }
-        if groupIndex >= groups.count, !groups.isEmpty { finish() }
+        if loopEnabled, !groups.isEmpty, groupIndex > loopTo {
+            loopLaps += 1
+            jump(toGroup: loopFrom)
+            feedback = loopLabel() + "  ·  \(loopLaps)x"
+        } else if groupIndex >= groups.count, !groups.isEmpty { finish() }
         else if changed, feedback.hasPrefix("Get ready") { feedback = "" }
     }
+
+    // MARK: - Position, seeking and section practice
+
+    /// No time signature travels with a Song, so bars are counted in fours.
+    /// That is only ever used for *labelling* and for choosing how much to
+    /// loop, never for timing, so a piece in three simply gets bars that do
+    /// not line up with its own — the numbers stay monotonic and evenly
+    /// spaced, which is all the scrub bar needs them to be.
+    static let beatsPerBar = 4.0
 
     /// How far through the piece we are, 0...1 — for the scrub bar.
     var progressFraction: Double {
         groups.isEmpty ? 0 : Double(groupIndex) / Double(groups.count)
     }
 
+    func bar(ofGroup i: Int) -> Int {
+        guard !groups.isEmpty else { return 0 }
+        let g = groups[min(groups.count - 1, max(0, i))]
+        return Int(g.startBeat / Self.beatsPerBar)
+    }
+
+    /// 1-based, for display.
+    var currentBar: Int { groups.isEmpty ? 0 : bar(ofGroup: groupIndex) + 1 }
+    var barCount: Int {
+        guard let last = groups.last else { return 0 }
+        return Int(last.startBeat / Self.beatsPerBar) + 1
+    }
+
+    var loopFromFraction: Double {
+        groups.isEmpty ? 0 : Double(loopFrom) / Double(groups.count)
+    }
+    var loopToFraction: Double {
+        groups.isEmpty ? 0 : Double(loopTo + 1) / Double(groups.count)
+    }
+    var loopFirstBar: Int { bar(ofGroup: loopFrom) + 1 }
+    var loopLastBar:  Int { bar(ofGroup: loopTo) + 1 }
+
     /// Jump to a point in the piece. Practising the middle of something
     /// should not mean playing the first two minutes of it again.
     func seek(toFraction f: Double) {
         guard !groups.isEmpty else { return }
-        let idx = min(groups.count - 1, max(0, Int(Double(groups.count) * f)))
+        jump(toGroup: Int(Double(groups.count) * f))
+        loopLaps = 0
+        feedback = ""
+    }
+
+    /// Mark the playhead as the start of the practice loop. Dragging two
+    /// handles with a hand-tracked ray is a fight; pressing a button at the
+    /// place you already are is not.
+    func setLoopStart() {
+        guard !groups.isEmpty else { return }
+        loopFrom = groupIndex
+        if loopTo < loopFrom { loopTo = min(groups.count - 1, loopFrom + phraseGroups() - 1) }
+        loopEnabled = true
+        loopLaps = 0
+        feedback = loopLabel()
+    }
+
+    func setLoopEnd() {
+        guard !groups.isEmpty else { return }
+        loopTo = groupIndex
+        if loopFrom > loopTo { loopFrom = max(0, loopTo - phraseGroups() + 1) }
+        loopEnabled = true
+        loopLaps = 0
+        feedback = loopLabel()
+    }
+
+    /// One tap for the common case: loop the four-bar phrase the playhead is
+    /// sitting in, and start it from the top.
+    func loopCurrentPhrase() {
+        guard !groups.isEmpty else { return }
+        let startBar = (bar(ofGroup: groupIndex) / 4) * 4
+        let endBar   = startBar + 3
+        loopFrom = groups.firstIndex { Int($0.startBeat / Self.beatsPerBar) >= startBar } ?? 0
+        loopTo   = (groups.lastIndex { Int($0.startBeat / Self.beatsPerBar) <= endBar }) ?? (groups.count - 1)
+        if loopTo < loopFrom { loopTo = loopFrom }
+        loopEnabled = true
+        loopLaps = 0
+        jump(toGroup: loopFrom)
+        feedback = loopLabel()
+    }
+
+    func toggleLoop() {
+        guard !groups.isEmpty else { return }
+        loopEnabled.toggle()
+        loopLaps = 0
+        if loopEnabled {
+            if loopTo <= loopFrom { loopCurrentPhrase(); return }
+            if groupIndex < loopFrom || groupIndex > loopTo { jump(toGroup: loopFrom) }
+            feedback = loopLabel()
+        } else {
+            feedback = "Loop off"
+        }
+    }
+
+    private func loopLabel() -> String { "Loop bars \(loopFirstBar)–\(loopLastBar)" }
+
+    /// Roughly four bars' worth of groups, used when only one end of the
+    /// loop has been set and the other has to be guessed.
+    private func phraseGroups() -> Int {
+        guard !groups.isEmpty else { return 1 }
+        let span = 4.0 * Self.beatsPerBar
+        let here = groups[min(groups.count - 1, max(0, groupIndex))].startBeat
+        let n = groups.filter { $0.startBeat >= here && $0.startBeat < here + span }.count
+        return max(1, n)
+    }
+
+    private func jump(toGroup i: Int) {
+        guard !groups.isEmpty else { return }
+        let idx = min(groups.count - 1, max(0, i))
         groupIndex   = idx
         acceptedKeys = []
         aheadRun     = []
@@ -266,7 +397,6 @@ final class SongPlayer: ObservableObject {
         groupEnteredAt = CACurrentMediaTime()
         isComplete   = false
         startHostTime = CACurrentMediaTime() - groups[idx].startBeat * 60.0 / effectiveBPM
-        feedback = ""
     }
 
     /// Tempo actually in force, for anything that needs to convert beats to

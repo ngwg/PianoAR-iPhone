@@ -20,6 +20,7 @@ struct ContentView: View {
     @StateObject private var audioDetector = AudioPitchDetector()
     @StateObject private var keyTuning     = KeyTuning()
     @StateObject private var comfort       = ComfortSettings()
+    @StateObject private var access        = AccessibilitySettings()
     @StateObject private var recorder      = SessionRecorder()
     @StateObject private var calibRun      = PianoCalibration()
 
@@ -38,6 +39,7 @@ struct ContentView: View {
             songPlayer: songPlayer, pressDetector: pressDetector,
             audioDetector: audioDetector, keyTuning: keyTuning,
             comfort: comfort.snapshot,
+            access: access.snapshot,
             onMenuAction: handleMenuAction,
             showDebug: showDebug,
             showKeyLabels: showKeyLabels,
@@ -141,6 +143,24 @@ struct ContentView: View {
             recorder.toggle()
         case .seek(let f):
             songPlayer.seek(toFraction: f)
+        case .loopSetStart:
+            songPlayer.setLoopStart()
+        case .loopSetEnd:
+            songPlayer.setLoopEnd()
+        case .loopPhrase:
+            songPlayer.loopCurrentPhrase()
+        case .loopToggle:
+            songPlayer.toggleLoop()
+        case .cycleTextSize:
+            access.cycleTextSize()
+        case .toggleContrast:
+            access.toggleContrast()
+        case .cycleDwell:
+            access.cycleDwell()
+        case .toggleColorBlind:
+            access.toggleColorBlindSafe()
+        case .resetAccess:
+            access.reset()
         case .toggleCalibration:
             if calibRun.active {
                 calibRun.stop()

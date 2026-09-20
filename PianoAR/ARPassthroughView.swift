@@ -12,6 +12,7 @@ struct ARPassthroughView: UIViewRepresentable {
     let audioDetector: AudioPitchDetector
     let keyTuning:     KeyTuning
     var comfort:        ComfortSnapshot
+    var access:         AccessibilitySnapshot = .default
     var onMenuAction:   ((MenuAction) -> Void)?
     var showDebug:      Bool   = false
     var showKeyLabels:  Bool   = true
@@ -59,6 +60,7 @@ struct ARPassthroughView: UIViewRepresentable {
             showDebug: showDebug,
             showKeyLabels: showKeyLabels,
             comfort: comfort,
+            access: access,
             alignment: alignment,
             recorder: recorder,
             calibration: calibrationRun,
@@ -74,6 +76,7 @@ struct ARPassthroughView: UIViewRepresentable {
             var showDebug = false
             var showKeyLabels = true
             var comfort = ComfortSnapshot.default
+            var access = AccessibilitySnapshot.default
             var alignment = KeyboardAlignment()
             var recorder: SessionRecorder?
             var calibration: PianoCalibration?
@@ -259,7 +262,16 @@ struct ARPassthroughView: UIViewRepresentable {
                     recording: cfg.recorder?.isRecording ?? false,
                     recordSeconds: cfg.recorder?.seconds ?? 0,
                     calibrating: cfg.calibration?.active ?? false,
-                    progress: Float(songPlayer.progressFraction))
+                    progress: Float(songPlayer.progressFraction),
+                    bar: songPlayer.currentBar,
+                    barCount: songPlayer.barCount,
+                    loopOn: songPlayer.loopEnabled,
+                    loopFrom: Float(songPlayer.loopFromFraction),
+                    loopTo: Float(songPlayer.loopToFraction),
+                    loopFirstBar: songPlayer.loopFirstBar,
+                    loopLastBar: songPlayer.loopLastBar,
+                    loopLaps: songPlayer.loopLaps,
+                    access: cfg.access)
                 if let action = menu.update(hands: hands, keyboardNode: kb, time: time,
                                             state: state, availableSongs: cfg.songs,
                                             cameraWorldPos: camPos) {
