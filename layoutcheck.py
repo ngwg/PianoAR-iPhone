@@ -1,109 +1,112 @@
 """Static check of the AR panel layout.
 
-The panel is drawn with hand-placed CGRects on a 960x640 texture, and the
-same rects drive hit-testing -- so a rect that overlaps its neighbour is not
-just ugly, it is a button that steals another button's presses. Nothing about
-that is visible until the headset is on, which is exactly why it is worth
-checking on the desk.
+The panel is hand-placed CGRects on a 960x640 texture and the same rects do
+the hit-testing, so a rect over its neighbour is not a cosmetic problem -- it
+is a button that eats another button's presses. None of it is visible until
+the headset is on, which is why it is worth checking on the desk.
 """
 import re, sys, io
 
-src = io.open("PianoAR/ARMenuOverlay.swift", encoding="utf-8").read()
+src = io.open("PianoAR/ARMenuPanel.swift", encoding="utf-8").read()
 
 TEX_W, TEX_H = 960, 640
-HANDLE_H, TAB_BAR_H, HEADER_H = 58, 72, 56
-CONTENT_TOP = HANDLE_H + HEADER_H       # 114
-TAB_TOP = TEX_H - TAB_BAR_H             # 568
+HANDLE_H, HEADER_H, NAV_H = 58, 64, 72
+CONTENT_TOP = HANDLE_H + HEADER_H       # 122
+NAV_TOP = TEX_H - NAV_H                 # 568
 
 rects = {}
 for m in re.finditer(
-        r"private static let (\w+Rect)\s*=\s*CGRect\(x:\s*(-?\d+),\s*y:\s*(-?\d+),"
+        r"static let (\w+Rect)\s*=\s*CGRect\(x:\s*(-?\d+),\s*y:\s*(-?\d+),"
         r"\s*width:\s*(\d+),\s*height:\s*(\d+)\)", src):
-    name, x, y, w, h = m.group(1), *map(int, m.groups()[1:])
-    rects[name] = (x, y, w, h)
+    rects[m.group(1)] = tuple(int(g) for g in m.groups()[1:])
 
-TABS = {
-    "practice": ["seekRect", "restartRect", "playRect", "skipRect", "loopPhraseRect",
-                 "loopARect", "loopBRect", "loopOnRect", "tempoDownRect", "tempoUpRect",
-                 "waitRect", "handRect"],
-    "access":   ["textSizeRect", "contrastRect", "dwellRect", "cbRect", "accessResetRect"],
-    "comfort":  ["viewDownRect", "viewUpRect", "lensDownRect", "lensUpRect", "smoothRect",
-                 "stereoRect", "handStyleRect", "comfortResetRect"],
-    "setup":    ["mapRect", "debugRect", "labelsRect", "alignResetRect", "recordRect",
-                 "calibRect"],
-    "pill":     ["pauseRect", "pillLoopRect", "pillSkipRect", "menuRect"],
-}
+# Screens, as the control tables define them. Parsed from the source so a
+# control added to a table without a rect shows up here rather than in the
+# headset.
+SCREENS = {}
+for m in re.finditer(r"static let (\w+)Controls: \[\(Region, CGRect\)\] = \[(.*?)\]",
+                     src, re.S):
+    SCREENS[m.group(1)] = re.findall(r",\s*(\w+Rect)\)", m.group(2))
+SCREENS["pill"] = ["pauseRect", "pillLoopRect", "pillSkipRect", "menuRect"]
+SCREENS["browse"] = SCREENS.get("browse", []) + ["__libcells__"]
+
+# library cells come from a formula, not constants
+LIB_COLS, LIB_ROWS, LIB_W, LIB_H = 2, 3, 436, 108
+lib_cells = [(36 + (i % LIB_COLS) * (LIB_W + 16),
+              130 + (i // LIB_COLS) * (LIB_H + 12), LIB_W, LIB_H)
+             for i in range(LIB_COLS * LIB_ROWS)]
+
+# Read the settings sub-tabs out of their formula rather than restating it,
+# so changing the Swift cannot leave the checker validating an old layout.
+_st = re.search(r"static func settingsTabRect.*?y:\s*(\d+),\s*width:\s*w,"
+                r"\s*height:\s*(\d+)\)", src, re.S)
+_ST_Y, _ST_H = (int(_st.group(1)), int(_st.group(2))) if _st else (126, 66)
+_ST_W = (TEX_W - 72 - 16) / 3
+SETTINGS_TABS = [(36 + i * (_ST_W + 8), _ST_Y, _ST_W, _ST_H) for i in range(3)]
 
 def overlap(a, b):
     ax, ay, aw, ah = a; bx, by, bw, bh = b
-    ox = max(0, min(ax + aw, bx + bw) - max(ax, bx))
-    oy = max(0, min(ay + ah, by + bh) - max(ay, by))
-    return ox * oy
+    return (max(0, min(ax + aw, bx + bw) - max(ax, bx))
+            * max(0, min(ay + ah, by + bh) - max(ay, by)))
 
 problems = []
-for tab, names in TABS.items():
-    missing = [n for n in names if n not in rects]
-    if missing:
-        problems.append("%s: rect not found: %s" % (tab, ", ".join(missing)))
-    got = [(n, rects[n]) for n in names if n in rects]
+
+def named(screen):
+    out = []
+    for n in SCREENS.get(screen, []):
+        if n == "__libcells__":
+            out += [("card%d" % i, c) for i, c in enumerate(lib_cells)]
+        elif n in rects:
+            out.append((n, rects[n]))
+        else:
+            problems.append("%s: rect not found: %s" % (screen, n))
+    if screen in ("view", "access", "align"):
+        out += [("settingsTab%d" % i, t) for i, t in enumerate(SETTINGS_TABS)]
+    return out
+
+MIN_TARGET = {"play": (108, 72), "pill": (108, 72), "access": (108, 72),
+              "view": (96, 72), "browse": (108, 66), "song": (96, 72),
+              "result": (108, 72), "align": (100, 66)}
+
+for screen in SCREENS:
+    got = named(screen)
     for i in range(len(got)):
         for j in range(i + 1, len(got)):
-            a, b = got[i], got[j]
-            if overlap(a[1], b[1]):
-                problems.append("%s: %s overlaps %s by %d px^2" % (tab, a[0], b[0], overlap(a[1], b[1])))
+            if overlap(got[i][1], got[j][1]):
+                problems.append("%s: %s overlaps %s" % (screen, got[i][0], got[j][0]))
     for n, (x, y, w, h) in got:
         if x < 0 or x + w > TEX_W:
-            problems.append("%s: %s runs off the side (x %d..%d)" % (tab, n, x, x + w))
-        if tab == "pill":
+            problems.append("%s: %s runs off the side (x %d..%d)" % (screen, n, x, x + w))
+        if screen == "pill":
             continue
         if y < CONTENT_TOP:
-            problems.append("%s: %s starts above the content area (y %d < %d)" % (tab, n, y, CONTENT_TOP))
-        if y + h > TAB_TOP:
-            problems.append("%s: %s runs into the tab bar (y %d > %d)" % (tab, n, y + h, TAB_TOP))
-
-# Minimum touch target. Stricter on the screens used mid-practice -- with a
-# song running you are aiming one-handed at a panel that is also moving with
-# your head. SETUP is laid out once and then left alone, so its denser grid of
-# nudge buttons is allowed to be smaller.
-MIN_TARGET = {"practice": (108, 72), "pill": (108, 72), "access": (108, 72),
-              "comfort": (108, 72), "setup": (100, 66)}
-for tab, names in TABS.items():
-    minw, minh = MIN_TARGET[tab]
-    for n in names:
-        if n not in rects:
-            continue
-        _, _, w, h = rects[n]
+            problems.append("%s: %s starts above the content area (y %d < %d)"
+                            % (screen, n, y, CONTENT_TOP))
+        if y + h > NAV_TOP:
+            problems.append("%s: %s runs into the nav bar (y %d > %d)"
+                            % (screen, n, y + h, NAV_TOP))
+        minw, minh = MIN_TARGET.get(screen, (100, 66))
         if w < minw or h < minh:
             problems.append("%s: %s is a small target (%dx%d, floor %dx%d)"
-                            % (tab, n, w, h, minw, minh))
-
-# five tabs have to fit across the bar
-tab_w = TEX_W / 5
-print("tab width %.0f px for 5 tabs" % tab_w)
-print("%d rects parsed" % len(rects))
-for tab, names in TABS.items():
-    ys = [(rects[n][1], rects[n][1] + rects[n][3]) for n in names if n in rects]
-    if ys:
-        print("  %-9s %2d controls, y %d..%d" % (tab, len(ys), min(a for a, _ in ys), max(b for _, b in ys)))
+                            % (screen, n, w, h, minw, minh))
 
 # Text blocks are drawn into inline CGRects that no hit-test knows about, so
-# nothing stops one from being laid over a row of buttons -- which is exactly
-# what happened to the VIEW and SETUP help paragraphs. Check them too.
-DRAW_FN = {"drawPractice": "practice", "drawAccess": "access",
-           "drawComfort": "comfort", "drawSetup": "setup"}
+# nothing stops one being laid over a row of buttons.
+DRAW_FN = {"drawBrowse": "browse", "drawSongPage": "song", "drawPractice": "play",
+           "drawResults": "result", "drawView": "view", "drawAccess": "access",
+           "drawAlign": "align"}
 
 def val(tok):
     tok = tok.strip()
     m = re.fullmatch(r"texW\s*-\s*(\d+)", tok)
     if m:
         return TEX_W - int(m.group(1))
-    m = re.fullmatch(r"-?\d+", tok)
-    return int(tok) if m else None
+    return int(tok) if re.fullmatch(r"-?\d+", tok) else None
 
-for fn, tab in DRAW_FN.items():
-    m = re.search(r"private static func %s\(_ s: PanelSnap\) \{" % fn, src)
+for fn, screen in DRAW_FN.items():
+    m = re.search(r"static func %s\(_ s: PanelSnap\) \{" % fn, src)
     if not m:
-        problems.append("%s: draw function not found" % tab)
+        problems.append("%s: draw function not found" % screen)
         continue
     depth, i = 0, m.end() - 1
     while i < len(src):
@@ -112,24 +115,41 @@ for fn, tab in DRAW_FN.items():
             depth -= 1
             if depth == 0: break
         i += 1
-    body = src[m.end():i]
-    controls = [(n, rects[n]) for n in TABS[tab] if n in rects]
+    body, controls = src[m.end():i], named(screen)
+    # An empty state and the content it replaces are mutually exclusive, so
+    # a placeholder drawn over where the cards *would* be is not a collision.
+    for em in re.finditer(r"isEmpty \{", body):
+        d, j = 0, em.end() - 1
+        while j < len(body):
+            if body[j] == "{": d += 1
+            elif body[j] == "}":
+                d -= 1
+                if d == 0: break
+            j += 1
+        body = body[:em.end()] + " " * (j - em.end()) + body[j:]
     for cm in re.finditer(r"CGRect\(x:\s*([^,]+),\s*y:\s*([^,]+),\s*"
                           r"width:\s*([^,]+),\s*height:\s*([^)]+)\)", body):
         vals = [val(g) for g in cm.groups()]
         if any(v is None for v in vals):
-            continue                      # derived from another rect; skip
+            continue                       # derived from another rect; skip
         x, y, w, h = vals
-        if h <= 0 or w <= 0:
-            problems.append("%s: text block at y %d has no area (%dx%d)" % (tab, y, w, h))
+        if w <= 0 or h <= 0:
+            problems.append("%s: text block at y %d has no area (%dx%d)" % (screen, y, w, h))
             continue
         for n, r in controls:
             if overlap((x, y, w, h), r):
                 problems.append("%s: text block (x %d y %d %dx%d) covers %s"
-                                % (tab, x, y, w, h, n))
-        if y + h > TAB_TOP:
-            problems.append("%s: text block at y %d..%d runs into the tab bar"
-                            % (tab, y, y + h))
+                                % (screen, x, y, w, h, n))
+        if y + h > NAV_TOP:
+            problems.append("%s: text block at y %d..%d runs into the nav bar"
+                            % (screen, y, y + h))
+
+print("%d rects parsed, %d screens" % (len(rects), len(SCREENS)))
+for screen in sorted(SCREENS):
+    got = named(screen)
+    if got:
+        print("  %-7s %2d controls, y %d..%d" % (screen, len(got),
+              min(r[1] for _, r in got), max(r[1] + r[3] for _, r in got)))
 
 if problems:
     print("\nPROBLEMS (%d):" % len(problems))

@@ -27,6 +27,7 @@ struct ContentView: View {
     @State private var showDebug = false
     @AppStorage("ui.keyLabels") private var showKeyLabels = true
     @State private var alignment = KeyboardAlignment()
+    @State private var alignMode: AlignMode = .nudge
     @State private var importedSongs: [Song] = []
     @State private var savedBrightness: CGFloat?
 
@@ -40,6 +41,7 @@ struct ContentView: View {
             audioDetector: audioDetector, keyTuning: keyTuning,
             comfort: comfort.snapshot,
             access: access.snapshot,
+            alignMode: alignMode,
             onMenuAction: handleMenuAction,
             showDebug: showDebug,
             showKeyLabels: showKeyLabels,
@@ -106,10 +108,12 @@ struct ContentView: View {
             songPlayer.restart()
         case .skip:
             songPlayer.skipGroup()
-        case .loadAndPlay(let song):
+        case .select(let song):
+            // Load only. Starting is a separate, deliberate press on the
+            // song's own page, which is also where hands and tempo live.
+            if songPlayer.isPlaying { songPlayer.stop() }
             songPlayer.load(song ?? BuiltInSongs.first)
             pressDetector.reset()
-            songPlayer.play()
         case .toggleDebug:
             showDebug.toggle()
         case .recalibrate:
@@ -135,6 +139,8 @@ struct ContentView: View {
             comfort.cycleHandStyle()
         case .cycleFrameRate:
             comfort.cycleFrameRate()
+        case .cycleAlignMode:
+            alignMode = alignMode.next
         case .resetComfort:
             comfort.resetViewDefaults()
         case .align(let adjust):

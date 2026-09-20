@@ -13,6 +13,7 @@ struct ARPassthroughView: UIViewRepresentable {
     let keyTuning:     KeyTuning
     var comfort:        ComfortSnapshot
     var access:         AccessibilitySnapshot = .default
+    var alignMode:      AlignMode = .nudge
     var onMenuAction:   ((MenuAction) -> Void)?
     var showDebug:      Bool   = false
     var showKeyLabels:  Bool   = true
@@ -61,6 +62,7 @@ struct ARPassthroughView: UIViewRepresentable {
             showKeyLabels: showKeyLabels,
             comfort: comfort,
             access: access,
+            alignMode: alignMode,
             alignment: alignment,
             recorder: recorder,
             calibration: calibrationRun,
@@ -77,6 +79,7 @@ struct ARPassthroughView: UIViewRepresentable {
             var showKeyLabels = true
             var comfort = ComfortSnapshot.default
             var access = AccessibilitySnapshot.default
+            var alignMode: AlignMode = .nudge
             var alignment = KeyboardAlignment()
             var recorder: SessionRecorder?
             var calibration: PianoCalibration?
@@ -116,6 +119,10 @@ struct ARPassthroughView: UIViewRepresentable {
         /// What the view is currently being asked for, captured in the render
         /// pass so the debug readout (which has no view) can report it.
         private var renderTarget: Int = 120
+        /// Song metadata for the browser. Derived from every note of every
+        /// song, so it is built when the library changes and not per frame.
+        private var cardCache: [ARMenuOverlay.SongCard] = []
+        private var cardKey = ""
         private var loggedSerial = -1
         private var lastTuningSave: TimeInterval = 0
         private var wasRecording = false
@@ -265,11 +272,15 @@ struct ARPassthroughView: UIViewRepresentable {
             // ── AR menu ──────────────────────────────────────────────────────
             if let kb = keyboardNode, let menu = menuOverlay {
                 let hud = songPlayer.hudSnapshot()
+                let key = "\(cfg.songs.count)|\(cfg.songs.first?.title ?? "")|\(cfg.songs.last?.title ?? "")"
+                if key != cardKey {
+                    cardKey = key
+                    cardCache = cfg.songs.map(ARMenuOverlay.SongCard.make)
+                }
                 let state = MenuState(
                     isPlaying: hud.isPlaying,
                     isComplete: hud.isComplete,
                     debugOn: cfg.showDebug,
-                    songTitles: cfg.songs.map { $0.title ?? "Untitled" },
                     currentTitle: songPlayer.song?.title ?? "",
                     tempoPercent: hud.tempoPercent,
                     hand: hud.hand,
@@ -289,7 +300,16 @@ struct ARPassthroughView: UIViewRepresentable {
                     loopFirstBar: songPlayer.loopFirstBar,
                     loopLastBar: songPlayer.loopLastBar,
                     loopLaps: songPlayer.loopLaps,
-                    access: cfg.access)
+                    access: cfg.access,
+                    alignMode: cfg.alignMode,
+                    correct: hud.accepted,
+                    wrong: hud.mistakes,
+                    missed: hud.missed,
+                    streak: hud.streak,
+                    bestStreak: hud.bestStreak,
+                    accuracy: Double(hud.accuracyPercent) / 100.0,
+                    timingMs: Double(hud.averageTimingMs),
+                    cards: cardCache)
                 if let action = menu.update(hands: hands, keyboardNode: kb, time: time,
                                             state: state, availableSongs: cfg.songs,
                                             cameraWorldPos: camPos) {

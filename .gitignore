@@ -16,3 +16,7 @@ DerivedData/
 # User-specific
 xcuserdata/
 *.xcuserstate
+
+# generated UI review pages
+panel-mockup.html
+mock-*.html
