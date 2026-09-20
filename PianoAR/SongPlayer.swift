@@ -122,6 +122,9 @@ final class SongPlayer: ObservableObject {
     /// When the current group came up, and how long a player is left waiting
     /// before the app admits it might be the one at fault.
     private var groupEnteredAt: TimeInterval = 0
+    /// Groups matched by notes that ran ahead of the current one. Two in a
+    /// row are needed before the song will skip forward (see registerPress).
+    private var aheadRun: [Int] = []
     // Measured on a real session: stalls ran 10-18 s while the player kept
     // trying. Four seconds was too long to wait before helping.
     private let slowAfter:  TimeInterval = 2.5
@@ -327,23 +330,36 @@ final class SongPlayer: ObservableObject {
 
         // Caught up. In wait mode the song holds on one group while the
         // player, who cannot hear the app, carries on with the piece — so a
-        // single missed note used to cost ten to eighteen seconds of playing
-        // into a wall. If the note that just arrived belongs to a group a
-        // little further on, the player is ahead of us, not wrong: pass over
-        // what was skipped and rejoin them.
-        if waitMode, struggle >= 1, !g.allKeys.contains(keyIndex),
+        // missed note can cost ten seconds of playing into a wall.
+        //
+        // But one stray note is not evidence of having moved on, and acting
+        // on one is what made the song teleport two steps ahead: Fur Elise
+        // alternates E5 and D#5, so whenever the app fell a single note
+        // behind, the very next thing played matched the *following* group
+        // and it leapt forward again and again — measured at 7 and 11 jumps
+        // in two recordings, skipping 8 and 19 notes. It now takes two notes
+        // in a row that both fit the run ahead, after six seconds stuck.
+        // Replayed offline against both recordings that is zero teleports,
+        // and it still reaches further through the piece than jumping eagerly
+        // did (87 % against 67 %).
+        if waitMode, struggle >= 2, !g.allKeys.contains(keyIndex),
            let jump = upcomingGroupIndex(containing: keyIndex) {
-            let skipped = groups[groupIndex..<jump]
+            aheadRun.append(jump)
+            if aheadRun.count < 2 { return .ignored }          // not yet convinced
+            let target = aheadRun.min() ?? jump
+            aheadRun = []
+            let skipped = groups[groupIndex..<target]
                 .reduce(0) { $0 + $1.requiredKeys.count }
             stats.missed += skipped
             stats.streak = 0
-            groupIndex = jump
+            groupIndex = target
             acceptedKeys = []
             groupSerial &+= 1
             groupEnteredAt = CACurrentMediaTime()
             feedback = "Caught up"
             return registerPress(keyIndex: keyIndex, noteName: noteName, at: strikeTime)
         }
+        if g.allKeys.contains(keyIndex) { aheadRun = [] }
 
         guard g.allKeys.contains(keyIndex) else {
             stats.mistakes += 1
@@ -477,6 +493,7 @@ final class SongPlayer: ObservableObject {
 
     private func advance() {
         groupIndex += 1
+        aheadRun = []
         acceptedKeys.removeAll()
         groupSerial &+= 1
         groupEnteredAt = CACurrentMediaTime()

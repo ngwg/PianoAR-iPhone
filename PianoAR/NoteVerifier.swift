@@ -62,7 +62,16 @@ final class NoteVerifier {
 
     /// A key must explain the sound at least this well relative to the best
     /// competing key, or it was not the one struck.
-    private let competeFrac: Float = 0.75
+    ///
+    /// 0.55, not the 0.75 guessed from synthetic notes. Replaying two real
+    /// recordings of Fur Elise through the whole pipeline offline, 0.75 got
+    /// 54 % of the way through the piece and 0.55 got 82 %, while accepting
+    /// *fewer* notes that were never played (measured against a control that
+    /// asks for notes three semitones from what was actually played). Real
+    /// piano sound in a room puts far more energy on a struck note's
+    /// neighbours than a clean synthesis does, so the margin a real note wins
+    /// by is smaller than the physics alone suggests.
+    private let competeFrac: Float = 0.55
     /// ...and must hold at least this share of the strongest explanation.
     private let absFrac: Float = 0.25
     /// How much of the pre-onset salience to subtract. Never below 1 for a key
