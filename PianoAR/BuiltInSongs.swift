@@ -18,6 +18,12 @@ enum BuiltInSongs {
         amazingGrace,
         scarboroughFair,
         turkishMarch,
+        // Harder, and each one leans on something different — see below.
+        minuetInG,
+        preludeInCBach,
+        entertainer,
+        toccataDMinor,
+        bumblebee,
     ]
 
     /// Default song on launch.
@@ -204,5 +210,117 @@ enum BuiltInSongs {
         ("E3",16,1,L),("B3",16,1,L),
         ("A5",17,1,R),
         ("A2",17,2,L),("A3",17,2,L),
+    ])
+
+    // MARK: - Harder pieces
+    //
+    // Chosen so each one stresses a different part of the detector, which is
+    // measured now rather than guessed: the microphone hears C3-B5 best
+    // (83-100 % of notes land in the top three), the bottom two octaves
+    // worst, and fast passages sit around 77 %.
+
+    /// Bach (Petzold) — steady, almost entirely inside the register the
+    /// microphone hears best. If anything ever fails here, the problem is not
+    /// the piano range.
+    private static let minuetInG = song("Minuet in G — Bach", bpm: 120, [
+        ("D5",0,1,R),("G4",1,0.5,R),("A4",1.5,0.5,R),("B4",2,0.5,R),("C5",2.5,0.5,R),
+        ("G2",0,3,L),("B3",0,3,L),
+        ("D5",3,1,R),("G4",4,1,R),("G4",5,1,R),
+        ("G2",3,3,L),("B3",3,3,L),
+        ("E5",6,1,R),("C5",7,0.5,R),("D5",7.5,0.5,R),("E5",8,0.5,R),("F#5",8.5,0.5,R),
+        ("C3",6,3,L),("E3",6,3,L),
+        ("G5",9,1,R),("G4",10,1,R),("G4",11,1,R),
+        ("G2",9,3,L),("B3",9,3,L),
+        ("C5",12,1,R),("D5",13,0.5,R),("C5",13.5,0.5,R),("B4",14,0.5,R),("A4",14.5,0.5,R),
+        ("A2",12,3,L),("C3",12,3,L),
+        ("B4",15,1,R),("C5",16,0.5,R),("B4",16.5,0.5,R),("A4",17,0.5,R),("G4",17.5,0.5,R),
+        ("G2",15,3,L),("B3",15,3,L),
+        ("F#4",18,1,R),("G4",19,0.5,R),("A4",19.5,0.5,R),("B4",20,0.5,R),("G4",20.5,0.5,R),
+        ("D3",18,3,L),("F#3",18,3,L),
+        ("A4",21,2,R),("G4",23,1,R),
+        ("G2",21,3,L),("B3",21,3,L),
+    ])
+
+    /// Bach, Well-Tempered Clavier — the arpeggio everyone knows. A steady
+    /// stream of single notes spanning three octaves, so it exercises the
+    /// register boundaries without ever playing two notes at once.
+    private static let preludeInCBach = song("Prelude in C — Bach", bpm: 76, [
+        ("C3",0,0.5,L),("E3",0.5,0.5,L),
+        ("G4",1,0.5,R),("C5",1.5,0.5,R),("E5",2,0.5,R),
+        ("G4",2.5,0.5,R),("C5",3,0.5,R),("E5",3.5,0.5,R),
+        ("C3",4,0.5,L),("D3",4.5,0.5,L),
+        ("A4",5,0.5,R),("D5",5.5,0.5,R),("F5",6,0.5,R),
+        ("A4",6.5,0.5,R),("D5",7,0.5,R),("F5",7.5,0.5,R),
+        ("B2",8,0.5,L),("D3",8.5,0.5,L),
+        ("G4",9,0.5,R),("D5",9.5,0.5,R),("F5",10,0.5,R),
+        ("G4",10.5,0.5,R),("D5",11,0.5,R),("F5",11.5,0.5,R),
+        ("C3",12,0.5,L),("E3",12.5,0.5,L),
+        ("G4",13,0.5,R),("C5",13.5,0.5,R),("E5",14,0.5,R),
+        ("G4",14.5,0.5,R),("C5",15,0.5,R),("E5",15.5,0.5,R),
+        ("C3",16,0.5,L),("E3",16.5,0.5,L),
+        ("A4",17,0.5,R),("E5",17.5,0.5,R),("A5",18,0.5,R),
+        ("A4",18.5,0.5,R),("E5",19,0.5,R),("A5",19.5,0.5,R),
+        ("C3",20,0.5,L),("D3",20.5,0.5,L),
+        ("F#4",21,0.5,R),("A4",21.5,0.5,R),("D5",22,0.5,R),
+        ("F#4",22.5,0.5,R),("A4",23,0.5,R),("D5",23.5,0.5,R),
+    ])
+
+    /// Joplin — syncopation. The melody lands off the beat almost throughout,
+    /// which is the real test of whether the timing feels right rather than
+    /// merely whether the notes are found.
+    private static let entertainer = song("The Entertainer — Joplin", bpm: 80, [
+        ("D5",0,0.5,R),("D#5",0.5,0.5,R),("E5",1,0.5,R),
+        ("C6",1.5,0.5,R),("E5",2,0.5,R),("C6",2.5,0.5,R),("E5",3,0.5,R),
+        ("C6",3.5,1.5,R),
+        ("C3",1.5,1,L),("G3",1.5,1,L),
+        ("C5",5,0.5,R),("D5",5.5,0.5,R),("D#5",6,0.5,R),("E5",6.5,0.5,R),
+        ("C5",7,0.5,R),("D5",7.5,0.5,R),
+        ("E5",8,1.5,R),
+        ("C3",5,1,L),("G3",5,1,L),
+        ("B4",9.5,0.5,R),("D5",10,0.5,R),
+        ("C5",10.5,1.5,R),
+        ("G2",9.5,1,L),("D3",9.5,1,L),
+        ("D5",13,0.5,R),("D#5",13.5,0.5,R),("E5",14,0.5,R),
+        ("C6",14.5,0.5,R),("E5",15,0.5,R),("C6",15.5,0.5,R),("E5",16,0.5,R),
+        ("C6",16.5,1.5,R),
+        ("C3",14.5,1,L),("G3",14.5,1,L),
+        ("C5",18,0.5,R),("D5",18.5,0.5,R),("D#5",19,0.5,R),("E5",19.5,0.5,R),
+        ("C6",20,0.5,R),("C6",20.5,0.5,R),("A5",21,1,R),
+        ("C3",18,1,L),("G3",18,1,L),
+    ])
+
+    /// Bach — the most famous opening in organ music, in unison octaves.
+    /// It runs down into the left hand deliberately: this is the piece to
+    /// play when you want to see where the microphone starts to struggle.
+    private static let toccataDMinor = song("Toccata in D minor — Bach", bpm: 66, [
+        ("A5",0,0.5,R),("G5",0.5,0.25,R),("A5",0.75,1.25,R),
+        ("A4",0,0.5,L),("G4",0.5,0.25,L),("A4",0.75,1.25,L),
+        ("G5",2.5,0.25,R),("F5",2.75,0.25,R),("E5",3,0.25,R),("D5",3.25,0.25,R),
+        ("C#5",3.5,0.5,R),("D5",4,1.5,R),
+        ("G4",2.5,0.25,L),("F4",2.75,0.25,L),("E4",3,0.25,L),("D4",3.25,0.25,L),
+        ("C#4",3.5,0.5,L),("D4",4,1.5,L),
+        ("A4",6,0.5,R),("G4",6.5,0.25,R),("A4",6.75,1.25,R),
+        ("A3",6,0.5,L),("G3",6.5,0.25,L),("A3",6.75,1.25,L),
+        ("E4",8.5,0.25,R),("F4",8.75,0.25,R),("C#4",9,0.5,R),("D4",9.5,1.5,R),
+        ("E3",8.5,0.25,L),("F3",8.75,0.25,L),("C#3",9,0.5,L),("D3",9.5,1.5,L),
+    ])
+
+    /// Rimsky-Korsakov — a chromatic run with no gaps at all. This is the
+    /// speed limit made audible: measured, fast passages land around 77 %
+    /// against 85 % for slow ones, so expect this to be the piece that
+    /// stumbles first. Written at half speed; wind it up with TEMPO.
+    private static let bumblebee = song("Flight of the Bumblebee", bpm: 60, [
+        ("E5",0,0.25,R),("D#5",0.25,0.25,R),("D5",0.5,0.25,R),("C#5",0.75,0.25,R),
+        ("C5",1,0.25,R),("B4",1.25,0.25,R),("A#4",1.5,0.25,R),("A4",1.75,0.25,R),
+        ("G#4",2,0.25,R),("G4",2.25,0.25,R),("F#4",2.5,0.25,R),("F4",2.75,0.25,R),
+        ("E4",3,0.25,R),("D#4",3.25,0.25,R),("D4",3.5,0.25,R),("C#4",3.75,0.25,R),
+        ("C4",4,0.5,R),("E3",4,1,L),
+        ("C4",5,0.25,R),("C#4",5.25,0.25,R),("D4",5.5,0.25,R),("D#4",5.75,0.25,R),
+        ("E4",6,0.25,R),("F4",6.25,0.25,R),("F#4",6.5,0.25,R),("G4",6.75,0.25,R),
+        ("G#4",7,0.25,R),("A4",7.25,0.25,R),("A#4",7.5,0.25,R),("B4",7.75,0.25,R),
+        ("C5",8,0.5,R),("A3",8,1,L),
+        ("B4",9,0.25,R),("A#4",9.25,0.25,R),("A4",9.5,0.25,R),("G#4",9.75,0.25,R),
+        ("G4",10,0.25,R),("F#4",10.25,0.25,R),("F4",10.5,0.25,R),("E4",10.75,0.25,R),
+        ("D#4",11,0.5,R),("E4",11.5,1,R),("E3",11,1.5,L),
     ])
 }
