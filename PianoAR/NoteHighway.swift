@@ -23,6 +23,7 @@ final class NoteHighway {
     private static let barPoolSize = 64
     private static let beatLineCount = 12
     private static let flashDuration: TimeInterval = 0.35
+    private static let heardDuration: TimeInterval = 0.18
 
     private static var leftEdge: Float { -KeyboardLayout.totalWidth / 2 }
 
@@ -74,6 +75,11 @@ final class NoteHighway {
 
     private var goodFlashes: [Int: TimeInterval] = [:]
     private var badFlashes:  [Int: TimeInterval] = [:]
+    /// "Something was struck" — shown the instant an onset is heard, before
+    /// anything is known about which note it was.
+    private var heardAt: TimeInterval = 0
+    /// Keys currently being waited for, captured while the cues are drawn.
+    private var pendingCueKeys: Set<Int> = []
     private var sheetShown = false
     private let midiToKey: [Int: KeyboardLayout.Key]
 
@@ -244,6 +250,22 @@ final class NoteHighway {
 
     // MARK: - Feedback
 
+    /// Telling the player "I heard you" and telling them "that was right"
+    /// are two different questions, and only the second one is slow.
+    ///
+    /// Deciding *which* note was played needs a long look at the sound — at
+    /// 8192 points that is 186 ms of audio, and the window cannot open until
+    /// the hammer noise has passed, so a verdict lands about a third of a
+    /// second after the strike. But *that* a note was struck is known within
+    /// about 40 ms, and known reliably (the onset detector measured 0.99
+    /// precision). Waiting for the verdict before showing anything made the
+    /// whole app feel unresponsive for no reason.
+    ///
+    /// So the keys being waited for pulse immediately on any strike — an
+    /// acknowledgement, deliberately not a judgement — and the green
+    /// confirmation still arrives when it is actually known.
+    func registerStrike() { heardAt = CACurrentMediaTime() }
+
     func registerPress(keyIndex: Int) { goodFlashes[keyIndex] = CACurrentMediaTime() }
     func registerMiss(keyIndex: Int)  { badFlashes[keyIndex]  = CACurrentMediaTime() }
 
@@ -372,6 +394,7 @@ final class NoteHighway {
 
     private func updateCues(player: SongPlayer, now: TimeInterval) {
         cues.forEach { $0.isHidden = true }
+        pendingCueKeys.removeAll(keepingCapacity: true)
 
         if player.isPlaying {
             // What to play now: pulsing, coloured by hand.
@@ -379,6 +402,7 @@ final class NoteHighway {
             for cue in player.currentCues() where cue.keyIndex >= 0 && cue.keyIndex < cues.count {
                 let n = cues[cue.keyIndex]
                 if cue.required {
+                    pendingCueKeys.insert(cue.keyIndex)
                     setMaterial(n, cue.isLeft ? Self.matCueLeft : Self.matCueRight)
                     n.opacity = pulse
                 } else {
@@ -404,6 +428,19 @@ final class NoteHighway {
                 setMaterial(n, Self.matCueSoon)
                 n.opacity = CGFloat(0.55 * (1 - dt))
                 n.isHidden = false
+            }
+        }
+
+        // "Heard you": a brief lift on whatever is being waited for, so the
+        // strike registers visually long before the verdict can exist.
+        let heardAge = now - heardAt
+        if heardAge >= 0, heardAge < Self.heardDuration {
+            let lift = CGFloat(1 - heardAge / Self.heardDuration)
+            for k in pendingCueKeys where k >= 0 && k < cues.count {
+                if goodFlashes[k] == nil, badFlashes[k] == nil {
+                    cues[k].opacity = max(cues[k].opacity, 0.35 + 0.45 * lift)
+                    cues[k].isHidden = false
+                }
             }
         }
 

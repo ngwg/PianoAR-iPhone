@@ -111,6 +111,7 @@ struct ARPassthroughView: UIViewRepresentable {
         private var loggedSerial = -1
         private var lastTuningSave: TimeInterval = 0
         private var wasRecording = false
+        private var lastHeardAttack = -1
 
         init(calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
@@ -154,6 +155,12 @@ struct ARPassthroughView: UIViewRepresentable {
 
             songPlayer.tick()
             cfg.recorder?.tick()
+            // Acknowledge the strike immediately — identifying the note takes
+            // a third of a second, hearing one takes 40 ms.
+            if let att = audio.attack, att.id != lastHeardAttack {
+                lastHeardAttack = att.id
+                highway?.registerStrike()
+            }
             // What the verifier has learned about this piano, kept for the
             // next session (cheap: only writes when something changed).
             if time - lastTuningSave > 4 { lastTuningSave = time; PianoTuning.shared.saveIfNeeded() }
