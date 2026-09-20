@@ -63,17 +63,6 @@ final class NoteVerifier {
     /// A key must explain the sound at least this well relative to the best
     /// competing key, or it was not the one struck.
     ///
-    /// 0.55, not the 0.75 guessed from synthetic notes. Replaying two real
-    /// recordings of Fur Elise through the whole pipeline offline, 0.75 got
-    /// 54 % of the way through the piece and 0.55 got 82 %, while accepting
-    /// *fewer* notes that were never played (measured against a control that
-    /// asks for notes three semitones from what was actually played). Real
-    /// piano sound in a room puts far more energy on a struck note's
-    /// neighbours than a clean synthesis does, so the margin a real note wins
-    /// by is smaller than the physics alone suggests.
-    private let competeFrac: Float = 0.55
-    /// ...and must hold at least this share of the strongest explanation.
-    private let absFrac: Float = 0.25
     /// How much of the pre-onset salience to subtract. Never below 1 for a key
     /// already ringing, so a merely decaying note comes out negative.
     private let preSubtract: Float = 0.9
@@ -82,22 +71,10 @@ final class NoteVerifier {
     private let inharmHi: Float = 1.4
     private let maxSlopCents: Float = 25
 
-    /// Keys a struck key is routinely confused with: immediate neighbours
-    /// (their search windows overlap) and harmonic relatives (they share
-    /// partials outright).
-    ///
-    /// The two- and three-octave entries are not decoration. A bass key's
-    /// partial comb is dense and reaches right up through the mid-range, so
-    /// it quietly collects energy from whatever is actually being played two
-    /// or three octaves above it. With the list stopping at one octave, the
-    /// note that really sounded never got to contest it, and the bottom of
-    /// the keyboard lit up under music played in the middle — measured on a
-    /// real session as A0, B0, D1, G#1, C2… flagged while Fur Elise was being
-    /// played. Widening the list cut false accepts from 5 % to 3 % with no
-    /// loss of real ones.
-    private static let competitors = [-36, -31, -24, -19, -12, -7, -5, -4, -3, -2, -1,
-                                      1, 2, 3, 4, 5, 7, 12, 19, 24, 31, 36]
-    /// Of those, the ones that sound genuinely ambiguous rather than wrong.
+    /// Offsets at which two keys genuinely overlap in sound rather than one
+    /// being wrong: octaves, twelfths, fifths and fourths. When one of these
+    /// outranks the expected note, the microphone cannot separate them and
+    /// the hands are allowed to break the tie.
     private static let ambiguous: Set<Int> = [12, -12, 24, -24, 36, -36, 7, -7, 19, -19, 5, -5]
 
     /// A key must hold at least this share of the best explanation anywhere
@@ -107,6 +84,18 @@ final class NoteVerifier {
     /// touched appeared. Real notes score tens to hundreds here; the
     /// artefacts scored 0 to 3.
     private let frameFloorFrac: Float = 0.10
+
+    /// How near the top of that ranking the expected note has to come, and
+    /// how much of the winner's strength it must hold. From the labelled
+    /// recordings, per onset:
+    ///
+    ///     rule                              recall   false
+    ///     must win outright                   63 %    2.7 %
+    ///     top 2, >= 0.55 of the winner        68 %    4.0 %
+    ///     top 2, >= 0.70 of the winner        65 %    3.2 %
+    ///     top 3, >= 0.55 of the winner        69 %   11.3 %
+    private let topN = 2
+    private let shareOfBest: Float = 0.55
 
     private var f0Table = (0..<88).map { NoteVerifier.nominalF0(ofKey: $0) }
     private var searchTable = [Float](repeating: 35, count: 88)
@@ -148,10 +137,13 @@ final class NoteVerifier {
     ///     with each other.
     ///   - ringing: keys already sounding. Their pre-onset salience is fully
     ///     subtracted, so a decaying note cannot read as a fresh one.
-    ///   - relax: 0 normally. 1 or 2 when the player has been stuck on this
-    ///     note for seconds — the bar drops for the expected keys only, since
-    ///     by then the odds that they are playing the right note are
-    ///     overwhelming and the cost of waiting longer is worse.
+    ///   - relax: accepted for source compatibility and ignored. Lowering
+    ///     the bar while the player is stuck was measured against aligned
+    ///     ground truth and it does not buy anything a lower bar would not
+    ///     buy anyway: at the loosest setting it reached 91 % recall but at
+    ///     **19 % false acceptance**, which is a song that walks through
+    ///     itself while nobody is playing. It is exactly the same trade the
+    ///     competition bar makes, made unpredictably and only sometimes.
     func evaluate(pre: [Float], post: [Float], sampleRate: Float,
                   keys: [Int], chord: Set<Int>,
                   ringing: Set<Int> = [],
@@ -254,43 +246,51 @@ final class NoteVerifier {
             return best
         }
 
+        // Identify, then compare — rather than asking "is the expected note
+        // present?" at every onset until one says yes.
+        //
+        // That yes/no framing is what made the song walk through itself. Each
+        // onset is another independent chance to say yes, so a 6 % error per
+        // question becomes a near-certainty over the dozen onsets a stuck
+        // group sees. Measured on three recordings with every onset labelled:
+        // asking the question at one onset gave 4 % false acceptance, at six
+        // onsets 17 %, and with the old threshold rule it reached 100 %.
+        //
+        // So the question is now "what was played?" — a ranking, in which at
+        // most one key can come first — and the expected note has to be at or
+        // near the top of it. Chord-mates are held out of each other's
+        // ranking, so a chord is still heard as a chord.
+        var ranked: [(key: Int, rise: Float)] = []
+        for k in 9..<80 {
+            let r = salienceRise(k)
+            if r > 0 { ranked.append((k, r)) }
+        }
+        ranked.sort { $0.rise > $1.rise }
+
         var out: [(key: Int, rise: Float, status: NoteStatus)] = []
         for k in keys where k >= 0 && k < 88 {
             let r = salienceRise(k)
             guard r > 0, evidence(k).partials >= 2 else {
                 out.append((k, 0, .absent)); continue
             }
-
-            // Competition. A key is the answer only if nothing nearby explains
-            // the sound better. This is what the old dB-rise test could not do,
-            // and it is where nearly all of the accuracy comes from.
-            var bestComp: Float = 0
-            var bestOffset = 0
-            for d in Self.competitors {
-                let j = k + d
-                guard j >= 0, j < 88, !chord.contains(j) else { continue }
-                let rj = salienceRise(j)
-                if rj > bestComp { bestComp = rj; bestOffset = d }
+            // Everything that outranks this key, ignoring the notes the song
+            // expects alongside it.
+            var better: [Int] = []
+            var best: Float = r
+            for e in ranked where e.key != k && !chord.contains(e.key) {
+                if e.rise > r { better.append(e.key) }
+                best = max(best, e.rise)
             }
-            let strongest = max(r, bestComp)
-            let confidence = simd_clamp(r / max(strongest, 1e-6), 0, 1)
+            let confidence = simd_clamp(r / max(best, 1e-6), 0, 1)
 
-            let ease = chord.contains(k) ? Float(min(2, max(0, relax))) : 0
-            let compBar = competeFrac * (1 - 0.25 * ease)
-            let absBar  = absFrac * (1 - 0.30 * ease)
-
-            let fb = frameBest()
-            if fb > 0, r < frameFloorFrac * fb {
-                out.append((k, 0, .absent)); continue
-            }
-            if r < absBar * strongest {
+            if r < frameFloorFrac * best {
                 out.append((k, confidence, .absent))
-            } else if bestComp > 0 && r < compBar * bestComp {
-                // Something else explains it better. If that something is an
-                // octave or a fifth away the two genuinely overlap and sound
-                // cannot separate them; anything else means this wasn't it.
-                out.append((k, confidence,
-                            Self.ambiguous.contains(bestOffset) ? .unsure : .absent))
+            } else if better.count >= topN || confidence < shareOfBest {
+                // Beaten too comfortably. If the winner is an octave or fifth
+                // away the two genuinely overlap and sound cannot separate
+                // them, so leave the door open for the hands to decide.
+                let amb = better.prefix(2).contains { Self.ambiguous.contains($0 - k) }
+                out.append((k, confidence, amb ? .unsure : .absent))
             } else {
                 out.append((k, confidence, .present))
                 learnTuning(key: k, from: evidence(k))

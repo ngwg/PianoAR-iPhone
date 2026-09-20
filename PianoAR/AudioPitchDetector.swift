@@ -172,14 +172,17 @@ final class AudioPitchDetector: ObservableObject {
     /// Two looks at middle/treble cover chords that are rolled or slightly
     /// spread; the bass waits for the long window.
     private static let bassSplitKey = 27   // C3 (~131 Hz) and above use the 4k window
-    /// Delays start *after* the hammer transient. A piano attack is 20-40 ms
-    /// of broadband noise: inside it every key in the register shows energy,
-    /// which both inflates the keys that were not struck and saturates the
-    /// reference the rise is measured against. Waiting 35 ms costs nothing
-    /// that matters (the onset timestamp is back-dated to the real strike)
-    /// and measures the steady partials instead of the thump.
+    /// One look, 35 ms after the onset — past the hammer transient (20-40 ms
+    /// of broadband noise, inside which every key in the register shows
+    /// energy) and on the steady partials.
+    ///
+    /// There used to be a second look at +120 ms for rolled chords. Measured
+    /// against labelled ground truth it bought no recall at all and cost
+    /// precision — 80 %/5.9 % with one look against 80 %/7.8 % with two —
+    /// because the later window catches the *next* note as often as the
+    /// spread of this one. Four looks were worse still.
     private var stages: [(delay: Double, verifier: NoteVerifier, bass: Bool)] {
-        [(0.035, verifier4k, false), (0.030, verifier8k, true), (0.120, verifier4k, false)]
+        [(0.035, verifier4k, false), (0.030, verifier8k, true)]
     }
     /// When each key was last heard clearly. A key heard within the last
     /// couple of seconds is very likely still ringing, which changes how a

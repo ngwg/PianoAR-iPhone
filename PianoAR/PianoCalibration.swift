@@ -50,7 +50,7 @@ final class PianoCalibration: ObservableObject {
         self.keys = keys
         index = 0
         lastAttackID = -1
-        startedAt = CACurrentMediaTime()
+        startedAt = 0                  // set from the render clock on first use
         lastAdvance = 0
         active = true
     }
@@ -67,9 +67,11 @@ final class PianoCalibration: ObservableObject {
     func consume(attack: AudioAttack?, time: TimeInterval) -> Int? {
         guard active, let attack, attack.id != lastAttackID,
               let key = currentKey,
-              time - lastAdvance >= minGap,
-              time - startedAt > 0.5
+              attack.confidence >= 0.25,      // a real strike, not a knock
+              time - lastAdvance >= minGap
         else { return nil }
+        if startedAt == 0 { startedAt = time }
+        guard time - startedAt > 0.5 else { return nil }
         lastAttackID = attack.id
         lastAdvance = time
         index += 1
