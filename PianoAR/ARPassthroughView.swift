@@ -17,6 +17,7 @@ struct ARPassthroughView: UIViewRepresentable {
     var showKeyLabels:  Bool   = true
     var alignment = KeyboardAlignment()           // SETUP › ALIGN fine placement
     var recorder: SessionRecorder?                // SETUP › RECORD diagnostics
+    var calibrationRun: PianoCalibration?         // SETUP › CALIBRATE guided pass
     var availableSongs: [Song] = []
 
     func makeCoordinator() -> Coordinator {
@@ -60,6 +61,7 @@ struct ARPassthroughView: UIViewRepresentable {
             comfort: comfort,
             alignment: alignment,
             recorder: recorder,
+            calibration: calibrationRun,
             songs: availableSongs
         ))
     }
@@ -74,6 +76,7 @@ struct ARPassthroughView: UIViewRepresentable {
             var comfort = ComfortSnapshot.default
             var alignment = KeyboardAlignment()
             var recorder: SessionRecorder?
+            var calibration: PianoCalibration?
             var songs: [Song] = []
         }
 
@@ -190,7 +193,21 @@ struct ARPassthroughView: UIViewRepresentable {
             if hintBar == nil, let cam = sceneView.pointOfView {
                 hintBar = HintBarOverlay(cameraNode: cam)
             }
-            hintBar?.update(text: currentHintText(time: time))
+            // Calibration takes over the hint bar and logs a labelled
+            // example for every onset: what was asked for, and when.
+            if let cal = cfg.calibration, cal.active {
+                if let asked = cal.consume(attack: audio.attack, time: time) {
+                    cfg.recorder?.log("calib", [
+                        "key": asked,
+                        "name": KeyboardLayout.keys[asked].noteName,
+                        "onset": audio.attack?.timestamp ?? time,
+                        "index": cal.index - 1,
+                    ])
+                }
+                hintBar?.update(text: cal.prompt)
+            } else {
+                hintBar?.update(text: currentHintText(time: time))
+            }
 
             // Fine placement from SETUP › ALIGN, on top of the mapping.
             let a = cfg.alignment
@@ -215,7 +232,8 @@ struct ARPassthroughView: UIViewRepresentable {
                     keyLabels: cfg.showKeyLabels,
                     alignReadout: cfg.alignment.readout,
                     recording: cfg.recorder?.isRecording ?? false,
-                    recordSeconds: cfg.recorder?.seconds ?? 0)
+                    recordSeconds: cfg.recorder?.seconds ?? 0,
+                    calibrating: cfg.calibration?.active ?? false)
                 if let action = menu.update(hands: hands, keyboardNode: kb, time: time,
                                             state: state, availableSongs: cfg.songs,
                                             cameraWorldPos: camPos) {

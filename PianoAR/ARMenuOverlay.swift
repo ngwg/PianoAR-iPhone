@@ -12,6 +12,7 @@ enum MenuAction {
     case align(KeyboardAlignment.Adjust)  // fine placement of the key overlay
     case toggleKeyLabels
     case toggleRecording                  // SETUP › RECORD diagnostics capture
+    case toggleCalibration                // SETUP › CALIBRATE guided note pass
 }
 
 /// Everything the panel shows, captured once per frame on the render thread.
@@ -29,6 +30,7 @@ struct MenuState: Equatable {
     var alignReadout = ""
     var recording = false
     var recordSeconds = 0
+    var calibrating = false
 }
 
 /// Floating "tablet" AR panel — Quest-3 interaction model.
@@ -115,7 +117,8 @@ final class ARMenuOverlay {
         CGRect(x: (col == 0 ? 30 : 495) + 8, y: 226 + CGFloat(row) * 70, width: 190, height: 60)
     }
     private static let alignResetRect = CGRect(x: 30, y: 436, width: 430, height: 56)
-    private static let recordRect     = CGRect(x: 495, y: 436, width: 430, height: 56)
+    private static let recordRect     = CGRect(x: 495, y: 436, width: 300, height: 56)
+    private static let calibRect      = CGRect(x: 805, y: 436, width: 125, height: 56)
 
     // Minimized pill
     private static let pillRect     = CGRect(x: 150, y: 16, width: 660, height: 116)
@@ -178,7 +181,7 @@ final class ARMenuOverlay {
         case pagePrev, pageNext, minimize
         case play, restart, skip, tempoDown, tempoUp, hand, wait
         case viewDown, viewUp, lensDown, lensUp, smooth, stereo, handStyle, comfortReset
-        case mapKeys, debug, labels, alignReset, record
+        case mapKeys, debug, labels, alignReset, record, calibrate
         case slideLeft, slideRight, keyLeft, keyRight, depthAway, depthToward
         case widthMinus, widthPlus, turnLeft, turnRight, heightDown, heightUp
         case pillPause, pillSkip, pillMenu
@@ -598,7 +601,7 @@ final class ARMenuOverlay {
         (.widthMinus, alignCell(row: 1, col: 1, button: 0)), (.widthPlus, alignCell(row: 1, col: 1, button: 1)),
         (.turnLeft, alignCell(row: 2, col: 0, button: 0)), (.turnRight, alignCell(row: 2, col: 0, button: 1)),
         (.heightDown, alignCell(row: 2, col: 1, button: 0)), (.heightUp, alignCell(row: 2, col: 1, button: 1)),
-        (.alignReset, alignResetRect), (.record, recordRect),
+        (.alignReset, alignResetRect), (.record, recordRect), (.calibrate, calibRect),
     ]
 
     private var pageCount: Int { max(1, (songs.count + Self.libPerPage - 1) / Self.libPerPage) }
@@ -704,6 +707,7 @@ final class ARMenuOverlay {
         case .labels:            return .toggleKeyLabels
         case .alignReset:        return .align(.reset)
         case .record:            return .toggleRecording
+        case .calibrate:         return .toggleCalibration
         case .slideLeft:         return .align(.moveX(-KeyboardAlignment.slideStep))
         case .slideRight:        return .align(.moveX(KeyboardAlignment.slideStep))
         case .keyLeft:           return .align(.moveX(-KeyboardAlignment.keyStep))
@@ -996,8 +1000,12 @@ final class ARMenuOverlay {
                                  : "◉  RECORD SESSION",
                fill: s.state.recording ? accentRed : neutral, size: 19)
 
+        button(calibRect, s.state.calibrating ? "STOP" : "CALIBRATE",
+               fill: s.state.calibrating ? accentGreen : neutral, size: 17)
+
         let hint = "Outlines show where the app thinks your keys are — line them up with the real ones. "
-            + "RECORD saves the mic audio plus every detection decision to Files › PianoAR › Diagnostics."
+            + "RECORD saves the mic audio and every decision to Files › PianoAR › Diagnostics. "
+            + "CALIBRATE (with RECORD on) names each note for you to play, so the log says exactly what was meant."
         let para = NSMutableParagraphStyle()
         para.alignment = .left
         para.lineBreakMode = .byWordWrapping

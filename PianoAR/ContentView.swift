@@ -21,6 +21,7 @@ struct ContentView: View {
     @StateObject private var keyTuning     = KeyTuning()
     @StateObject private var comfort       = ComfortSettings()
     @StateObject private var recorder      = SessionRecorder()
+    @StateObject private var calibration   = PianoCalibration()
 
     @State private var showDebug = false
     @AppStorage("ui.keyLabels") private var showKeyLabels = true
@@ -42,6 +43,7 @@ struct ContentView: View {
             showKeyLabels: showKeyLabels,
             alignment: alignment,
             recorder: recorder,
+            calibrationRun: calibration,
             availableSongs: allSongs
         )
         .ignoresSafeArea()
@@ -137,6 +139,14 @@ struct ContentView: View {
             showKeyLabels.toggle()
         case .toggleRecording:
             recorder.toggle()
+        case .toggleCalibration:
+            if calibration.active {
+                calibration.stop()
+            } else {
+                if songPlayer.isPlaying { songPlayer.stop() }
+                if !recorder.isRecording { recorder.start() }
+                calibration.start()
+            }
         }
     }
 }
