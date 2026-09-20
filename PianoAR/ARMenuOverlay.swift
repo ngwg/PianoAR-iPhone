@@ -131,30 +131,30 @@ final class ARMenuOverlay {
     private static let accessResetRect = CGRect(x: 648, y: 432, width: 276, height: 90)
 
     // Comfort
-    private static let viewDownRect  = CGRect(x: 560, y: 126, width: 80, height: 56)
-    private static let viewUpRect    = CGRect(x: 840, y: 126, width: 80, height: 56)
-    private static let lensDownRect  = CGRect(x: 560, y: 196, width: 80, height: 56)
-    private static let lensUpRect    = CGRect(x: 840, y: 196, width: 80, height: 56)
-    private static let smoothRect    = CGRect(x: 40,  y: 300, width: 430, height: 84)
-    private static let stereoRect    = CGRect(x: 490, y: 300, width: 430, height: 84)
-    private static let handStyleRect = CGRect(x: 40,  y: 400, width: 430, height: 84)
-    private static let comfortResetRect = CGRect(x: 490, y: 400, width: 430, height: 84)
+    private static let viewDownRect  = CGRect(x: 516, y: 124, width: 124, height: 78)
+    private static let viewUpRect    = CGRect(x: 800, y: 124, width: 124, height: 78)
+    private static let lensDownRect  = CGRect(x: 516, y: 212, width: 124, height: 78)
+    private static let lensUpRect    = CGRect(x: 800, y: 212, width: 124, height: 78)
+    private static let smoothRect    = CGRect(x: 36,  y: 302, width: 432, height: 78)
+    private static let stereoRect    = CGRect(x: 492, y: 302, width: 432, height: 78)
+    private static let handStyleRect = CGRect(x: 36,  y: 390, width: 432, height: 78)
+    private static let comfortResetRect = CGRect(x: 492, y: 390, width: 432, height: 78)
 
     // Setup
     // Setup: top row, then an ALIGN grid of labelled button pairs (two columns).
-    private static let mapRect       = CGRect(x: 24,  y: 118, width: 300, height: 76)
-    private static let debugRect     = CGRect(x: 340, y: 118, width: 268, height: 76)
-    private static let labelsRect    = CGRect(x: 624, y: 118, width: 312, height: 76)
+    private static let mapRect       = CGRect(x: 24,  y: 118, width: 300, height: 68)
+    private static let debugRect     = CGRect(x: 340, y: 118, width: 268, height: 68)
+    private static let labelsRect    = CGRect(x: 624, y: 118, width: 312, height: 68)
     private static func alignCell(row: Int, col: Int, button: Int) -> CGRect {
-        CGRect(x: (col == 0 ? 24 : 492) + 196 + CGFloat(button) * 124,
-               y: 218 + CGFloat(row) * 84, width: 118, height: 74)
+        CGRect(x: (col == 0 ? 24 : 492) + 194 + CGFloat(button) * 122,
+               y: 220 + CGFloat(row) * 76, width: 116, height: 70)
     }
     private static func alignLabel(row: Int, col: Int) -> CGRect {
-        CGRect(x: (col == 0 ? 24 : 492) + 6, y: 218 + CGFloat(row) * 84, width: 188, height: 74)
+        CGRect(x: (col == 0 ? 24 : 492) + 6, y: 220 + CGFloat(row) * 76, width: 186, height: 70)
     }
-    private static let alignResetRect = CGRect(x: 24, y: 480, width: 430, height: 80)
-    private static let recordRect     = CGRect(x: 492, y: 480, width: 300, height: 80)
-    private static let calibRect      = CGRect(x: 806, y: 480, width: 130, height: 80)
+    private static let alignResetRect = CGRect(x: 24,  y: 448, width: 430, height: 70)
+    private static let recordRect     = CGRect(x: 492, y: 448, width: 300, height: 70)
+    private static let calibRect      = CGRect(x: 806, y: 448, width: 130, height: 70)
 
     // Minimized pill
     private static let pillRect     = CGRect(x: 40,  y: 16, width: 880, height: 116)
@@ -1275,16 +1275,11 @@ final class ARMenuOverlay {
         button(handStyleRect, "HAND DISPLAY:  \(c.handStyle.label)", fill: neutral, size: 26)
         button(comfortResetRect, "RESET VIEW", fill: neutral, size: 26)
 
-        let hint = "Motion sick? Stare at a far edge and shake your head. World swings AGAINST "
-            + "your turn → lower VIEW SIZE. It DRAGS WITH you → raise it. Slide the headset "
-            + "lenses to your eyes, then set LENS SPACING until everything looks single and sharp."
-        let para = NSMutableParagraphStyle()
-        para.alignment = .center
-        para.lineBreakMode = .byWordWrapping
-        (hint as NSString).draw(in: CGRect(x: 50, y: 424, width: texW - 100, height: 130),
-                                withAttributes: [.font: fnt(24, .medium),
-                                                 .foregroundColor: UIColor(white: 1, alpha: 0.62),
-                                                 .paragraphStyle: para])
+        wrapped("Motion sick? Stare at a far edge and shake your head. World swings AGAINST your "
+                + "turn → lower VIEW SIZE. It DRAGS WITH you → raise it. Slide the headset lenses "
+                + "to your eyes, then set LENS SPACING until everything is single and sharp.",
+                in: CGRect(x: 44, y: 482, width: texW - 88, height: 80),
+                size: 21, align: .center, alpha: 0.62)
     }
 
     private static func drawSetup(_ s: PanelSnap) {
@@ -1294,7 +1289,7 @@ final class ARMenuOverlay {
         button(labelsRect, s.state.keyLabels ? "KEY LABELS:  ON" : "KEY LABELS:  OFF",
                fill: s.state.keyLabels ? accentGreen : neutral, size: 26)
 
-        centered(s.state.alignReadout, in: CGRect(x: 20, y: 182, width: texW - 40, height: 34),
+        centered(s.state.alignReadout, in: CGRect(x: 20, y: 190, width: texW - 40, height: 26),
                  font: monoFnt(22, .semibold),
                  color: UIColor(red: 0.55, green: 0.95, blue: 1.0, alpha: 0.9))
 
@@ -1321,16 +1316,10 @@ final class ARMenuOverlay {
         button(calibRect, s.state.calibrating ? "STOP" : "CALIBRATE",
                fill: s.state.calibrating ? accentGreen : neutral, size: 23)
 
-        let hint = "Outlines show where the app thinks your keys are — line them up with the real ones. "
-            + "RECORD saves the mic audio and every decision to Files › PianoAR › Diagnostics. "
-            + "CALIBRATE (with RECORD on) names each note for you to play, so the log says exactly what was meant."
-        let para = NSMutableParagraphStyle()
-        para.alignment = .left
-        para.lineBreakMode = .byWordWrapping
-        (hint as NSString).draw(in: CGRect(x: 30, y: 500, width: 900, height: 60),
-                                withAttributes: [.font: fnt(21, .medium),
-                                                 .foregroundColor: UIColor(white: 1, alpha: 0.55),
-                                                 .paragraphStyle: para])
+        wrapped("Outlines show where the app thinks your keys are — line them up with the real "
+                + "ones. RECORD logs the mic audio and every decision to Files › PianoAR; "
+                + "CALIBRATE names each note for you to play so the log knows what was meant.",
+                in: CGRect(x: 28, y: 524, width: 904, height: 42), size: 19)
     }
 
     private static func centered(_ text: String, in rect: CGRect, font: UIFont, color: UIColor) {
