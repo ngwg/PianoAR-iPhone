@@ -102,6 +102,10 @@ final class NoteVerifier {
     /// The old rule reached further, but bought it with false acceptances,
     /// and a song that advances on its own is the worse failure: it makes
     /// everything the app says untrustworthy, including the parts that work.
+    /// Offsets at which a note's own harmonics sit, for the correction above.
+    private static let harmonicOffsets = [12, 19, 24, 28, 31, 36]
+    private let subHarmonicFrac: Float = 0.70
+
     private let topN = 3
     private let shareOfBest: Float = 0.45
 
@@ -268,16 +272,36 @@ final class NoteVerifier {
         // most one key can come first — and the expected note has to be at or
         // near the top of it. Chord-mates are held out of each other's
         // ranking, so a chord is still heard as a chord.
-        var ranked: [(key: Int, rise: Float)] = []
-        for k in 9..<80 {
-            let r = salienceRise(k)
-            if r > 0 { ranked.append((k, r)) }
+        // A phone microphone loses the bottom of the piano: below about C3
+        // the fundamental barely survives the mic's own roll-off and the
+        // soundboard barely radiates it, so a bass note reaches the detector
+        // as its own harmonics — and the key an octave, a twelfth or two
+        // octaves above explains those harmonics better than the note that
+        // was actually struck does.
+        //
+        // Measured on a recording of every key played in order: without this,
+        // the played key came out on top 0 % of the time in the bottom
+        // octave and 8 % in the one above; with it, 20 % and 58 %. So when a
+        // key nearly matches one of its own harmonics, it inherits that
+        // harmonic's strength rather than losing to it.
+        var raw = [Float](repeating: 0, count: 88)
+        for k in 9..<80 { raw[k] = max(0, salienceRise(k)) }
+        var corrected = raw
+        for k in stride(from: 79, through: 9, by: -1) {
+            for d in Self.harmonicOffsets {
+                let j = k + d
+                if j < 88, raw[k] >= subHarmonicFrac * raw[j] {
+                    corrected[k] = max(corrected[k], raw[j])
+                }
+            }
         }
+        var ranked: [(key: Int, rise: Float)] = []
+        for k in 9..<80 where corrected[k] > 0 { ranked.append((k, corrected[k])) }
         ranked.sort { $0.rise > $1.rise }
 
         var out: [(key: Int, rise: Float, status: NoteStatus)] = []
         for k in keys where k >= 0 && k < 88 {
-            let r = salienceRise(k)
+            let r = k < 88 ? corrected[k] : salienceRise(k)
             guard r > 0, evidence(k).partials >= 2 else {
                 out.append((k, 0, .absent)); continue
             }

@@ -229,7 +229,7 @@ final class SongPlayer: ObservableObject {
         var changed = false
         while groupIndex < groups.count {
             let g = groups[groupIndex]
-            let pending = g.requiredKeys.subtracting(acceptedKeys)
+            let pending = requiredNow(of: g).subtracting(acceptedKeys)
             if pending.isEmpty, raw >= g.startBeat {
                 advance()
                 changed = true
@@ -384,7 +384,7 @@ final class SongPlayer: ObservableObject {
         stats.timingSamples += 1
         let played = g.items.first { $0.keyIndex == keyIndex }?.note.key ?? noteName
 
-        if g.requiredKeys.isSubset(of: acceptedKeys) {
+        if requiredNow(of: g).isSubset(of: acceptedKeys) {
             // Wait mode restarts the clock from this group's beat, so an
             // early press pulls the song forward and a late one resumes it.
             if waitMode { startHostTime = now - g.startBeat * 60.0 / effectiveBPM }
@@ -435,6 +435,29 @@ final class SongPlayer: ObservableObject {
             return i
         }
         return nil
+    }
+
+    /// The notes of a group that actually have to be heard.
+    ///
+    /// A phone microphone in a headset shell hears roughly three octaves of
+    /// the piano well. Measured against a recording of every key played in
+    /// order, the played note came out in the detector's top three 83-100 %
+    /// of the time between C3 and B5, but only 27 % in the bottom octave and
+    /// 52 % above C6. Requiring a note the microphone cannot hear does not
+    /// make the app stricter, it makes it stuck — which is exactly what a
+    /// left-hand bass note was doing to Fur Elise.
+    ///
+    /// So a group advances on the notes inside that range, and the rest are
+    /// credited with it. The trade is deliberate and worth being honest
+    /// about: the app is no longer checking the far ends of the keyboard, it
+    /// is taking them on trust. A group made up entirely of such notes is
+    /// still required, since there is nothing else to go on.
+    private static let trustedLow = 27      // C3
+    private static let trustedHigh = 62     // B5
+
+    func requiredNow(of g: NoteGroup) -> Set<Int> {
+        let trusted = g.requiredKeys.filter { $0 >= Self.trustedLow && $0 <= Self.trustedHigh }
+        return trusted.isEmpty ? g.requiredKeys : Set(trusted)
     }
 
     /// What to say when a note is not coming through. Silence is the worst
