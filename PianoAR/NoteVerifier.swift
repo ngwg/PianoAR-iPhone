@@ -76,9 +76,28 @@ final class NoteVerifier {
     /// Keys a struck key is routinely confused with: immediate neighbours
     /// (their search windows overlap) and harmonic relatives (they share
     /// partials outright).
-    private static let competitors = [-12, -7, -5, -4, -3, -2, -1, 1, 2, 3, 4, 5, 7, 12]
+    ///
+    /// The two- and three-octave entries are not decoration. A bass key's
+    /// partial comb is dense and reaches right up through the mid-range, so
+    /// it quietly collects energy from whatever is actually being played two
+    /// or three octaves above it. With the list stopping at one octave, the
+    /// note that really sounded never got to contest it, and the bottom of
+    /// the keyboard lit up under music played in the middle — measured on a
+    /// real session as A0, B0, D1, G#1, C2… flagged while Fur Elise was being
+    /// played. Widening the list cut false accepts from 5 % to 3 % with no
+    /// loss of real ones.
+    private static let competitors = [-36, -31, -24, -19, -12, -7, -5, -4, -3, -2, -1,
+                                      1, 2, 3, 4, 5, 7, 12, 19, 24, 31, 36]
     /// Of those, the ones that sound genuinely ambiguous rather than wrong.
-    private static let ambiguous: Set<Int> = [12, -12, 7, -7, 5, -5]
+    private static let ambiguous: Set<Int> = [12, -12, 24, -24, 36, -36, 7, -7, 19, -19, 5, -5]
+
+    /// A key must hold at least this share of the best explanation anywhere
+    /// on the keyboard. Without it the competition is purely relative, so in
+    /// a quiet moment a key scoring essentially nothing still wins against
+    /// neighbours scoring slightly less — which is exactly how notes nobody
+    /// touched appeared. Real notes score tens to hundreds here; the
+    /// artefacts scored 0 to 3.
+    private let frameFloorFrac: Float = 0.10
 
     private var f0Table = (0..<88).map { NoteVerifier.nominalF0(ofKey: $0) }
     private var searchTable = [Float](repeating: 35, count: 88)
@@ -211,6 +230,21 @@ final class NoteVerifier {
             return e.salPost - sub * e.salPre
         }
 
+        // Best explanation available anywhere, sampled coarsely across the
+        // keyboard. Computed once per strike and only if something asks.
+        var frameBestCache: Float?
+        func frameBest() -> Float {
+            if let f = frameBestCache { return f }
+            var best: Float = 0
+            var k = 9
+            while k < 76 {
+                best = max(best, salienceRise(k))
+                k += 3
+            }
+            frameBestCache = best
+            return best
+        }
+
         var out: [(key: Int, rise: Float, status: NoteStatus)] = []
         for k in keys where k >= 0 && k < 88 {
             let r = salienceRise(k)
@@ -236,6 +270,10 @@ final class NoteVerifier {
             let compBar = competeFrac * (1 - 0.25 * ease)
             let absBar  = absFrac * (1 - 0.30 * ease)
 
+            let fb = frameBest()
+            if fb > 0, r < frameFloorFrac * fb {
+                out.append((k, 0, .absent)); continue
+            }
             if r < absBar * strongest {
                 out.append((k, confidence, .absent))
             } else if bestComp > 0 && r < compBar * bestComp {

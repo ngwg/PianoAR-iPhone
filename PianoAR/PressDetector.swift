@@ -447,6 +447,11 @@ final class PressDetector: ObservableObject {
                     .filter({ !groupKeys.contains($0) && !upcoming.contains($0)
                               && v.status[$0] == .present && v.rise[$0] >= wrongRise })
                     .filter({ w in !groupKeys.contains { Self.isHarmonicRelative(w, $0) } })
+                    // A mistake is a near miss. Nobody aiming at a note in the
+                    // middle of the keyboard hits one three octaves below it,
+                    // so a "wrong note" that far out is the detector being
+                    // wrong, not the player.
+                    .filter({ w in groupKeys.contains { abs($0 - w) <= 12 } })
                     .max(by: { v.rise[$0] < v.rise[$1] }),
                direct.contains(where: { tipIsOnKey($0, KeyboardLayout.keys[wrong]) }) {
                 st.wrongReported = true
