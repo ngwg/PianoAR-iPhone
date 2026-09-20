@@ -890,6 +890,14 @@ final class ARMenuOverlay {
             centered("No songs", in: CGRect(x: 0, y: contentTop, width: texW, height: 200),
                      font: .systemFont(ofSize: 24, weight: .semibold), color: UIColor(white: 1, alpha: 0.5))
         }
+        // The library is not limited to what ships with the app, and nothing
+        // said so. Any MIDI file dropped into the app's folder shows up here,
+        // which is the answer for every piece that is still in copyright and
+        // so cannot be written into the app itself.
+        centered("Add your own: put a .mid file in Files › On My iPhone › PianoAR",
+                 in: CGRect(x: 0, y: 556, width: texW, height: 26),
+                 font: .systemFont(ofSize: 16, weight: .medium),
+                 color: UIColor(white: 1, alpha: 0.45))
         for (i, title) in s.pageTitles.enumerated() {
             let rect = libCellRect(i)
             let accent = accents[(s.page * libPerPage + i) % accents.count]
