@@ -15,12 +15,30 @@ final class NoteHighway {
 
     // MARK: Layout
     private static let sheetHeight: Float = 0.40
-    private static let lookAheadBeats: Float = 4
+    /// How far ahead the sheet shows, in **seconds** rather than beats.
+    ///
+    /// It used to be a fixed four beats, which means a fast piece shows less
+    /// warning than a slow one — exactly backwards. Dreiton runs at 120 bpm,
+    /// so four beats is two seconds; at nearly five notes a second that put
+    /// roughly ten notes into forty centimetres of sheet, stacked on top of
+    /// each other. Moonlight at 54 bpm got four and a half seconds for the
+    /// same space. Now every piece gets the same amount of *time*, with a
+    /// floor and a ceiling in beats so the grid never becomes meaningless.
+    private static let lookAheadSeconds: Float = 2.6
+    private static var lookAheadBeats: Float = 4
     private static var metersPerBeat: Float { sheetHeight / lookAheadBeats }
+
+    private static func updateLookAhead(bpm: Float) {
+        let beats = lookAheadSeconds * bpm / 60
+        lookAheadBeats = min(10, max(2.5, beats))
+    }
     private static let tilt: Float = 0.26               // ~15° back from vertical
     private static let barDepth: Float = 0.006
     private static let barGap: Float = 0.003
-    private static let barPoolSize = 64
+    // Eight simultaneous notes over two and a half seconds of a dense piece
+    // overflows sixty-four, and the overflow was silently dropped — notes
+    // simply missing from the preview.
+    private static let barPoolSize = 180
     private static let beatLineCount = 12
     private static let flashDuration: TimeInterval = 0.35
     private static let heardDuration: TimeInterval = 0.18
@@ -314,6 +332,7 @@ final class NoteHighway {
     }
 
     private func updateBars(player: SongPlayer, beat: Float) {
+        Self.updateLookAhead(bpm: Float(player.effectiveBPMNow))
         let mpb = Self.metersPerBeat
         let groupStart = player.currentGroupStartBeat()
         let accepted = player.acceptedKeys
@@ -343,6 +362,11 @@ final class NoteHighway {
             } else {
                 setMaterial(bar, note.isLeft ? Self.matBarLeft : Self.matBarRight)
             }
+            // While the song waits, everything stops — so a dense piece piles
+            // up at the hit line and it stops being obvious which notes are
+            // actually being asked for. Hold the current group at full
+            // strength and push the rest back.
+            bar.opacity = (player.isWaitingNow && !inCurrentGroup) ? 0.42 : 1.0
             bar.isHidden = false
 
             let edge = barEdges[i]

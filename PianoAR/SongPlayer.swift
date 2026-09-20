@@ -249,6 +249,17 @@ final class SongPlayer: ObservableObject {
         else if changed, feedback.hasPrefix("Get ready") { feedback = "" }
     }
 
+    /// Tempo actually in force, for anything that needs to convert beats to
+    /// seconds (the sheet's look-ahead).
+    var effectiveBPMNow: Double { effectiveBPM }
+
+    /// True when wait mode is holding the song on a group the player has not
+    /// finished — i.e. the sheet is frozen rather than scrolling.
+    var isWaitingNow: Bool {
+        guard isPlaying, !isComplete, waitMode, groupIndex < groups.count else { return false }
+        return !requiredNow(of: groups[groupIndex]).isSubset(of: acceptedKeys)
+    }
+
     /// Current song position in beats (render thread). In wait mode it holds
     /// at the next group until that group has been played.
     func beatNow() -> Double {
