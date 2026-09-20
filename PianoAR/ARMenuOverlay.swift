@@ -53,8 +53,8 @@ final class ARMenuOverlay {
     let rootNode = SCNNode()
 
     // ── Panel geometry ──────────────────────────────────────────────────────
-    private static let panW: Float = 0.48
-    private static let panH: Float = 0.32
+    private static let panW: Float = 0.58
+    private static let panH: Float = 0.39
     private static let texW: CGFloat = 960
     private static let texH: CGFloat = 640
 
@@ -86,39 +86,39 @@ final class ARMenuOverlay {
     private static let pageNextRect = CGRect(x: 828, y: 64, width: 110, height: 44)
 
     // Practice
-    private static let playRect      = CGRect(x: 330, y: 168, width: 300, height: 88)
-    private static let restartRect   = CGRect(x: 250, y: 268, width: 220, height: 52)
-    private static let skipRect      = CGRect(x: 490, y: 268, width: 220, height: 52)
-    private static let tempoDownRect = CGRect(x: 250, y: 350, width: 96, height: 60)
-    private static let tempoUpRect   = CGRect(x: 614, y: 350, width: 96, height: 60)
-    private static let handRect      = CGRect(x: 110, y: 450, width: 350, height: 64)
-    private static let waitRect      = CGRect(x: 500, y: 450, width: 350, height: 64)
+    private static let playRect      = CGRect(x: 270, y: 150, width: 420, height: 124)
+    private static let restartRect   = CGRect(x: 190, y: 292, width: 270, height: 84)
+    private static let skipRect      = CGRect(x: 500, y: 292, width: 270, height: 84)
+    private static let tempoDownRect = CGRect(x: 190, y: 394, width: 140, height: 84)
+    private static let tempoUpRect   = CGRect(x: 630, y: 394, width: 140, height: 84)
+    private static let handRect      = CGRect(x: 60,  y: 496, width: 400, height: 92)
+    private static let waitRect      = CGRect(x: 500, y: 496, width: 400, height: 92)
 
     // Comfort
     private static let viewDownRect  = CGRect(x: 560, y: 126, width: 80, height: 56)
     private static let viewUpRect    = CGRect(x: 840, y: 126, width: 80, height: 56)
     private static let lensDownRect  = CGRect(x: 560, y: 196, width: 80, height: 56)
     private static let lensUpRect    = CGRect(x: 840, y: 196, width: 80, height: 56)
-    private static let smoothRect    = CGRect(x: 40,  y: 272, width: 430, height: 60)
-    private static let stereoRect    = CGRect(x: 490, y: 272, width: 430, height: 60)
-    private static let handStyleRect = CGRect(x: 40,  y: 346, width: 430, height: 60)
-    private static let comfortResetRect = CGRect(x: 490, y: 346, width: 430, height: 60)
+    private static let smoothRect    = CGRect(x: 40,  y: 300, width: 430, height: 84)
+    private static let stereoRect    = CGRect(x: 490, y: 300, width: 430, height: 84)
+    private static let handStyleRect = CGRect(x: 40,  y: 400, width: 430, height: 84)
+    private static let comfortResetRect = CGRect(x: 490, y: 400, width: 430, height: 84)
 
     // Setup
     // Setup: top row, then an ALIGN grid of labelled button pairs (two columns).
-    private static let mapRect       = CGRect(x: 30,  y: 122, width: 300, height: 52)
-    private static let debugRect     = CGRect(x: 345, y: 122, width: 270, height: 52)
-    private static let labelsRect    = CGRect(x: 630, y: 122, width: 300, height: 52)
+    private static let mapRect       = CGRect(x: 24,  y: 118, width: 300, height: 76)
+    private static let debugRect     = CGRect(x: 340, y: 118, width: 268, height: 76)
+    private static let labelsRect    = CGRect(x: 624, y: 118, width: 312, height: 76)
     private static func alignCell(row: Int, col: Int, button: Int) -> CGRect {
-        CGRect(x: (col == 0 ? 30 : 495) + 200 + CGFloat(button) * 120,
-               y: 226 + CGFloat(row) * 70, width: 110, height: 60)
+        CGRect(x: (col == 0 ? 24 : 492) + 196 + CGFloat(button) * 124,
+               y: 218 + CGFloat(row) * 84, width: 118, height: 74)
     }
     private static func alignLabel(row: Int, col: Int) -> CGRect {
-        CGRect(x: (col == 0 ? 30 : 495) + 8, y: 226 + CGFloat(row) * 70, width: 190, height: 60)
+        CGRect(x: (col == 0 ? 24 : 492) + 6, y: 218 + CGFloat(row) * 84, width: 188, height: 74)
     }
-    private static let alignResetRect = CGRect(x: 30, y: 436, width: 430, height: 56)
-    private static let recordRect     = CGRect(x: 495, y: 436, width: 300, height: 56)
-    private static let calibRect      = CGRect(x: 805, y: 436, width: 125, height: 56)
+    private static let alignResetRect = CGRect(x: 24, y: 480, width: 430, height: 80)
+    private static let recordRect     = CGRect(x: 492, y: 480, width: 300, height: 80)
+    private static let calibRect      = CGRect(x: 806, y: 480, width: 130, height: 80)
 
     // Minimized pill
     private static let pillRect     = CGRect(x: 150, y: 16, width: 660, height: 116)
@@ -132,15 +132,26 @@ final class ARMenuOverlay {
     }
 
     // ── Default placement (right of keyboard centre, lifted, tilted) ────────
-    private static let initPos = SIMD3<Float>(KeyboardLayout.totalWidth * 0.30, 0.30, 0.18)
-    private static let initRotX: Float = -Float.pi * 0.28
-    private static let initRotY: Float = -Float.pi * 0.13
+    /// Centred above the keys and tilted toward the player.
+    ///
+    /// It used to sit 37 cm to the right of centre, which meant turning your
+    /// head to reach anything — and turning your head inside a headset is the
+    /// one movement that costs you the alignment you just set up. It only
+    /// appears when the song is stopped, so overlapping the note sheet costs
+    /// nothing.
+    private static let initPos = SIMD3<Float>(0, 0.30, 0.24)
+    private static let initRotX: Float = -Float.pi * 0.24
+    private static let initRotY: Float = 0
 
     // ── Cursor / click thresholds ───────────────────────────────────────────
     private static let tipMaxBehind: Float        = 0.12
     private static let pokeArmZ:     Float        = 0.080
     private static let pokeFireZ:    Float        = 0.015
-    private static let dwellTime:    TimeInterval = 0.65
+    // Dwell is the fallback when a pinch will not register, which inside a
+    // headset is often — the hands sit at the bottom edge of the camera and
+    // half occlude themselves. Making it quicker makes it a real alternative
+    // rather than a last resort.
+    private static let dwellTime:    TimeInterval = 0.45
     private static let debounce:     TimeInterval = 0.30
     private static let xyMargin:     Float        = 0.030
     private static let pinchOn:  Float = 0.022
@@ -151,7 +162,9 @@ final class ARMenuOverlay {
     private static let grabLostGrace: TimeInterval = 0.40
     private static let dragSmooth:    Float        = 0.45
     private static let yawSmooth:     Float        = 0.18
-    private static let stickyInflate: CGFloat = 34
+    // Once the cursor is on a control it takes a deliberate movement to
+    // leave it, so a tremor cannot slide the selection onto its neighbour.
+    private static let stickyInflate: CGFloat = 64
 
     // ── Distance-adaptive scale ─────────────────────────────────────────────
     private static let refDistance:   Float = 0.55
@@ -422,7 +435,9 @@ final class ARMenuOverlay {
 
             let sm: SIMD3<Float>
             if let prev = cursorSmoothed, cursorLeft == b.isLeft {
-                sm = prev + 0.5 * (b.local - prev)
+                // Was 0.5 — barely any smoothing, so the ray jittered with
+                // every frame of hand-tracking noise.
+                sm = prev + 0.28 * (b.local - prev)
             } else {
                 sm = b.local
             }
@@ -748,11 +763,15 @@ final class ARMenuOverlay {
 
     // MARK: - Baking  (main thread only — UIKit)
 
-    private static let accentBlue   = UIColor(red: 0.20, green: 0.52, blue: 1.00, alpha: 0.95)
-    private static let accentGreen  = UIColor(red: 0.12, green: 0.55, blue: 0.28, alpha: 0.95)
-    private static let accentRed    = UIColor(red: 0.82, green: 0.14, blue: 0.14, alpha: 0.95)
-    private static let accentPurple = UIColor(red: 0.42, green: 0.22, blue: 0.88, alpha: 0.95)
-    private static let neutral      = UIColor(white: 1, alpha: 0.10)
+    // Brighter than before, and the neutral state far lighter. Everything is
+    // seen through two plastic lenses inside a dark shell, which costs a lot
+    // of brightness and most of the saturation — colours that look right on a
+    // monitor read as grey mush in the headset.
+    private static let accentBlue   = UIColor(red: 0.32, green: 0.66, blue: 1.00, alpha: 1.00)
+    private static let accentGreen  = UIColor(red: 0.20, green: 0.80, blue: 0.44, alpha: 1.00)
+    private static let accentRed    = UIColor(red: 1.00, green: 0.30, blue: 0.30, alpha: 1.00)
+    private static let accentPurple = UIColor(red: 0.60, green: 0.40, blue: 1.00, alpha: 1.00)
+    private static let neutral      = UIColor(white: 1, alpha: 0.22)
 
     private static func bake(_ s: PanelSnap) -> UIImage {
         let sz = CGSize(width: texW, height: texH)
@@ -814,9 +833,9 @@ final class ARMenuOverlay {
         UIColor(red: 0.04, green: 0.03, blue: 0.11, alpha: 0.88).setFill()
         UIBezierPath(roundedRect: pillRect, cornerRadius: pillRect.height / 2).fill()
         button(pauseRect, s.state.isPlaying ? "❚❚  PAUSE" : "▶  PLAY",
-               fill: s.state.isPlaying ? accentRed : accentBlue, size: 28, weight: .heavy, radius: 40)
-        button(pillSkipRect, "SKIP  ▸▸", fill: neutral, size: 28, weight: .heavy, radius: 40)
-        button(menuRect, "☰  MENU", fill: accentPurple, size: 28, weight: .heavy, radius: 40)
+               fill: s.state.isPlaying ? accentRed : accentBlue, size: 34, weight: .heavy, radius: 40)
+        button(pillSkipRect, "SKIP  ▸▸", fill: neutral, size: 34, weight: .heavy, radius: 40)
+        button(menuRect, "☰  MENU", fill: accentPurple, size: 34, weight: .heavy, radius: 40)
     }
 
     private static func drawGrabHandle(_ s: PanelSnap) {
@@ -832,7 +851,7 @@ final class ARMenuOverlay {
         }
         let title = s.grabbing ? "MOVING…" : "PIANOAR"
         let attrs: [NSAttributedString.Key: Any] = [
-            .font: UIFont.systemFont(ofSize: 20, weight: .black),
+            .font: UIFont.systemFont(ofSize: 25, weight: .black),
             .foregroundColor: UIColor(white: 1, alpha: s.grabbing ? 0.95 : 0.65),
             .kern: 3.2 as NSObject,
         ]
@@ -841,7 +860,7 @@ final class ARMenuOverlay {
         if !s.grabbing {
             let hint = "PINCH & HOLD TO MOVE"
             let hAttrs: [NSAttributedString.Key: Any] = [
-                .font: UIFont.systemFont(ofSize: 16, weight: .semibold),
+                .font: UIFont.systemFont(ofSize: 21, weight: .semibold),
                 .foregroundColor: UIColor(white: 1, alpha: 0.45),
             ]
             let hsz = hint.size(withAttributes: hAttrs)
@@ -852,13 +871,13 @@ final class ARMenuOverlay {
 
     private static func drawHeader(_ s: PanelSnap) {
         centered(s.tab.title, in: CGRect(x: 0, y: handleH, width: texW, height: headerH),
-                 font: .systemFont(ofSize: 24, weight: .black), color: UIColor(white: 1, alpha: 0.6))
+                 font: .systemFont(ofSize: 29, weight: .black), color: UIColor(white: 1, alpha: 0.6))
         if s.state.isPlaying {
-            button(minimizeRect, "▾  MINIMIZE", fill: neutral, size: 18)
+            button(minimizeRect, "▾  MINIMIZE", fill: neutral, size: 24)
         }
         if s.tab == .library, s.pageCount > 1 {
-            button(pagePrevRect, "‹ PREV", fill: s.page > 0 ? neutral : UIColor(white: 1, alpha: 0.03), size: 18)
-            button(pageNextRect, "NEXT ›", fill: s.page < s.pageCount - 1 ? neutral : UIColor(white: 1, alpha: 0.03), size: 18)
+            button(pagePrevRect, "‹ PREV", fill: s.page > 0 ? neutral : UIColor(white: 1, alpha: 0.03), size: 24)
+            button(pageNextRect, "NEXT ›", fill: s.page < s.pageCount - 1 ? neutral : UIColor(white: 1, alpha: 0.03), size: 24)
         }
     }
 
@@ -871,7 +890,7 @@ final class ARMenuOverlay {
                 accentPurple.setFill()
                 UIBezierPath(rect: r).fill()
             }
-            centered(t.title, in: r, font: .systemFont(ofSize: 20, weight: .bold),
+            centered(t.title, in: r, font: .systemFont(ofSize: 25, weight: .bold),
                      color: t == s.tab ? .white : UIColor(white: 1, alpha: 0.45))
         }
         UIColor(white: 1, alpha: 0.16).setFill()
@@ -888,7 +907,7 @@ final class ARMenuOverlay {
         ]
         if s.pageTitles.isEmpty {
             centered("No songs", in: CGRect(x: 0, y: contentTop, width: texW, height: 200),
-                     font: .systemFont(ofSize: 24, weight: .semibold), color: UIColor(white: 1, alpha: 0.5))
+                     font: .systemFont(ofSize: 29, weight: .semibold), color: UIColor(white: 1, alpha: 0.5))
         }
         // The library is not limited to what ships with the app, and nothing
         // said so. Any MIDI file dropped into the app's folder shows up here,
@@ -896,7 +915,7 @@ final class ARMenuOverlay {
         // so cannot be written into the app itself.
         centered("Add your own: put a .mid file in Files › On My iPhone › PianoAR",
                  in: CGRect(x: 0, y: 556, width: texW, height: 26),
-                 font: .systemFont(ofSize: 16, weight: .medium),
+                 font: .systemFont(ofSize: 21, weight: .medium),
                  color: UIColor(white: 1, alpha: 0.45))
         for (i, title) in s.pageTitles.enumerated() {
             let rect = libCellRect(i)
@@ -910,16 +929,16 @@ final class ARMenuOverlay {
             let chip = CGRect(x: rect.minX + 10, y: rect.midY - 18, width: 36, height: 36)
             accent.setFill()
             UIBezierPath(roundedRect: chip, cornerRadius: 10).fill()
-            centered("♪", in: chip, font: .systemFont(ofSize: 20, weight: .bold), color: .white)
+            centered("♪", in: chip, font: .systemFont(ofSize: 25, weight: .bold), color: .white)
             let textRect = CGRect(x: chip.maxX + 10, y: rect.minY,
                                   width: rect.maxX - chip.maxX - 18, height: rect.height)
             leftTruncated(title.isEmpty ? "Untitled" : title, in: textRect,
-                          font: .systemFont(ofSize: 20, weight: .semibold), color: .white)
+                          font: .systemFont(ofSize: 25, weight: .semibold), color: .white)
         }
         if s.pageCount > 1 {
             centered("\(s.page + 1) / \(s.pageCount)",
                      in: CGRect(x: 0, y: tabTop - 30, width: texW, height: 26),
-                     font: .systemFont(ofSize: 16, weight: .bold), color: UIColor(white: 1, alpha: 0.45))
+                     font: .systemFont(ofSize: 21, weight: .bold), color: UIColor(white: 1, alpha: 0.45))
         }
     }
 
@@ -927,43 +946,43 @@ final class ARMenuOverlay {
         let st = s.state
         centered(st.currentTitle.isEmpty ? "Pick a song in LIBRARY" : st.currentTitle,
                  in: CGRect(x: 40, y: contentTop + 2, width: texW - 80, height: 44),
-                 font: .systemFont(ofSize: 26, weight: .heavy), color: .white)
+                 font: .systemFont(ofSize: 31, weight: .heavy), color: .white)
         button(playRect, st.isPlaying ? "❚❚   PAUSE" : "▶   PLAY",
-               fill: st.isPlaying ? accentRed : accentBlue, size: 36, weight: .black, radius: 24)
-        button(restartRect, "↺   RESTART", fill: neutral, size: 22)
-        button(skipRect, "SKIP NOTE  ▸▸", fill: neutral, size: 22)
-        button(tempoDownRect, "−", fill: neutral, size: 40, weight: .black)
-        button(tempoUpRect, "+", fill: neutral, size: 40, weight: .black)
+               fill: st.isPlaying ? accentRed : accentBlue, size: 42, weight: .black, radius: 24)
+        button(restartRect, "↺   RESTART", fill: neutral, size: 28)
+        button(skipRect, "SKIP NOTE  ▸▸", fill: neutral, size: 28)
+        button(tempoDownRect, "−", fill: neutral, size: 46, weight: .black)
+        button(tempoUpRect, "+", fill: neutral, size: 46, weight: .black)
         centered("TEMPO  \(st.tempoPercent)%",
                  in: CGRect(x: tempoDownRect.maxX, y: tempoDownRect.minY,
                             width: tempoUpRect.minX - tempoDownRect.maxX, height: tempoDownRect.height),
-                 font: .systemFont(ofSize: 28, weight: .heavy), color: .white)
-        button(handRect, "HANDS:  \(st.hand.label)", fill: neutral, size: 21)
+                 font: .systemFont(ofSize: 33, weight: .heavy), color: .white)
+        button(handRect, "HANDS:  \(st.hand.label)", fill: neutral, size: 27)
         button(waitRect, st.waitMode ? "MODE:  WAIT FOR ME" : "MODE:  PLAY-ALONG",
-               fill: st.waitMode ? accentGreen : accentPurple, size: 21)
+               fill: st.waitMode ? accentGreen : accentPurple, size: 27)
     }
 
     private static func drawComfort(_ s: PanelSnap) {
         let c = s.state.comfort
-        let labelFont = UIFont.systemFont(ofSize: 22, weight: .heavy)
-        let valueFont = UIFont.systemFont(ofSize: 28, weight: .heavy)
+        let labelFont = UIFont.systemFont(ofSize: 27, weight: .heavy)
+        let valueFont = UIFont.systemFont(ofSize: 33, weight: .heavy)
         leftTruncated("VIEW SIZE", in: CGRect(x: 40, y: viewDownRect.minY, width: 480, height: viewDownRect.height),
                       font: labelFont, color: .white)
         leftTruncated("LENS SPACING", in: CGRect(x: 40, y: lensDownRect.minY, width: 480, height: lensDownRect.height),
                       font: labelFont, color: .white)
         for (down, up, value) in [(viewDownRect, viewUpRect, "\(Int((c.viewScale * 100).rounded()))%"),
                                   (lensDownRect, lensUpRect, String(format: "%.1f mm", c.lensSpacingMM))] {
-            button(down, "−", fill: neutral, size: 34, weight: .black)
-            button(up, "+", fill: neutral, size: 34, weight: .black)
+            button(down, "−", fill: neutral, size: 40, weight: .black)
+            button(up, "+", fill: neutral, size: 40, weight: .black)
             centered(value, in: CGRect(x: down.maxX, y: down.minY, width: up.minX - down.maxX, height: down.height),
                      font: valueFont, color: .white)
         }
         button(smoothRect, c.motionSmoothing ? "MOTION SMOOTHING:  ON" : "MOTION SMOOTHING:  OFF",
-               fill: c.motionSmoothing ? accentGreen : neutral, size: 20)
+               fill: c.motionSmoothing ? accentGreen : neutral, size: 26)
         button(stereoRect, c.stereoMode == .dual ? "RENDER:  DUAL" : "RENDER:  SINGLE (FAST)",
-               fill: c.stereoMode == .dual ? neutral : accentPurple, size: 20)
-        button(handStyleRect, "HAND DISPLAY:  \(c.handStyle.label)", fill: neutral, size: 20)
-        button(comfortResetRect, "RESET VIEW", fill: neutral, size: 20)
+               fill: c.stereoMode == .dual ? neutral : accentPurple, size: 26)
+        button(handStyleRect, "HAND DISPLAY:  \(c.handStyle.label)", fill: neutral, size: 26)
+        button(comfortResetRect, "RESET VIEW", fill: neutral, size: 26)
 
         let hint = "Motion sick? Stare at a far edge and shake your head. World swings AGAINST "
             + "your turn → lower VIEW SIZE. It DRAGS WITH you → raise it. Slide the headset "
@@ -972,20 +991,20 @@ final class ARMenuOverlay {
         para.alignment = .center
         para.lineBreakMode = .byWordWrapping
         (hint as NSString).draw(in: CGRect(x: 50, y: 424, width: texW - 100, height: 130),
-                                withAttributes: [.font: UIFont.systemFont(ofSize: 19, weight: .medium),
+                                withAttributes: [.font: UIFont.systemFont(ofSize: 24, weight: .medium),
                                                  .foregroundColor: UIColor(white: 1, alpha: 0.62),
                                                  .paragraphStyle: para])
     }
 
     private static func drawSetup(_ s: PanelSnap) {
-        button(mapRect, "⌖  MAP KEYS (PINCH)", fill: accentBlue, size: 20)
+        button(mapRect, "⌖  MAP KEYS (PINCH)", fill: accentBlue, size: 26)
         button(debugRect, s.state.debugOn ? "DEBUG:  ON" : "DEBUG:  OFF",
-               fill: s.state.debugOn ? accentGreen : neutral, size: 20)
+               fill: s.state.debugOn ? accentGreen : neutral, size: 26)
         button(labelsRect, s.state.keyLabels ? "KEY LABELS:  ON" : "KEY LABELS:  OFF",
-               fill: s.state.keyLabels ? accentGreen : neutral, size: 20)
+               fill: s.state.keyLabels ? accentGreen : neutral, size: 26)
 
         centered(s.state.alignReadout, in: CGRect(x: 20, y: 182, width: texW - 40, height: 34),
-                 font: .monospacedDigitSystemFont(ofSize: 17, weight: .semibold),
+                 font: .monospacedDigitSystemFont(ofSize: 22, weight: .semibold),
                  color: UIColor(red: 0.55, green: 0.95, blue: 1.0, alpha: 0.9))
 
         let rows: [(label: String, minus: String, plus: String)] = [
@@ -993,23 +1012,23 @@ final class ARMenuOverlay {
             ("DEPTH", "▲ away", "▼ near"), ("WIDTH", "−", "+"),
             ("TURN", "↺", "↻"), ("HEIGHT", "▼", "▲"),
         ]
-        let labelFont = UIFont.systemFont(ofSize: 19, weight: .heavy)
+        let labelFont = UIFont.systemFont(ofSize: 24, weight: .heavy)
         for (i, r) in rows.enumerated() {
             let row = i / 2, col = i % 2
             leftTruncated(r.label, in: alignLabel(row: row, col: col), font: labelFont,
                           color: UIColor(white: 1, alpha: 0.75))
-            button(alignCell(row: row, col: col, button: 0), r.minus, fill: neutral, size: 24, weight: .black)
-            button(alignCell(row: row, col: col, button: 1), r.plus, fill: neutral, size: 24, weight: .black)
+            button(alignCell(row: row, col: col, button: 0), r.minus, fill: neutral, size: 30, weight: .black)
+            button(alignCell(row: row, col: col, button: 1), r.plus, fill: neutral, size: 30, weight: .black)
         }
-        button(alignResetRect, "RESET ALIGNMENT", fill: neutral, size: 19)
+        button(alignResetRect, "RESET ALIGNMENT", fill: neutral, size: 25)
         button(recordRect,
                s.state.recording ? String(format: "● RECORDING  %d:%02d",
                                           s.state.recordSeconds / 60, s.state.recordSeconds % 60)
                                  : "◉  RECORD SESSION",
-               fill: s.state.recording ? accentRed : neutral, size: 19)
+               fill: s.state.recording ? accentRed : neutral, size: 25)
 
         button(calibRect, s.state.calibrating ? "STOP" : "CALIBRATE",
-               fill: s.state.calibrating ? accentGreen : neutral, size: 17)
+               fill: s.state.calibrating ? accentGreen : neutral, size: 23)
 
         let hint = "Outlines show where the app thinks your keys are — line them up with the real ones. "
             + "RECORD saves the mic audio and every decision to Files › PianoAR › Diagnostics. "
@@ -1018,7 +1037,7 @@ final class ARMenuOverlay {
         para.alignment = .left
         para.lineBreakMode = .byWordWrapping
         (hint as NSString).draw(in: CGRect(x: 30, y: 500, width: 900, height: 60),
-                                withAttributes: [.font: UIFont.systemFont(ofSize: 16, weight: .medium),
+                                withAttributes: [.font: UIFont.systemFont(ofSize: 21, weight: .medium),
                                                  .foregroundColor: UIColor(white: 1, alpha: 0.55),
                                                  .paragraphStyle: para])
     }
