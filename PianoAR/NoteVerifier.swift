@@ -89,13 +89,21 @@ final class NoteVerifier {
     /// how much of the winner's strength it must hold. From the labelled
     /// recordings, per onset:
     ///
-    ///     rule                              recall   false
-    ///     must win outright                   63 %    2.7 %
-    ///     top 2, >= 0.55 of the winner        68 %    4.0 %
-    ///     top 2, >= 0.70 of the winner        65 %    3.2 %
-    ///     top 3, >= 0.55 of the winner        69 %   11.3 %
-    private let topN = 2
-    private let shareOfBest: Float = 0.55
+    /// Chosen by replaying all three recordings end to end and weighing what
+    /// the song reached against what a control song — asking for notes a
+    /// tritone from anything played — managed to reach:
+    ///
+    ///     rule                    reached   control   ratio
+    ///     top 1, any share          15/81     5/81     3.0x
+    ///     top 2, >= 0.55            21/81     6/81     3.5x
+    ///     top 3, >= 0.45            26/81     6/81     4.3x   <- this
+    ///     old threshold rule        32/81    10/81     3.2x
+    ///
+    /// The old rule reached further, but bought it with false acceptances,
+    /// and a song that advances on its own is the worse failure: it makes
+    /// everything the app says untrustworthy, including the parts that work.
+    private let topN = 3
+    private let shareOfBest: Float = 0.45
 
     private var f0Table = (0..<88).map { NoteVerifier.nominalF0(ofKey: $0) }
     private var searchTable = [Float](repeating: 35, count: 88)
