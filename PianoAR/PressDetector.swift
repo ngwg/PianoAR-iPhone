@@ -382,7 +382,12 @@ final class PressDetector: ObservableObject {
             }
             let verification = snap.verification(for: attack.id)
 
-            for k in remaining.sorted() where k >= 0 && k < KeyboardLayout.keys.count {
+            // While stuck, also listen for the notes just ahead, so a player
+            // who has carried on with the piece can be caught up with rather
+            // than played at.
+            var look = remaining
+            if struggling { look.formUnion(upcoming) }
+            for k in look.sorted() where k >= 0 && k < KeyboardLayout.keys.count {
                 let key = KeyboardLayout.keys[k]
                 let handNear = onBoard.contains { abs($0.localX - key.xCenter) <= reach }
                 let onKey = direct.contains { tipIsOnKey($0, key) }
@@ -425,6 +430,7 @@ final class PressDetector: ObservableObject {
                 guard let c = confidence else { continue }
                 st.acceptedKeys.insert(k)
                 remaining.remove(k)
+                _ = upcoming
                 lastKeyPressTime[k] = time
                 events.append(PressEvent(keyIndex: k, noteName: key.noteName,
                                          confidence: min(1, c), fingerID: "audio",

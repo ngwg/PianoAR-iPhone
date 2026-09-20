@@ -122,8 +122,10 @@ final class SongPlayer: ObservableObject {
     /// When the current group came up, and how long a player is left waiting
     /// before the app admits it might be the one at fault.
     private var groupEnteredAt: TimeInterval = 0
-    private let slowAfter:  TimeInterval = 4
-    private let stuckAfter: TimeInterval = 9
+    // Measured on a real session: stalls ran 10-18 s while the player kept
+    // trying. Four seconds was too long to wait before helping.
+    private let slowAfter:  TimeInterval = 2.5
+    private let stuckAfter: TimeInterval = 6
 
     /// 0 = fine. 1 = this is taking a while: say what the microphone can
     /// hear, so the player knows whether to play louder or fix the mount.
@@ -323,6 +325,26 @@ final class SongPlayer: ObservableObject {
         let raw = rawBeat(at: min(now, strikeTime ?? now))
         if !waitMode, raw < g.startBeat - earlySeconds * effectiveBPM / 60.0 { return .ignored }
 
+        // Caught up. In wait mode the song holds on one group while the
+        // player, who cannot hear the app, carries on with the piece — so a
+        // single missed note used to cost ten to eighteen seconds of playing
+        // into a wall. If the note that just arrived belongs to a group a
+        // little further on, the player is ahead of us, not wrong: pass over
+        // what was skipped and rejoin them.
+        if waitMode, struggle >= 1, !g.allKeys.contains(keyIndex),
+           let jump = upcomingGroupIndex(containing: keyIndex) {
+            let skipped = groups[groupIndex..<jump]
+                .reduce(0) { $0 + $1.requiredKeys.count }
+            stats.missed += skipped
+            stats.streak = 0
+            groupIndex = jump
+            acceptedKeys = []
+            groupSerial &+= 1
+            groupEnteredAt = CACurrentMediaTime()
+            feedback = "Caught up"
+            return registerPress(keyIndex: keyIndex, noteName: noteName, at: strikeTime)
+        }
+
         guard g.allKeys.contains(keyIndex) else {
             stats.mistakes += 1
             stats.streak = 0
@@ -387,6 +409,18 @@ final class SongPlayer: ObservableObject {
         )
     }
 
+    /// The nearest group just ahead of the current one that wants this key.
+    /// Deliberately short-sighted: two groups, so a wrong note that happens
+    /// to appear later in the piece cannot throw the song forward.
+    private func upcomingGroupIndex(containing key: Int) -> Int? {
+        let end = min(groups.count, groupIndex + 3)
+        guard groupIndex + 1 < end else { return nil }
+        for i in (groupIndex + 1)..<end where groups[i].requiredKeys.contains(key) {
+            return i
+        }
+        return nil
+    }
+
     /// What to say when a note is not coming through. Silence is the worst
     /// answer here: the player cannot tell "the app can't hear me" from
     /// "I am playing it wrong", and with no way to tell, people end up
@@ -394,7 +428,7 @@ final class SongPlayer: ObservableObject {
     private func hint(_ pending: String) -> String? {
         guard !pending.isEmpty else { return nil }
         switch struggle {
-        case 1:  return "Waiting for \(pending) — try playing it a little firmer"
+        case 1:  return "Waiting for \(pending) — play it again, or carry on"
         case 2:  return "Still can't hear \(pending) — tap SKIP to move on"
         default: return nil
         }

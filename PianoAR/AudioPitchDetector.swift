@@ -156,7 +156,17 @@ final class AudioPitchDetector: ObservableObject {
     /// Diagnostics (SETUP › RECORD): raw microphone + every verdict.
     weak var recorder: SessionRecorder?
 
-    func setExpectedKeys(_ keys: Set<Int>) { expectedKeys.set(keys) }
+    /// How long the player has been stuck on the current note (0 = fine,
+    /// 1 = a few seconds, 2 = stuck). A player who has been trying the same
+    /// note for several seconds is almost certainly playing the right one, so
+    /// the verdict for the *expected* keys — and only those — is loosened.
+    /// This is the score's prior used where it is safest to use it.
+    private let relaxLevel = Locked<Int>(0)
+
+    func setExpectedKeys(_ keys: Set<Int>, relax: Int = 0) {
+        expectedKeys.set(keys)
+        relaxLevel.set(relax)
+    }
 
     /// Verification stages: (post-onset delay in s, verifier, low-register keys?).
     /// Two looks at middle/treble cover chords that are rolled or slightly
@@ -487,6 +497,7 @@ final class AudioPitchDetector: ObservableObject {
         let stageList = stages
         var remaining: [PendingVerification] = []
 
+        let relax = relaxLevel.get()
         for var p in pending {
             let chord = p.chord
             for (si, stage) in stageList.enumerated() where !p.stagesDone.contains(si) {
@@ -514,7 +525,7 @@ final class AudioPitchDetector: ObservableObject {
                 let results = stage.verifier.evaluate(pre: pre, post: post,
                                                       sampleRate: Float(sampleRate),
                                                       keys: keys, chord: chord,
-                                                      ringing: ringing)
+                                                      ringing: ringing, relax: relax)
                 for r in results where r.status == .present {
                     lastHeard[r.key] = max(lastHeard[r.key], p.timestamp)
                 }

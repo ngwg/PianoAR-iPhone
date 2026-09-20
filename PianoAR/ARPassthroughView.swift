@@ -173,7 +173,7 @@ struct ARPassthroughView: UIViewRepresentable {
                     "pending": pending.sorted(),
                 ])
             }
-            audioDetector.setExpectedKeys(groupKeys)
+            audioDetector.setExpectedKeys(groupKeys, relax: songPlayer.struggle)
 
             hand3D?.update(hands: hands, style: cfg.comfort.handStyle,
                            menu: menuOverlay, keyboardNode: keyboardNode)
@@ -231,7 +231,7 @@ struct ARPassthroughView: UIViewRepresentable {
                 expectedKeyIndices: pending,
                 groupKeyIndices: groupKeys,
                 upcomingKeyIndices: songPlayer.upcomingKeyIndices(),
-                struggling: songPlayer.struggle >= 2,
+                struggling: songPlayer.struggle >= 1,
                 groupSerial: songPlayer.groupSerial,
                 keyTuning: keyTuning
             )

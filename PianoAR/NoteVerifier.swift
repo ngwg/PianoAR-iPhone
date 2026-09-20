@@ -120,9 +120,14 @@ final class NoteVerifier {
     ///     with each other.
     ///   - ringing: keys already sounding. Their pre-onset salience is fully
     ///     subtracted, so a decaying note cannot read as a fresh one.
+    ///   - relax: 0 normally. 1 or 2 when the player has been stuck on this
+    ///     note for seconds — the bar drops for the expected keys only, since
+    ///     by then the odds that they are playing the right note are
+    ///     overwhelming and the cost of waiting longer is worse.
     func evaluate(pre: [Float], post: [Float], sampleRate: Float,
                   keys: [Int], chord: Set<Int>,
-                  ringing: Set<Int> = []) -> [(key: Int, rise: Float, status: NoteStatus)] {
+                  ringing: Set<Int> = [],
+                  relax: Int = 0) -> [(key: Int, rise: Float, status: NoteStatus)] {
         guard pre.count == fftN, post.count == fftN, sampleRate > 0 else { return [] }
         let tuning = PianoTuning.shared.snapshot()
         for k in 0..<88 {
@@ -227,9 +232,13 @@ final class NoteVerifier {
             let strongest = max(r, bestComp)
             let confidence = simd_clamp(r / max(strongest, 1e-6), 0, 1)
 
-            if r < absFrac * strongest {
+            let ease = chord.contains(k) ? Float(min(2, max(0, relax))) : 0
+            let compBar = competeFrac * (1 - 0.25 * ease)
+            let absBar  = absFrac * (1 - 0.30 * ease)
+
+            if r < absBar * strongest {
                 out.append((k, confidence, .absent))
-            } else if bestComp > 0 && r < competeFrac * bestComp {
+            } else if bestComp > 0 && r < compBar * bestComp {
                 // Something else explains it better. If that something is an
                 // octave or a fifth away the two genuinely overlap and sound
                 // cannot separate them; anything else means this wasn't it.

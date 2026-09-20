@@ -60,7 +60,8 @@ final class SessionRecorder: ObservableObject {
 
     func stop() {
         guard isRecording else { return }
-        log("session", ["stop": CACurrentMediaTime()])
+        log("session", ["stop": CACurrentMediaTime(), "wavBytes": wavBytes,
+                        "wavOpen": wav != nil])
         active.set(false)
         queue.async { [weak self] in
             guard let self else { return }
