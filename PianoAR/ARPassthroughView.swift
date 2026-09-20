@@ -113,6 +113,9 @@ struct ARPassthroughView: UIViewRepresentable {
         private var fps: Double = 60
         private var camFPS: Double = 60
         private var lastCamStamp: TimeInterval = 0
+        /// What the view is currently being asked for, captured in the render
+        /// pass so the debug readout (which has no view) can report it.
+        private var renderTarget: Int = 120
         private var loggedSerial = -1
         private var lastTuningSave: TimeInterval = 0
         private var wasRecording = false
@@ -152,6 +155,7 @@ struct ARPassthroughView: UIViewRepresentable {
                 fps += (1 / (time - lastFrameTime) - fps) * 0.05
             }
             lastFrameTime = time
+            renderTarget = sceneView.preferredFramesPerSecond
 
             // At 120 Hz the renderer runs twice per camera frame. Anything
             // that reads the camera image must not: a second Vision pass over
@@ -351,7 +355,7 @@ struct ARPassthroughView: UIViewRepresentable {
             var lines = [
                 "— SYSTEM",
                 String(format: "render %.0f/%d Hz · camera %.0f fps · %@",
-                       fps, sceneView.preferredFramesPerSecond, camFPS, thermal),
+                       fps, renderTarget, camFPS, thermal),
                 "\(ARSessionModel.cameraFormatDescription) · tracking \(tracking)",
                 "hands \(hands.count) · LiDAR depth \(depth ? "yes" : "no")",
                 "— PRESS DETECTION",
