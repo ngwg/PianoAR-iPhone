@@ -258,6 +258,52 @@ a piano nobody can hear; this is how a real session gets replayed offline.
 
 ## 8. Known gaps / next steps
 
+### What the microphone can and cannot hear (v3.4, measured)
+
+Jop played every key of the piano in order and recorded it. Aligning those 88
+onsets to A0..C8 gives exact ground truth per key, on the real instrument
+through the real microphone. How often the played key lands in the detector's
+top three:
+
+| register | top-3 | strongest partial (measured) |
+|---|---|---|
+| A0-B1 | 27 % -> 47 % | the **10th** |
+| C2-B2 | 67 % -> 83 % | the 3rd |
+| C3-B3 | 83 % | the 2nd |
+| C4-B4 | 92 % | the 1st |
+| C5-B5 | **100 %** | the 1st |
+| C6-C8 | 52 % | the 1st |
+
+(arrows = after the sub-harmonic correction.) At A2 the fundamental arrives
+**28 dB below the third partial**: the soundboard barely radiates 110 Hz and
+the phone rolls off what survives. This is physics plus hardware, not
+thresholds, and it is why `SongPlayer.requiredNow` stops the far ends of the
+keyboard from blocking a song.
+
+On real playing (three Fur Elise recordings, onsets labelled by aligning the
+audio to the score): **77 % recall at 7 % false acceptance per onset.**
+
+### Things measured and rejected — do not re-try without new evidence
+
+| idea | result |
+|---|---|
+| Lower/raise the competition bar | strictly a trade along one curve; 0.45 is the knee |
+| Relaxing the bar while stuck | 91 % recall at **19 % false** — the runaway |
+| Accepting the ambiguous octave verdicts | 93 % recall at **22 % false** |
+| Extra analysis windows (+120 ms, 4 stages) | no recall gained, precision lost |
+| Judging only on partials two keys don't share | recall collapses to 49 % |
+| Per-key templates measured from the sweep | +40 pts on isolated bass notes, but **-15 pts on real playing** — a single sample does not survive pedal and overlap |
+| The measured stretch curve in place of the inharmonicity model | 69 % vs 72 %, no gain |
+| Spotify Basic Pitch (ONNX, run offline on the recordings) | 74 % / 9 % — comparable, not better. **21 of 99 real notes are invisible to both it and the salience detector** |
+
+That last row is the ceiling: a fifth of the notes leave no usable trace in
+these recordings. Better audio (a mic nearer the piano, or a lossless
+transfer — every recording so far arrives re-encoded as ~120 kbps AAC) is
+the only thing that moves it.
+
+Analysis harness: `sim.py`, `align.py`, `tune.py`, `identify.py`, `sweepalign.py`
+in the analysis scratch; they replay a recording through the whole pipeline.
+
 ### End-to-end validation (v2.7)
 
 The whole guided path — SuperFlux onsets, salience verifier, acceptance rules,
