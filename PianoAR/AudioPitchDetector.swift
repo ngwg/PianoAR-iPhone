@@ -125,16 +125,18 @@ final class AudioPitchDetector: ObservableObject {
     private var spectrum: [Float]
     private var prevSpectrum: [Float]
 
-    // Long ring buffer: holds enough history for the verifier's pre-onset
-    // window plus its post-onset window (0.68 s @ 48 kHz).
-    private static let ringN = 32_768
+    // Long ring buffer: the pre window ends 100 ms before the onset and the
+    // post window runs to +336 ms, so about 0.62 s must stay addressable.
+    // 65536 is 1.36 s at 48 kHz — room to spare.
+    private static let ringN = 65_536
     private var ring: [Float]
     private var written: Int = 0          // total samples ever written
     private var hopFill = 0
 
     // Expected-note verification
-    private let verifier4k = NoteVerifier(fftN: 4096)   // 85 ms: middle + treble
-    private let verifier8k = NoteVerifier(fftN: 8192)   // 171 ms: bass semitones need the resolution
+    // 8192 points = 186 ms at 44.1 kHz: 5.4 Hz bins, which is what it takes
+    // to tell one semitone from the next (see `stages`).
+    private let verifier8k = NoteVerifier(fftN: 8192)
     private struct PendingVerification {
         let attackID: Int
         let onsetSample: Int
@@ -172,17 +174,34 @@ final class AudioPitchDetector: ObservableObject {
     /// Two looks at middle/treble cover chords that are rolled or slightly
     /// spread; the bass waits for the long window.
     private static let bassSplitKey = 27   // C3 (~131 Hz) and above use the 4k window
-    /// One look, 35 ms after the onset — past the hammer transient (20-40 ms
-    /// of broadband noise, inside which every key in the register shows
-    /// energy) and on the steady partials.
+    /// One look, 8192 points, 150 ms after the onset.
     ///
-    /// There used to be a second look at +120 ms for rolled chords. Measured
-    /// against labelled ground truth it bought no recall at all and cost
-    /// precision — 80 %/5.9 % with one look against 80 %/7.8 % with two —
-    /// because the later window catches the *next* note as often as the
-    /// spread of this one. Four looks were worse still.
+    /// The window length is the whole ballgame and it was wrong. At 4096
+    /// points and 44.1 kHz the bins are 10.8 Hz apart — but a semitone at C4
+    /// spans only 15 Hz, so **two adjacent keys sat 1.4 bins apart**. The
+    /// analysis literally could not resolve one note from its neighbour
+    /// through most of the keyboard, which is why every attempt to fix this
+    /// by moving thresholds ran into the same ceiling. At 8192 they are 2.8
+    /// bins apart, which is enough.
+    ///
+    /// The placement was wrong too: measured against the true attack in the
+    /// audio, the onset stamp runs about 40 ms early, so a window opening at
+    /// +35 ms was starting before the note did.
+    ///
+    /// Measured across three recordings, how often the played note lands in
+    /// the detector's top three:
+    ///
+    ///                       C3-B3  C4-B4  C5-B5  C6+   fast passages
+    ///     4096, +35 ms       43 %   54 %   70 %  67 %      37 %
+    ///     8192, +150 ms      82 %   76 %   89 %  88 %      77 %
+    ///
+    /// Better in every register, and fast passages more than double. The cost
+    /// is latency: a verdict now lands ~340 ms after the strike rather than
+    /// ~130 ms. Scoring is unaffected — the onset timestamp is back-dated, so
+    /// timing accuracy does not depend on when the verdict arrives — only the
+    /// moment a note lights up is later.
     private var stages: [(delay: Double, verifier: NoteVerifier, bass: Bool)] {
-        [(0.035, verifier4k, false), (0.030, verifier8k, true)]
+        [(0.150, verifier8k, false)]
     }
     /// When each key was last heard clearly. A key heard within the last
     /// couple of seconds is very likely still ringing, which changes how a
@@ -496,7 +515,9 @@ final class AudioPitchDetector: ObservableObject {
     private func runDueVerifications() {
         guard !pending.isEmpty else { return }
         let mask = Self.ringN - 1
-        let preGap = hop                  // keep the attack itself out of "before"
+        // "Before" ends 100 ms ahead of the onset, well clear of the attack
+        // and of the stamp's own ~40 ms of slop.
+        let preGap = Int(0.100 * sampleRate)
         let stageList = stages
         var remaining: [PendingVerification] = []
 
@@ -518,7 +539,7 @@ final class AudioPitchDetector: ObservableObject {
                     pre[k]  = ring[(preStart + k) & mask]
                     post[k] = ring[(postStart + k) & mask]
                 }
-                let keys = stage.bass ? Array(0..<Self.bassSplitKey) : Array(Self.bassSplitKey..<88)
+                let keys = Array(0..<88)
                 var ringing = Set<Int>()
                 for k in 0..<88 where lastHeard[k] > 0
                     && p.timestamp - lastHeard[k] <= ringingFor

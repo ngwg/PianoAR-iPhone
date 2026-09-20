@@ -110,7 +110,12 @@ final class NoteVerifier {
     private let shareOfBest: Float = 0.45
 
     private var f0Table = (0..<88).map { NoteVerifier.nominalF0(ofKey: $0) }
-    private var searchTable = [Float](repeating: 35, count: 88)
+    private var searchTable = [Float](repeating: 25, count: 88)
+
+    /// Half-width of the partial search, in cents. Fixed: with an 8192-point
+    /// window the bins are fine enough that ±25 cents cannot reach a
+    /// neighbouring semitone, and a fixed value cannot drift.
+    private let centsTol: Float = 25
 
     init(fftN: Int) {
         precondition(fftN > 0 && fftN & (fftN - 1) == 0, "fftN must be a power of two")
@@ -130,9 +135,19 @@ final class NoteVerifier {
     /// Equal temperament at A4 = 440.
     static func nominalF0(ofKey k: Int) -> Float { 440 * powf(2, Float(k + 21 - 69) / 12) }
 
-    /// What this key actually sounds at on the piano in the room.
+    /// What this key sounds at, allowing for the stretch every piano has.
+    ///
+    /// The learned per-register offset that used to live here is gone. It was
+    /// fed only by notes the verifier already believed, so a wrong verdict
+    /// shifted the offset, which produced more wrong verdicts the same way —
+    /// a loop that drifted until it hit its own clamp and then stayed there,
+    /// saved to disk, poisoning every later session. Measured on a recording
+    /// of all 88 keys, this piano sits within a few cents of equal
+    /// temperament through the middle and follows the ordinary stretch curve
+    /// at the ends, so the learning had nothing to find and everything to
+    /// lose.
     static func f0(ofKey k: Int) -> Float {
-        nominalF0(ofKey: k) * powf(2, PianoTuning.shared.offsetCents(forKey: k) / 1200)
+        nominalF0(ofKey: k) * powf(2, PianoTuning.prior(forKey: k) / 1200)
     }
 
     /// Everything one key contributes at one strike.
@@ -161,11 +176,10 @@ final class NoteVerifier {
                   ringing: Set<Int> = [],
                   relax: Int = 0) -> [(key: Int, rise: Float, status: NoteStatus)] {
         guard pre.count == fftN, post.count == fftN, sampleRate > 0 else { return [] }
-        let tuning = PianoTuning.shared.snapshot()
         for k in 0..<88 {
-            f0Table[k] = Self.nominalF0(ofKey: k) * powf(2, tuning.offset[k] / 1200)
+            f0Table[k] = Self.f0(ofKey: k)
+            searchTable[k] = centsTol
         }
-        searchTable = tuning.search
 
         let before = magnitudeSpectrum(pre)
         let after  = magnitudeSpectrum(post)
@@ -325,7 +339,6 @@ final class NoteVerifier {
                 out.append((k, confidence, amb ? .unsure : .absent))
             } else {
                 out.append((k, confidence, .present))
-                learnTuning(key: k, from: evidence(k))
             }
         }
         return out
@@ -339,16 +352,6 @@ final class NoteVerifier {
         var vals = Array(s[lo..<hi])
         vals.sort()
         return max(vals[vals.count / 5], 1e-7)
-    }
-
-    /// A note we are sure about is also a tuning measurement. Median, because
-    /// one low partial may be sitting on another note's partial.
-    private func learnTuning(key k: Int, from e: Evidence) {
-        guard e.bestSNR >= 12, !e.residuals.isEmpty else { return }
-        var r = e.residuals
-        r.sort()
-        PianoTuning.shared.observe(key: k, residualCents: r[r.count / 2],
-                                   confidence: min(1, Float(r.count) * 0.5))
     }
 
     /// Stiffness of piano strings by register (defaults from the literature;
