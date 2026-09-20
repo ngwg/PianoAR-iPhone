@@ -133,6 +133,8 @@ struct ContentView: View {
             comfort.toggleStereoMode()
         case .cycleHandStyle:
             comfort.cycleHandStyle()
+        case .cycleFrameRate:
+            comfort.cycleFrameRate()
         case .resetComfort:
             comfort.resetViewDefaults()
         case .align(let adjust):

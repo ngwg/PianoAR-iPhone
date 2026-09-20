@@ -39,10 +39,16 @@ final class StereoARContainer: UIView {
     /// Physical density of every current iPhone Pro/Max/base panel (460 ppi).
     private static let screenPPI: CGFloat = 460
 
+    private var thermalObserver: NSObjectProtocol?
+
     init(session: ARSession) {
         self.session = session
         left = Self.makeARView(session: session)
         super.init(frame: .zero)
+        thermalObserver = NotificationCenter.default.addObserver(
+            forName: ProcessInfo.thermalStateDidChangeNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in self?.applyFrameRate() }
         backgroundColor = .black
         for host in [leftHost, rightHost] {
             host.clipsToBounds = true
@@ -57,7 +63,10 @@ final class StereoARContainer: UIView {
 
     required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
 
-    deinit { warp.stop() }
+    deinit {
+        if let obs = thermalObserver { NotificationCenter.default.removeObserver(obs) }
+        warp.stop()
+    }
 
     private static func makeARView(session: ARSession) -> ARSCNView {
         let v = ARSCNView(frame: .zero)
@@ -65,9 +74,16 @@ final class StereoARContainer: UIView {
         // Overlay materials are all constant-lit; skip light-estimate work.
         v.automaticallyUpdatesLighting = false
         v.rendersContinuously = true
-        // Camera-bound: ARKit delivers 60 fps, so rendering faster would only
-        // re-draw identical frames. Smoothness above 60 comes from MotionWarp.
-        v.preferredFramesPerSecond = 60
+        // The camera is still 60 fps, but the *overlay* is not: note bars
+        // scroll, the cursor follows a hand, and those are drawn fresh every
+        // pass. Rendering them at the panel's own 120 Hz is the difference
+        // between a sheet that slides and one that steps. Set again by
+        // applyFrameRate() once the setting and the thermal state are known.
+        v.preferredFramesPerSecond = 120
+        // Stated rather than inherited. Each eye is a magnified half-screen,
+        // so multisampling would not be free here, and judder is what makes
+        // people ill — jaggies are not.
+        v.antialiasingMode = .none
         v.contentMode = .scaleAspectFill
         v.debugOptions = []
         v.isUserInteractionEnabled = false
@@ -79,7 +95,35 @@ final class StereoARContainer: UIView {
         comfort = settings
         warp.enabled = settings.motionSmoothing
         if modeChanged { applyStereoMode() }
+        applyFrameRate()
         setNeedsLayout()
+    }
+
+    /// What the renderer is currently being asked for, for the debug readout.
+    private(set) var targetFPS: Int = 120
+
+    /// The thermal ceiling is applied even to an explicit choice, because a
+    /// critical state is iOS about to take the frame rate away anyway; better
+    /// to hand it back in a controlled step than to be stalled.
+    func applyFrameRate() {
+        let thermal = ProcessInfo.processInfo.thermalState
+        let ceiling: Int
+        switch thermal {
+        case .nominal, .fair: ceiling = 120
+        case .serious:        ceiling = comfort.frameRate.followsThermals ? 90 : 120
+        case .critical:       ceiling = 60
+        @unknown default:     ceiling = 60
+        }
+        let target = min(comfort.frameRate.ceiling, ceiling)
+        guard target != targetFPS || left.preferredFramesPerSecond != target else { return }
+        targetFPS = target
+        left.preferredFramesPerSecond = target
+        right?.preferredFramesPerSecond = target
+        // The warp is a compositor transform on a layer that is already drawn:
+        // it costs almost nothing and it is the whole reason a 60 fps camera
+        // feels smooth. It keeps running flat out until the phone is in
+        // trouble, whatever the renderer has been told to do.
+        warp.setDisplayRate(max: thermal == .critical ? 60 : 120)
     }
 
     private func applyStereoMode() {
@@ -101,6 +145,8 @@ final class StereoARContainer: UIView {
             }
         }
         warp.targets = [left.layer] + (right.map { [$0.layer] } ?? [])
+        right?.preferredFramesPerSecond = targetFPS
+        right?.antialiasingMode = .none
         setNeedsLayout()
     }
 

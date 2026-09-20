@@ -8,7 +8,7 @@ enum MenuAction {
     case tempo(Double)                    // delta, e.g. -0.05
     case cycleHand, toggleWaitMode
     case viewScale(Double), lensSpacing(Double)
-    case toggleSmoothing, toggleStereo, cycleHandStyle, resetComfort
+    case toggleSmoothing, toggleStereo, cycleHandStyle, resetComfort, cycleFrameRate
     case align(KeyboardAlignment.Adjust)  // fine placement of the key overlay
     case toggleKeyLabels
     case toggleRecording                  // SETUP › RECORD diagnostics capture
@@ -137,8 +137,9 @@ final class ARMenuOverlay {
     private static let lensUpRect    = CGRect(x: 800, y: 212, width: 124, height: 78)
     private static let smoothRect    = CGRect(x: 36,  y: 302, width: 432, height: 78)
     private static let stereoRect    = CGRect(x: 492, y: 302, width: 432, height: 78)
-    private static let handStyleRect = CGRect(x: 36,  y: 390, width: 432, height: 78)
-    private static let comfortResetRect = CGRect(x: 492, y: 390, width: 432, height: 78)
+    private static let handStyleRect = CGRect(x: 36,  y: 390, width: 284, height: 78)
+    private static let frameRateRect = CGRect(x: 330, y: 390, width: 284, height: 78)
+    private static let comfortResetRect = CGRect(x: 624, y: 390, width: 300, height: 78)
 
     // Setup
     // Setup: top row, then an ALIGN grid of labelled button pairs (two columns).
@@ -244,6 +245,7 @@ final class ARMenuOverlay {
         case loopPhrase, loopA, loopB, loopOn
         case textSize, contrast, dwell, colorBlind, accessReset
         case viewDown, viewUp, lensDown, lensUp, smooth, stereo, handStyle, comfortReset
+        case frameRate
         case mapKeys, debug, labels, alignReset, record, calibrate
         case slideLeft, slideRight, keyLeft, keyRight, depthAway, depthToward
         case widthMinus, widthPlus, turnLeft, turnRight, heightDown, heightUp
@@ -674,7 +676,8 @@ final class ARMenuOverlay {
         (.viewDown, viewDownRect), (.viewUp, viewUpRect),
         (.lensDown, lensDownRect), (.lensUp, lensUpRect),
         (.smooth, smoothRect), (.stereo, stereoRect),
-        (.handStyle, handStyleRect), (.comfortReset, comfortResetRect),
+        (.handStyle, handStyleRect), (.frameRate, frameRateRect),
+        (.comfortReset, comfortResetRect),
     ]
     private static let setupControls: [(Region, CGRect)] = [
         (.mapKeys, mapRect), (.debug, debugRect), (.labels, labelsRect),
@@ -803,6 +806,7 @@ final class ARMenuOverlay {
         case .smooth:            return .toggleSmoothing
         case .stereo:            return .toggleStereo
         case .handStyle:         return .cycleHandStyle
+        case .frameRate:         return .cycleFrameRate
         case .comfortReset:      return .resetComfort
         case .mapKeys:           return .recalibrate
         case .debug:             return .toggleDebug
@@ -1272,8 +1276,9 @@ final class ARMenuOverlay {
                fill: c.motionSmoothing ? accentGreen : neutral, size: 26)
         button(stereoRect, c.stereoMode == .dual ? "RENDER:  DUAL" : "RENDER:  SINGLE (FAST)",
                fill: c.stereoMode == .dual ? neutral : accentPurple, size: 26)
-        button(handStyleRect, "HAND DISPLAY:  \(c.handStyle.label)", fill: neutral, size: 26)
-        button(comfortResetRect, "RESET VIEW", fill: neutral, size: 26)
+        button(handStyleRect, "HANDS:  \(c.handStyle.label)", fill: neutral, size: 24)
+        button(frameRateRect, c.frameRate.label, fill: neutral, size: 24)
+        button(comfortResetRect, "RESET VIEW", fill: neutral, size: 24)
 
         wrapped("Motion sick? Stare at a far edge and shake your head. World swings AGAINST your "
                 + "turn → lower VIEW SIZE. It DRAGS WITH you → raise it. Slide the headset lenses "

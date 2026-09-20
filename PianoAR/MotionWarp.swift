@@ -66,9 +66,23 @@ final class MotionWarp: NSObject {
             motion.startDeviceMotionUpdates()
         }
         let l = CADisplayLink(target: self, selector: #selector(tick(_:)))
-        l.preferredFrameRateRange = CAFrameRateRange(minimum: 80, maximum: 120, preferred: 120)
+        l.preferredFrameRateRange = Self.range(max: maxRate)
         l.add(to: .main, forMode: .common)
         link = l
+    }
+
+    private var maxRate: Float = 120
+
+    private static func range(max m: Float) -> CAFrameRateRange {
+        CAFrameRateRange(minimum: Swift.min(80, m), maximum: m, preferred: m)
+    }
+
+    /// Called when the thermal state changes; the warp only gives ground in a
+    /// genuine emergency.
+    func setDisplayRate(max m: Float) {
+        guard m != maxRate else { return }
+        maxRate = m
+        link?.preferredFrameRateRange = Self.range(max: m)
     }
 
     func stop() {

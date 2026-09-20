@@ -24,6 +24,50 @@ enum HandStyle: String, CaseIterable {
     }
 }
 
+/// What to ask the display for.
+///
+/// The panel is 120 Hz LTPO and the A18 Pro can usually feed it, but the
+/// phone is sealed inside a cardboard shell with no airflow while running
+/// ARKit, Vision, a camera and an FFT. When iOS decides it has had enough it
+/// throttles *suddenly*, and a frame rate that falls off a cliff mid-practice
+/// is itself a motion-sickness cue — so AUTO gives up a tier at a time as the
+/// phone heats, long before iOS does it for us.
+enum FrameRateCap: String, CaseIterable {
+    case auto, hz120, hz90, hz60
+
+    var label: String {
+        switch self {
+        case .auto:  return "AUTO (120 → 60)"
+        case .hz120: return "120 Hz"
+        case .hz90:  return "90 Hz"
+        case .hz60:  return "60 Hz"
+        }
+    }
+
+    /// The most this setting will ever ask for.
+    var ceiling: Int {
+        switch self {
+        case .auto, .hz120: return 120
+        case .hz90:         return 90
+        case .hz60:         return 60
+        }
+    }
+
+    /// AUTO is the only mode that steps down on heat; an explicit pick is
+    /// still held back from a *critical* state, which is a thermal emergency
+    /// rather than a preference.
+    var followsThermals: Bool { self == .auto }
+
+    var next: FrameRateCap {
+        switch self {
+        case .auto:  return .hz120
+        case .hz120: return .hz90
+        case .hz90:  return .hz60
+        case .hz60:  return .auto
+        }
+    }
+}
+
 enum StereoMode: String {
     /// Two AR views, each rendering the shared scene (always works).
     case dual
@@ -39,12 +83,14 @@ struct ComfortSnapshot: Equatable {
     var motionSmoothing: Bool
     var stereoMode: StereoMode
     var handStyle: HandStyle
+    var frameRate: FrameRateCap
 
     static let `default` = ComfortSnapshot(viewScale: ComfortSettings.defaultViewScale,
                                            lensSpacingMM: ComfortSettings.defaultLensSpacingMM,
                                            motionSmoothing: true,
                                            stereoMode: .dual,
-                                           handStyle: .fingertips)
+                                           handStyle: .fingertips,
+                                           frameRate: .auto)
 }
 
 /// Headset comfort settings — the main motion-sickness levers — persisted
@@ -84,6 +130,7 @@ final class ComfortSettings: ObservableObject {
             if let v = d["motionSmoothing"] as? Bool { s.motionSmoothing = v }
             if let v = (d["stereoMode"] as? String).flatMap(StereoMode.init(rawValue:)) { s.stereoMode = v }
             if let v = (d["handStyle"] as? String).flatMap(HandStyle.init(rawValue:)) { s.handStyle = v }
+            if let v = (d["frameRate"] as? String).flatMap(FrameRateCap.init(rawValue:)) { s.frameRate = v }
         }
         s.viewScale = Self.clamp(s.viewScale, Self.viewScaleRange)
         s.lensSpacingMM = Self.clamp(s.lensSpacingMM, Self.lensSpacingRange)
@@ -106,6 +153,8 @@ final class ComfortSettings: ObservableObject {
 
     func cycleHandStyle() { update { $0.handStyle = $0.handStyle.next } }
 
+    func cycleFrameRate() { update { $0.frameRate = $0.frameRate.next } }
+
     func resetViewDefaults() {
         update {
             $0.viewScale = Self.defaultViewScale
@@ -124,6 +173,7 @@ final class ComfortSettings: ObservableObject {
             "motionSmoothing": s.motionSmoothing,
             "stereoMode": s.stereoMode.rawValue,
             "handStyle": s.handStyle.rawValue,
+            "frameRate": s.frameRate.rawValue,
         ], forKey: Self.storeKey)
     }
 

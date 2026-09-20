@@ -111,6 +111,8 @@ struct ARPassthroughView: UIViewRepresentable {
         private let planeNodes = NSHashTable<SCNNode>.weakObjects()
         private var lastFrameTime: TimeInterval = 0
         private var fps: Double = 60
+        private var camFPS: Double = 60
+        private var lastCamStamp: TimeInterval = 0
         private var loggedSerial = -1
         private var lastTuningSave: TimeInterval = 0
         private var wasRecording = false
@@ -151,9 +153,21 @@ struct ARPassthroughView: UIViewRepresentable {
             }
             lastFrameTime = time
 
+            // At 120 Hz the renderer runs twice per camera frame. Anything
+            // that reads the camera image must not: a second Vision pass over
+            // the same pixels costs the same as the first and cannot tell us
+            // anything new. Only the drawing is worth doing twice.
+            let newCameraFrame = frame.timestamp != lastCamStamp
+            if newCameraFrame {
+                if lastCamStamp > 0, frame.timestamp > lastCamStamp {
+                    camFPS += (1 / (frame.timestamp - lastCamStamp) - camFPS) * 0.05
+                }
+                lastCamStamp = frame.timestamp
+            }
+
             if hand3D == nil { hand3D = Hand3DOverlay(scene: sceneView.scene) }
 
-            handTracker.maybeProcess(frame)
+            if newCameraFrame { handTracker.maybeProcess(frame) }
             let hands = handTracker.snapshot()
             let audio = audioDetector.snapshot()
             let camT  = frame.camera.transform.columns.3
@@ -178,7 +192,7 @@ struct ARPassthroughView: UIViewRepresentable {
                     _ = kb
                 }
             }
-            if let kb = keyboardNode {
+            if newCameraFrame, let kb = keyboardNode {
                 keyVision.update(frame: frame, keyboard: kb, time: time,
                                  orientation: handTracker.imageOrientation)
             }
@@ -336,7 +350,9 @@ struct ARPassthroughView: UIViewRepresentable {
             let depth = frame.smoothedSceneDepth != nil || frame.sceneDepth != nil
             var lines = [
                 "— SYSTEM",
-                String(format: "%.0f fps · tracking %@ · %@", fps, tracking, thermal),
+                String(format: "render %.0f/%d Hz · camera %.0f fps · %@",
+                       fps, sceneView.preferredFramesPerSecond, camFPS, thermal),
+                "\(ARSessionModel.cameraFormatDescription) · tracking \(tracking)",
                 "hands \(hands.count) · LiDAR depth \(depth ? "yes" : "no")",
                 "— PRESS DETECTION",
             ]
