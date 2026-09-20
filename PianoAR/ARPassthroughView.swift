@@ -112,6 +112,9 @@ struct ARPassthroughView: UIViewRepresentable {
         private var lastTuningSave: TimeInterval = 0
         private var wasRecording = false
         private var lastHeardAttack = -1
+        /// Jop's idea: watch the keys, not the fingers or the sound. Logged
+        /// only for now — see KeyVision.
+        private let keyVision = KeyVision()
 
         init(calibration: CalibrationManager,
              handTracker: HandTracker, songPlayer: SongPlayer,
@@ -160,6 +163,21 @@ struct ARPassthroughView: UIViewRepresentable {
             if let att = audio.attack, att.id != lastHeardAttack {
                 lastHeardAttack = att.id
                 highway?.registerStrike()
+                // Whatever the keys looked like at that instant, for offline
+                // analysis. Nothing depends on this yet.
+                if let kb = keyboardNode, cfg.recorder?.isRecording == true {
+                    let top = keyVision.rankedDrops(limit: 6)
+                    cfg.recorder?.log("keyvision", [
+                        "onset": att.timestamp,
+                        "drops": top.map { ["k": $0.key, "d": round($0.drop * 100) / 100] },
+                        "visible": keyVision.samples.filter { $0.visible }.count,
+                    ])
+                    _ = kb
+                }
+            }
+            if let kb = keyboardNode {
+                keyVision.update(frame: frame, keyboard: kb, time: time,
+                                 orientation: handTracker.imageOrientation)
             }
             // What the verifier has learned about this piano, kept for the
             // next session (cheap: only writes when something changed).
