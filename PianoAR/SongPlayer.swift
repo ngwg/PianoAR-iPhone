@@ -249,6 +249,26 @@ final class SongPlayer: ObservableObject {
         else if changed, feedback.hasPrefix("Get ready") { feedback = "" }
     }
 
+    /// How far through the piece we are, 0...1 — for the scrub bar.
+    var progressFraction: Double {
+        groups.isEmpty ? 0 : Double(groupIndex) / Double(groups.count)
+    }
+
+    /// Jump to a point in the piece. Practising the middle of something
+    /// should not mean playing the first two minutes of it again.
+    func seek(toFraction f: Double) {
+        guard !groups.isEmpty else { return }
+        let idx = min(groups.count - 1, max(0, Int(Double(groups.count) * f)))
+        groupIndex   = idx
+        acceptedKeys = []
+        aheadRun     = []
+        groupSerial &+= 1
+        groupEnteredAt = CACurrentMediaTime()
+        isComplete   = false
+        startHostTime = CACurrentMediaTime() - groups[idx].startBeat * 60.0 / effectiveBPM
+        feedback = ""
+    }
+
     /// Tempo actually in force, for anything that needs to convert beats to
     /// seconds (the sheet's look-ahead).
     var effectiveBPMNow: Double { effectiveBPM }

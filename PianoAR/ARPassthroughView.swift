@@ -258,7 +258,8 @@ struct ARPassthroughView: UIViewRepresentable {
                     alignReadout: cfg.alignment.readout,
                     recording: cfg.recorder?.isRecording ?? false,
                     recordSeconds: cfg.recorder?.seconds ?? 0,
-                    calibrating: cfg.calibration?.active ?? false)
+                    calibrating: cfg.calibration?.active ?? false,
+                    progress: Float(songPlayer.progressFraction))
                 if let action = menu.update(hands: hands, keyboardNode: kb, time: time,
                                             state: state, availableSongs: cfg.songs,
                                             cameraWorldPos: camPos) {

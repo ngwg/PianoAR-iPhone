@@ -13,6 +13,7 @@ enum MenuAction {
     case toggleKeyLabels
     case toggleRecording                  // SETUP › RECORD diagnostics capture
     case toggleCalibration                // SETUP › CALIBRATE guided note pass
+    case seek(Double)                     // 0...1 along the piece
 }
 
 /// Everything the panel shows, captured once per frame on the render thread.
@@ -31,6 +32,7 @@ struct MenuState: Equatable {
     var recording = false
     var recordSeconds = 0
     var calibrating = false
+    var progress: Float = 0
 }
 
 /// Floating "tablet" AR panel — Quest-3 interaction model.
@@ -53,8 +55,11 @@ final class ARMenuOverlay {
     let rootNode = SCNNode()
 
     // ── Panel geometry ──────────────────────────────────────────────────────
-    private static let panW: Float = 0.58
-    private static let panH: Float = 0.39
+    // Small, and off to the side where it does not cover the keys or the
+    // sheet. Making it bigger to fit more on it was the wrong move: the way
+    // to stop a panel feeling cramped is to put less on it.
+    private static let panW: Float = 0.34
+    private static let panH: Float = 0.24
     private static let texW: CGFloat = 960
     private static let texH: CGFloat = 640
 
@@ -86,13 +91,18 @@ final class ARMenuOverlay {
     private static let pageNextRect = CGRect(x: 828, y: 64, width: 110, height: 44)
 
     // Practice
-    private static let playRect      = CGRect(x: 270, y: 150, width: 420, height: 124)
-    private static let restartRect   = CGRect(x: 190, y: 292, width: 270, height: 84)
-    private static let skipRect      = CGRect(x: 500, y: 292, width: 270, height: 84)
-    private static let tempoDownRect = CGRect(x: 190, y: 394, width: 140, height: 84)
-    private static let tempoUpRect   = CGRect(x: 630, y: 394, width: 140, height: 84)
-    private static let handRect      = CGRect(x: 60,  y: 496, width: 400, height: 92)
-    private static let waitRect      = CGRect(x: 500, y: 496, width: 400, height: 92)
+    /// The scrub bar. Wide and tall on purpose — it is the one control that
+    /// is aimed at rather than pressed, so it has to forgive a shaky ray.
+    private static let seekRect      = CGRect(x: 40,  y: 132, width: 880, height: 96)
+    private static let playRect      = CGRect(x: 330, y: 262, width: 300, height: 118)
+    private static let restartRect   = CGRect(x: 40,  y: 262, width: 260, height: 118)
+    private static let skipRect      = CGRect(x: 660, y: 262, width: 260, height: 118)
+    private static let tempoDownRect = CGRect(x: 40,  y: 410, width: 190, height: 104)
+    private static let tempoUpRect   = CGRect(x: 500, y: 410, width: 190, height: 104)
+    // Moved off the playing screen: both are chosen once and then left
+    // alone, so they were only ever adding to the clutter in front of you.
+    private static let handRect      = CGRect(x: 730, y: 410, width: 190, height: 104)
+    private static let waitRect      = CGRect(x: 240, y: 410, width: 250, height: 104)
 
     // Comfort
     private static let viewDownRect  = CGRect(x: 560, y: 126, width: 80, height: 56)
@@ -139,9 +149,9 @@ final class ARMenuOverlay {
     /// one movement that costs you the alignment you just set up. It only
     /// appears when the song is stopped, so overlapping the note sheet costs
     /// nothing.
-    private static let initPos = SIMD3<Float>(0, 0.30, 0.24)
+    private static let initPos = SIMD3<Float>(KeyboardLayout.totalWidth * 0.26, 0.27, 0.20)
     private static let initRotX: Float = -Float.pi * 0.24
-    private static let initRotY: Float = 0
+    private static let initRotY: Float = -Float.pi * 0.11
 
     // ── Cursor / click thresholds ───────────────────────────────────────────
     private static let tipMaxBehind: Float        = 0.12
@@ -192,7 +202,7 @@ final class ARMenuOverlay {
         case tab(Tab)
         case song(Int)                     // absolute song index
         case pagePrev, pageNext, minimize
-        case play, restart, skip, tempoDown, tempoUp, hand, wait
+        case play, restart, skip, tempoDown, tempoUp, hand, wait, seek
         case viewDown, viewUp, lensDown, lensUp, smooth, stereo, handStyle, comfortReset
         case mapKeys, debug, labels, alignReset, record, calibrate
         case slideLeft, slideRight, keyLeft, keyRight, depthAway, depthToward
@@ -237,6 +247,9 @@ final class ARMenuOverlay {
     private var curYaw:       Float         = ARMenuOverlay.initRotY
 
     private var cursorSmoothed: SIMD3<Float>? = nil
+    /// Where the cursor last sat, in texture space — the scrub bar needs the
+    /// position it was tapped at, not merely that it was tapped.
+    private var cursorTex: CGPoint = .zero
     private var curScale:   Float        = 1.0
     private var scaleGoal:  Float        = 1.0
     private var flashUntil: TimeInterval = 0
@@ -442,6 +455,7 @@ final class ARMenuOverlay {
                 sm = b.local
             }
             cursorSmoothed = sm
+            cursorTex = texPoint(localX: sm.x, localY: sm.y)
 
             aimHist.append((sm, time))
             aimHist.removeAll { time - $0.t > 0.5 }
@@ -599,6 +613,7 @@ final class ARMenuOverlay {
 
     private static let practiceControls: [(Region, CGRect)] = [
         (.play, playRect), (.restart, restartRect), (.skip, skipRect),
+        (.seek, seekRect),
         (.tempoDown, tempoDownRect), (.tempoUp, tempoUpRect),
         (.hand, handRect), (.wait, waitRect),
     ]
@@ -709,6 +724,9 @@ final class ARMenuOverlay {
         case .tempoUp:           return .tempo(0.05)
         case .hand:              return .cycleHand
         case .wait:              return .toggleWaitMode
+        case .seek:
+            let f = (cursorTex.x - Self.seekRect.minX) / Self.seekRect.width
+            return .seek(Double(min(1, max(0, f))))
         case .viewDown:          return .viewScale(-0.02)
         case .viewUp:            return .viewScale(0.02)
         case .lensDown:          return .lensSpacing(-0.5)
@@ -945,21 +963,47 @@ final class ARMenuOverlay {
     private static func drawPractice(_ s: PanelSnap) {
         let st = s.state
         centered(st.currentTitle.isEmpty ? "Pick a song in LIBRARY" : st.currentTitle,
-                 in: CGRect(x: 40, y: contentTop + 2, width: texW - 80, height: 44),
-                 font: .systemFont(ofSize: 31, weight: .heavy), color: .white)
-        button(playRect, st.isPlaying ? "❚❚   PAUSE" : "▶   PLAY",
-               fill: st.isPlaying ? accentRed : accentBlue, size: 42, weight: .black, radius: 24)
-        button(restartRect, "↺   RESTART", fill: neutral, size: 28)
-        button(skipRect, "SKIP NOTE  ▸▸", fill: neutral, size: 28)
-        button(tempoDownRect, "−", fill: neutral, size: 46, weight: .black)
-        button(tempoUpRect, "+", fill: neutral, size: 46, weight: .black)
-        centered("TEMPO  \(st.tempoPercent)%",
+                 in: CGRect(x: 40, y: contentTop + 2, width: texW - 80, height: 46),
+                 font: .systemFont(ofSize: 32, weight: .heavy), color: .white)
+
+        // ── scrub bar ────────────────────────────────────────────────────
+        let track = CGRect(x: seekRect.minX, y: seekRect.midY - 13,
+                           width: seekRect.width, height: 26)
+        UIColor(white: 1, alpha: 0.14).setFill()
+        UIBezierPath(roundedRect: track, cornerRadius: 13).fill()
+        let done = CGRect(x: track.minX, y: track.minY,
+                          width: track.width * CGFloat(min(1, max(0, st.progress))),
+                          height: track.height)
+        accentBlue.setFill()
+        UIBezierPath(roundedRect: done, cornerRadius: 13).fill()
+        // the handle, big enough to aim at with a shaky ray
+        let hx = track.minX + track.width * CGFloat(min(1, max(0, st.progress)))
+        let knob = CGRect(x: hx - 21, y: seekRect.midY - 21, width: 42, height: 42)
+        UIColor.white.setFill()
+        UIBezierPath(ovalIn: knob).fill()
+        centered("\(Int((st.progress * 100).rounded()))%  —  tap the bar to jump",
+                 in: CGRect(x: seekRect.minX, y: seekRect.maxY - 30,
+                            width: seekRect.width, height: 28),
+                 font: .systemFont(ofSize: 21, weight: .semibold),
+                 color: UIColor(white: 1, alpha: 0.55))
+
+        // ── transport ────────────────────────────────────────────────────
+        button(playRect, st.isPlaying ? "❚❚  PAUSE" : "▶  PLAY",
+               fill: st.isPlaying ? accentRed : accentBlue, size: 40, weight: .black, radius: 26)
+        button(restartRect, "↺  START", fill: neutral, size: 28, radius: 26)
+        button(skipRect, "SKIP  ▸▸", fill: neutral, size: 28, radius: 26)
+
+        // ── one settings row ─────────────────────────────────────────────
+        button(tempoDownRect, "−", fill: neutral, size: 44, weight: .black, radius: 24)
+        button(tempoUpRect, "+", fill: neutral, size: 44, weight: .black, radius: 24)
+        centered("\(st.tempoPercent)%",
                  in: CGRect(x: tempoDownRect.maxX, y: tempoDownRect.minY,
-                            width: tempoUpRect.minX - tempoDownRect.maxX, height: tempoDownRect.height),
-                 font: .systemFont(ofSize: 33, weight: .heavy), color: .white)
-        button(handRect, "HANDS:  \(st.hand.label)", fill: neutral, size: 27)
-        button(waitRect, st.waitMode ? "MODE:  WAIT FOR ME" : "MODE:  PLAY-ALONG",
-               fill: st.waitMode ? accentGreen : accentPurple, size: 27)
+                            width: tempoUpRect.minX - tempoDownRect.maxX,
+                            height: tempoDownRect.height),
+                 font: .systemFont(ofSize: 34, weight: .heavy), color: .white)
+        button(waitRect, st.waitMode ? "WAIT FOR ME" : "PLAY-ALONG",
+               fill: st.waitMode ? accentGreen : accentPurple, size: 25, radius: 24)
+        button(handRect, st.hand.label.uppercased(), fill: neutral, size: 25, radius: 24)
     }
 
     private static func drawComfort(_ s: PanelSnap) {

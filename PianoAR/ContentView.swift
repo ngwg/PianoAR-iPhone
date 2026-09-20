@@ -139,6 +139,8 @@ struct ContentView: View {
             showKeyLabels.toggle()
         case .toggleRecording:
             recorder.toggle()
+        case .seek(let f):
+            songPlayer.seek(toFraction: f)
         case .toggleCalibration:
             if calibRun.active {
                 calibRun.stop()
