@@ -249,7 +249,16 @@ final class PressDetector: ObservableObject {
         }
 
         recentValleys = recentValleys.filter { time - $0.value < 0.6 }
-        let guided = !expectedKeyIndices.isEmpty
+        // "A song is running" — not "a note is pending right now". Between
+        // one note being accepted and the next becoming current, the pending
+        // set is briefly empty, and the raw vision path used to fill that gap
+        // with whatever a fingertip happened to be resting on. Measured on a
+        // good session, seven of the twelve wrong-note flashes came from
+        // there. With the microphone working, vision has nothing to add to
+        // guided play beyond breaking an octave tie, which the verifier asks
+        // for separately.
+        let songRunning = !expectedKeyIndices.isEmpty || !groupKeyIndices.isEmpty
+        let guided = songRunning && audioSnapshot?.listening == true
         var finalPresses: [PressEvent]
 
         if guided, let kb = keyboardNode {
