@@ -258,7 +258,7 @@ final class SongPlayer: ObservableObject {
         while groupIndex < groups.count {
             let g = groups[groupIndex]
             let pending = requiredNow(of: g).subtracting(acceptedKeys)
-            if pending.isEmpty, raw >= g.startBeat {
+            if isSatisfied(g), raw >= g.startBeat {
                 advance()
                 changed = true
                 continue
@@ -407,7 +407,7 @@ final class SongPlayer: ObservableObject {
     /// finished — i.e. the sheet is frozen rather than scrolling.
     var isWaitingNow: Bool {
         guard isPlaying, !isComplete, waitMode, groupIndex < groups.count else { return false }
-        return !requiredNow(of: groups[groupIndex]).isSubset(of: acceptedKeys)
+        return !isSatisfied(groups[groupIndex])
     }
 
     /// Current song position in beats (render thread). In wait mode it holds
@@ -621,6 +621,37 @@ final class SongPlayer: ObservableObject {
         return trusted.isEmpty ? g.requiredKeys : Set(trusted)
     }
 
+    /// How many of a group's notes have to be heard before it counts as
+    /// played.
+    ///
+    /// Hearing one pitch out of a strike and hearing five out of the same
+    /// strike are not the same problem. A wide chord puts the bass note's
+    /// harmonics directly on top of the upper notes' fundamentals, so the
+    /// detector has to get its ranked decision right five times over from one
+    /// burst of sound — and at the ~85 % per-note rate measured in the
+    /// trusted range, all five land only about 44 % of the time. Requiring
+    /// every note does not make the app stricter, it makes it stop dead on
+    /// chords the player got right.
+    ///
+    /// Ones and twos are still required in full: they are most of the music,
+    /// they are the easy case for the detector, and that is where being
+    /// honest about correctness matters. The slack only opens up where the
+    /// measurement genuinely cannot keep up.
+    func neededCount(of trusted: Set<Int>) -> Int {
+        switch trusted.count {
+        case 0, 1, 2: return trusted.count
+        case 3:       return 2
+        case 4:       return 3
+        default:      return trusted.count - 2
+        }
+    }
+
+    /// True when enough of the group has been heard to move on.
+    func isSatisfied(_ g: NoteGroup) -> Bool {
+        let trusted = requiredNow(of: g)
+        return acceptedKeys.intersection(trusted).count >= neededCount(of: trusted)
+    }
+
     /// What to say when a note is not coming through. Silence is the worst
     /// answer here: the player cannot tell "the app can't hear me" from
     /// "I am playing it wrong", and with no way to tell, people end up
@@ -640,13 +671,24 @@ final class SongPlayer: ObservableObject {
         (time - startHostTime) * effectiveBPM / 60.0
     }
 
+    /// How far apart two onsets can be and still be the same chord.
+    ///
+    /// It was 0.001 beats — half a millisecond — which is fine for a file
+    /// written by a notation program and wrong for every file played by a
+    /// person. A rolled or simply human chord lands its notes 20–40 ms apart,
+    /// and at half a millisecond each of those became its own step you had to
+    /// play on its own. 35 ms is comfortably inside that and comfortably
+    /// outside a real thirty-second note, which is 73 ms even at 102 bpm.
+    private var chordWindowBeats: Double { 0.035 * bpm / 60.0 }
+
     private func rebuildGroups() {
         var out: [NoteGroup] = []
         var i = 0
+        let window = chordWindowBeats
         while i < notes.count {
             let start = notes[i].startBeat
             var items: [(note: SongNote, keyIndex: Int?)] = []
-            while i < notes.count, abs(notes[i].startBeat - start) < 0.001 {
+            while i < notes.count, notes[i].startBeat - start < window {
                 let note = notes[i]
                 items.append((note: note, keyIndex: note.midiNote.flatMap { midiToKeyIndex[$0] }))
                 i += 1

@@ -90,23 +90,36 @@ enum MIDIFileImporter {
             reader.position = trackEnd
         }
 
-        let songNotes = notes
+        let kept = notes
             .filter { $0.endTick > $0.startTick && (21...108).contains($0.midiNote) }
             .sorted {
                 if $0.startTick == $1.startTick { return $0.midiNote < $1.midiNote }
                 return $0.startTick < $1.startTick
             }
-            .map { note in
-                SongNote(
-                    key: midiName(note.midiNote),
-                    startBeat: Double(note.startTick) / Double(ticksPerQuarter),
-                    durationBeats: max(
-                        0.25,
-                        Double(note.endTick - note.startTick) / Double(ticksPerQuarter)
-                    ),
-                    hand: note.isLeft ? "left" : "right"
-                )
-            }
+
+        // A short note is padded out to a quarter-beat so its bar is visible
+        // on the sheet, but the padding used to be blind: a 90 ms note
+        // followed 150 ms later by the same pitch was stretched straight
+        // through its own repeat, and the sheet drew two overlapping bars in
+        // one lane. Never pad past the next strike of the same key.
+        var nextStart: [Int: Int] = [:]
+        var floors: [Int] = Array(repeating: 0, count: kept.count)
+        for i in stride(from: kept.count - 1, through: 0, by: -1) {
+            let n = kept[i]
+            let limit = nextStart[n.midiNote] ?? Int.max
+            floors[i] = min(n.startTick + ticksPerQuarter / 4, limit)
+            nextStart[n.midiNote] = n.startTick
+        }
+
+        let songNotes = kept.enumerated().map { i, note in
+            SongNote(
+                key: midiName(note.midiNote),
+                startBeat: Double(note.startTick) / Double(ticksPerQuarter),
+                durationBeats: Double(max(note.endTick, floors[i]) - note.startTick)
+                             / Double(ticksPerQuarter),
+                hand: note.isLeft ? "left" : "right"
+            )
+        }
 
         guard !songNotes.isEmpty else { throw MIDIImportError.noNotes }
         return Song(title: title, bpm: bpm, notes: songNotes)
