@@ -77,6 +77,32 @@ final class AudioPitchDetector: ObservableObject {
     /// Safe from any thread.
     func debugSnapshot() -> [String] { [micState.get()] + debugStore.get() }
 
+    /// True once the engine is running and a tap is installed.
+    var isListening: Bool { listening.get() }
+
+    /// What to tell the player when nothing is being heard, or nil when the
+    /// microphone is fine.
+    ///
+    /// This existed the whole time and only ever appeared in the debug panel,
+    /// which is off by default — so a denied microphone looked exactly like
+    /// an app that had stopped working, with nothing on screen to say
+    /// otherwise. A reinstall re-asks for the microphone, and the prompt is
+    /// easy to miss when you are putting the phone into the shell.
+    var micProblem: String? {
+        let s = micState.get()
+        if s.hasPrefix("mic listening") { return nil }
+        switch s {
+        case "mic denied":
+            return "Microphone is off — Settings › PianoAR › Microphone"
+        case "mic permission":
+            return "Allow microphone access to detect notes"
+        case "mic error", "mic unavailable":
+            return "Microphone unavailable — close other audio apps and reopen"
+        default:
+            return "Microphone is not running"
+        }
+    }
+
     // Short-window STFT for onset timing. 2048 @ 48 kHz is ~43 ms, hop 512 is
     // ~11 ms.
     private let fftN = 2048

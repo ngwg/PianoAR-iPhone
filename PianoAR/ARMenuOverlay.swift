@@ -59,6 +59,8 @@ struct MenuState: Equatable {
     var accuracy: Double = 0
     var timingMs: Double = 0
     var cards: [ARMenuOverlay.SongCard] = []
+    /// nil when the microphone is fine.
+    var micProblem: String? = nil
 }
 
 /// Floating "tablet" AR panel — Quest-3 interaction model.

@@ -309,7 +309,8 @@ struct ARPassthroughView: UIViewRepresentable {
                     bestStreak: hud.bestStreak,
                     accuracy: Double(hud.accuracyPercent) / 100.0,
                     timingMs: Double(hud.averageTimingMs),
-                    cards: cardCache)
+                    cards: cardCache,
+                    micProblem: audioDetector.micProblem)
                 if let action = menu.update(hands: hands, keyboardNode: kb, time: time,
                                             state: state, availableSongs: cfg.songs,
                                             cameraWorldPos: camPos) {
@@ -455,6 +456,9 @@ struct ARPassthroughView: UIViewRepresentable {
         }
 
         private func currentHintText(time: TimeInterval) -> String {
+            // Ahead of everything else: with no microphone there is nothing to
+            // detect, and every other hint is beside the point.
+            if let problem = audioDetector.micProblem { return "⚠︎  " + problem }
             if let hint = calibration.mappingHint(time: time) { return hint }
             switch calibration.state {
             case .idle:

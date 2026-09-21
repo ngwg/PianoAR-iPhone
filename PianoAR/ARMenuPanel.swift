@@ -662,6 +662,19 @@ extension ARMenuOverlay {
 
     static func drawPractice(_ s: PanelSnap) {
         let st = s.state
+        // Nothing below this matters if the app cannot hear the piano, so it
+        // takes the place of the stats rather than sitting politely beside
+        // them.
+        if let problem = st.micProblem {
+            let r = CGRect(x: 36, y: 126, width: texW - 72, height: 56)
+            red.withAlphaComponent(0.22).setFill()
+            UIBezierPath(roundedRect: r, cornerRadius: 16).fill()
+            red.setStroke()
+            let b = UIBezierPath(roundedRect: r.insetBy(dx: 1, dy: 1), cornerRadius: 16)
+            b.lineWidth = 2
+            b.stroke()
+            centered("⚠︎  " + problem, in: r, font: fnt(21, .heavy), color: .white)
+        }
         // ── live stats, display only ────────────────────────────────────
         let cw = (texW - 72 - 36) / 4
         let chips: [(String, String, UIColor)] = [
@@ -670,9 +683,11 @@ extension ARMenuOverlay {
             ("MISSED", "\(st.missed)", st.missed > 0 ? amber : .white),
             ("STREAK", "\(st.streak)", st.streak >= 8 ? green : .white),
         ]
-        for (i, c) in chips.enumerated() {
-            chip(CGRect(x: 36 + CGFloat(i) * (cw + 12), y: 126, width: cw, height: 56),
-                 c.0, c.1, tint: c.2)
+        if st.micProblem == nil {
+            for (i, c) in chips.enumerated() {
+                chip(CGRect(x: 36 + CGFloat(i) * (cw + 12), y: 126, width: cw, height: 56),
+                     c.0, c.1, tint: c.2)
+            }
         }
 
         // ── scrub ───────────────────────────────────────────────────────
